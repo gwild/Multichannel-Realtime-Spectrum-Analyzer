@@ -1,0 +1,10 @@
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/libcopypasta-4146d3bd24640c39.rmeta: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/common.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/osx_clipboard.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/nop_clipboard.rs
+
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/libcopypasta-4146d3bd24640c39.rlib: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/common.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/osx_clipboard.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/nop_clipboard.rs
+
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/copypasta-4146d3bd24640c39.d: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/common.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/osx_clipboard.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/nop_clipboard.rs
+
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/lib.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/common.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/osx_clipboard.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/copypasta-0.7.1/src/nop_clipboard.rs:

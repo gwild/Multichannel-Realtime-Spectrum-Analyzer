@@ -1,0 +1,11 @@
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/libecolor-6b4c01b22ff75e3f.rmeta: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/color32.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva_gamma.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/rgba.rs
+
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/libecolor-6b4c01b22ff75e3f.rlib: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/color32.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva_gamma.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/rgba.rs
+
+/Users/gregorywildes/Rust Projects/audio_streaming/target/debug/deps/ecolor-6b4c01b22ff75e3f.d: /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/lib.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/color32.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva_gamma.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva.rs /Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/rgba.rs
+
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/lib.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/color32.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva_gamma.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/hsva.rs:
+/Users/gregorywildes/.cargo/registry/src/index.crates.io-6f17d22bba15001f/ecolor-0.22.0/src/rgba.rs:
