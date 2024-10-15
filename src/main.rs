@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let host = cpal::default_host();
 
     // Get a list of available input devices
-    let devices: Vec<_> = host.devices()?.collect();  // Collect devices into a Vec
+    let devices: Vec<_> = host.devices()?.collect();
 
     // Print device names and indexes
     println!("Available Input Devices:");
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
             // Set up the stream config with the selected sample rate and number of channels
             let stream_config = StreamConfig {
                 channels: selected_config.channels(),
-                sample_rate: selected_config.min_sample_rate(),  // Fix: use min_sample_rate
+                sample_rate: selected_config.min_sample_rate(), // Ensure this matches your usage
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -112,9 +112,8 @@ fn main() -> Result<()> {
                 SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,  // New i32 support
+                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,  // Support for i32 format
                 SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-
                 _ => return Err(anyhow::anyhow!("Unsupported sample format")),
             };
 
@@ -128,7 +127,7 @@ fn main() -> Result<()> {
                 native_options,
                 Box::new(move |_cc| {
                     Box::new(MyApp {
-                        spectrum: spectrum_app.clone(),
+                        spectrum: spectrum_app.clone(),  // Pass spectrum app to MyApp
                     })
                 }),
             );
