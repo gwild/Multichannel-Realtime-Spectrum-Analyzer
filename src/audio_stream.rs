@@ -2,6 +2,7 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Stream, StreamConfig, Sample, SizedSample};
 use std::sync::{Arc, Mutex};
+use num_traits::ToPrimitive;  // Import the ToPrimitive trait for conversion
 use crate::fft_analysis::compute_spectrum;
 use crate::plot::SpectrumApp;
 
@@ -15,7 +16,7 @@ pub fn build_input_stream<T>(
     selected_channels: Vec<usize>, // List of channels to use
 ) -> Result<Stream>
 where
-    T: Sample + Into<f32> + SizedSample + std::fmt::Debug,
+    T: Sample + SizedSample + ToPrimitive + std::fmt::Debug, // Add ToPrimitive here
 {
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
@@ -29,7 +30,11 @@ where
                 if selected_channels.contains(&channel) {
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-                    buffer.push((*sample).into());
+                    
+                    // Convert the sample to f32 using ToPrimitive
+                    let sample_as_f32: f32 = sample.to_f64().unwrap_or(0.0) as f32;
+                    
+                    buffer.push(sample_as_f32);
 
                     // Manage buffer size by removing the oldest sample if it exceeds the max size
                     if buffer.len() > MAX_BUFFER_SIZE {
