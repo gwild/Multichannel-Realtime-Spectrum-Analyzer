@@ -5,6 +5,7 @@ mod plot;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat};
+use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
 use audio_stream::build_input_stream;
 use plot::{MyApp, SpectrumApp};
@@ -12,46 +13,92 @@ use eframe::NativeOptions;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
-    let device = host.default_input_device().expect("No input device available");
-    println!("Using input device: {:?}", device.name());
-    let config = device.default_input_config()?;
 
-    // Specify the channels to use explicitly
-    let selected_channels = vec![2, 3, 4, 5]; // Example: using channels 0, 2, 3, and 6
+    // Get a list of available input devices
+    let devices: Vec<_> = host.devices()?.collect();  // Collect devices into a Vec
 
-    // Initialize audio buffers for each selected channel
-    let audio_buffers: Arc<Vec<Mutex<Vec<f32>>>> = Arc::new(
-        selected_channels
-            .iter()
-            .map(|_| Mutex::new(Vec::new()))
-            .collect(),
-    );
+    // Print device names and indexes
+    println!("Available Input Devices:");
+    for (i, device) in devices.iter().enumerate() {
+        println!("  [{}] - {}", i, device.name()?);
+    }
 
-    // Create the spectrum app state
-    let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
+    // Prompt user for device selection
+    println!("Enter the index of the desired device: ");
+    let mut user_input = String::new();
+    io::stdin().read_line(&mut user_input)?;
 
-    // Build input stream based on sample format
-    let stream = match config.sample_format() {
-        SampleFormat::F32 => build_input_stream::<f32>(&device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-        SampleFormat::I16 => build_input_stream::<i16>(&device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-        SampleFormat::U16 => build_input_stream::<u16>(&device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-    };
+    // Parse user input
+    let device_index = user_input.trim().parse::<usize>()?;
 
-    // Start the stream
-    stream.play()?;
+    // Check for valid input within available devices
+    if device_index < devices.len() {
+        let selected_device = devices[device_index].clone();
+        let config = selected_device.default_input_config()?;
 
-    // Launch the eframe application for plotting
-    let native_options = NativeOptions::default();
-    eframe::run_native(
-        "Real-Time Spectrum Analyzer",
-        native_options,
-        Box::new(move |_cc| {
-            Box::new(MyApp {
-                spectrum: spectrum_app.clone(),
-            })
-        }),
-    );
+        // Get the number of available channels
+        let num_channels = config.channels() as usize;
+
+        // Print available channels
+        println!("Available Channels (0-{}):", num_channels - 1);
+        for i in 0..num_channels {
+            println!("  Channel {}", i);
+        }
+
+        // Prompt user for channel selection
+        println!("Enter the indices of the desired channels, separated by spaces (e.g., '0 1 2'): ");
+        user_input.clear();
+        io::stdin().read_line(&mut user_input)?;
+
+        // Parse user input into a list of selected channels
+        let selected_channels: Vec<usize> = user_input
+            .trim()
+            .split_whitespace()
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|&ch| ch < num_channels)  // Ensure selected channels are valid
+            .collect();
+
+        if selected_channels.is_empty() {
+            println!("No valid channels selected. Exiting.");
+            return Ok(());
+        }
+
+        // Initialize audio buffers for each selected channel
+        let audio_buffers: Arc<Vec<Mutex<Vec<f32>>>> = Arc::new(
+            selected_channels
+                .iter()
+                .map(|_| Mutex::new(Vec::new()))
+                .collect(),
+        );
+
+        // Create the spectrum app state
+        let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
+
+        // Build input stream based on sample format
+        let stream = match config.sample_format() {
+            SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+            SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+            SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &config.into(), audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+            _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+        };
+
+        // Start the stream
+        stream.play()?;
+
+        // Launch the eframe application for plotting
+        let native_options = NativeOptions::default();
+        eframe::run_native(
+            "Real-Time Spectrum Analyzer",
+            native_options,
+            Box::new(move |_cc| {
+                Box::new(MyApp {
+                    spectrum: spectrum_app.clone(),
+                })
+            }),
+        );
+    } else {
+        println!("Invalid device index. Exiting.");
+    }
 
     Ok(())
 }
