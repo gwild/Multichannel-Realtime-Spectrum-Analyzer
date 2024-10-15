@@ -2,7 +2,7 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Stream, StreamConfig, Sample, SizedSample};
 use std::sync::{Arc, Mutex};
-use num_traits::ToPrimitive;  // Import the ToPrimitive trait for conversion
+use num_traits::ToPrimitive;
 use crate::fft_analysis::compute_spectrum;
 use crate::plot::SpectrumApp;
 
@@ -16,7 +16,7 @@ pub fn build_input_stream<T>(
     selected_channels: Vec<usize>, // List of channels to use
 ) -> Result<Stream>
 where
-    T: Sample + SizedSample + ToPrimitive + std::fmt::Debug, // Add ToPrimitive here
+    T: Sample + SizedSample + ToPrimitive + std::fmt::Debug,
 {
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;

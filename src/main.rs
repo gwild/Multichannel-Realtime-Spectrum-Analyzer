@@ -109,10 +109,12 @@ fn main() -> Result<()> {
 
             // Build input stream based on sample format
             let stream = match selected_config.sample_format() {
-                SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,  // New i32 support
+                SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+
                 _ => return Err(anyhow::anyhow!("Unsupported sample format")),
             };
 
