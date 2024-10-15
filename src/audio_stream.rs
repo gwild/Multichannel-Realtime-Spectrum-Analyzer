@@ -31,9 +31,13 @@ where
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
                     
-                    // Convert the sample to f32 using ToPrimitive
-                    let sample_as_f32: f32 = sample.to_f64().unwrap_or(0.0) as f32;
-                    
+                    // Convert the sample to f32 using ToPrimitive and normalize i32 samples
+                    let sample_as_f32: f32 = if let Some(i32_sample) = sample.to_i32() {
+                        i32_sample as f32 / 2147483647.0 // Normalize i32 to f32
+                    } else {
+                        sample.to_f64().unwrap_or(0.0) as f32 // For other types, use ToPrimitive
+                    };
+
                     buffer.push(sample_as_f32);
 
                     // Manage buffer size by removing the oldest sample if it exceeds the max size
