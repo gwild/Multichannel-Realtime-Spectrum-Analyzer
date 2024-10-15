@@ -1,8 +1,8 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait}; // If not used, consider removing this
 use cpal::{Stream, StreamConfig, Sample, SizedSample};
 use std::sync::{Arc, Mutex};
-use num_traits::{ToPrimitive, FromPrimitive}; // Use FromPrimitive for conversions
+use num_traits::{ToPrimitive}; // Removed FromPrimitive if not used
 use crate::fft_analysis::compute_spectrum;
 use crate::plot::SpectrumApp;
 
@@ -69,7 +69,7 @@ where
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
                     
                     // Disambiguate to_f32 method
-                    let sample_as_f32 = AudioSample::to_f32(sample);
+                    let sample_as_f32 = AudioSample::to_f32(sample); // Specify the trait explicitly
                     buffer.push(sample_as_f32);
 
                     // Manage buffer size by removing the oldest sample if it exceeds the max size
