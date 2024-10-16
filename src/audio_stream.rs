@@ -100,7 +100,7 @@ where
                     .iter()
                     .map(|&(freq, amp)| (f64::from(freq), f64::from(amp)))
                     .collect();
-                
+
                 // Print partials results for debugging
                 println!("Channel {}: Partial Results: {:?}", channel, partials_converted);
                 
