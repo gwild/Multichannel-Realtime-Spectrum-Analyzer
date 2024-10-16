@@ -1,10 +1,11 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, StreamTrait}; // If not used, consider removing this
+use cpal::traits::DeviceTrait;
 use cpal::{Stream, StreamConfig, Sample, SizedSample};
 use std::sync::{Arc, Mutex};
-use num_traits::{ToPrimitive}; // Removed FromPrimitive if not used
+use num_traits::ToPrimitive;
 use crate::fft_analysis::compute_spectrum;
 use crate::plot::SpectrumApp;
+use std::fmt::Debug;
 
 const MAX_BUFFER_SIZE: usize = 1024; // Define a max buffer size
 const MAX_I32: f32 = i32::MAX as f32; // Define the max value for scaling
@@ -45,15 +46,21 @@ impl AudioSample for f64 {
     }
 }
 
+// Optional converter function to handle custom conversions (e.g., i32 to f32)
+pub fn i32_to_f32(input: i32) -> f32 {
+    input as f32 / MAX_I32 // Normalize i32 to f32 range (-1.0 to 1.0)
+}
+
 pub fn build_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     audio_buffers: Arc<Vec<Mutex<Vec<f32>>>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>, // List of channels to use
+    convert: Option<fn(T) -> f32>, // Optional conversion function (for i32)
 ) -> Result<Stream>
 where
-    T: Sample + SizedSample + ToPrimitive + std::fmt::Debug + AudioSample + 'static,
+    T: Sample + SizedSample + ToPrimitive + Debug + AudioSample + 'static,
 {
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
@@ -67,9 +74,14 @@ where
                 if selected_channels.contains(&channel) {
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-                    
-                    // Disambiguate to_f32 method
-                    let sample_as_f32 = AudioSample::to_f32(sample); // Specify the trait explicitly
+
+                    // Convert sample to f32 using the trait method or the provided conversion function
+                    let sample_as_f32 = if let Some(converter) = convert {
+                        converter(*sample) // Use the provided converter for i32
+                    } else {
+                        AudioSample::to_f32(sample) // Use trait method for other formats
+                    };
+
                     buffer.push(sample_as_f32);
 
                     // Manage buffer size by removing the oldest sample if it exceeds the max size
