@@ -8,9 +8,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use std::io::{self, Read};
 use std::sync::{Arc, Mutex};
-use audio_stream::build_input_stream;
+use audio_stream::{build_input_stream, CircularBuffer}; // Import CircularBuffer
 use plot::{MyApp, SpectrumApp};
 use eframe::NativeOptions;
+
+const MAX_BUFFER_SIZE: usize = 1024; // Set your desired buffer size
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -66,7 +68,7 @@ fn main() -> Result<()> {
             // Set up the stream config with the selected sample rate and number of channels
             let stream_config = StreamConfig {
                 channels: selected_config.channels(),
-                sample_rate: selected_config.min_sample_rate(), // Ensure this matches your usage
+                sample_rate: selected_config.min_sample_rate(),
                 buffer_size: cpal::BufferSize::Default,
             };
 
@@ -97,11 +99,11 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Initialize audio buffers for each selected channel
-            let audio_buffers: Arc<Vec<Mutex<Vec<f32>>>> = Arc::new(
+            // Initialize audio buffers for each selected channel using CircularBuffer
+            let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
                 selected_channels
                     .iter()
-                    .map(|_| Mutex::new(Vec::new()))
+                    .map(|_| Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE))) // Create CircularBuffer for each channel
                     .collect(),
             );
 
@@ -113,7 +115,7 @@ fn main() -> Result<()> {
                 SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?, // Removed conversion function
+                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 _ => return Err(anyhow::anyhow!("Unsupported sample format")),
             };
