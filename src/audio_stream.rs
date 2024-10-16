@@ -46,18 +46,13 @@ impl AudioSample for f64 {
     }
 }
 
-// Optional converter function to handle custom conversions (e.g., i32 to f32)
-pub fn i32_to_f32(input: i32) -> f32 {
-    input as f32 / MAX_I32 // Normalize i32 to f32 range (-1.0 to 1.0)
-}
-
+// Build input stream function
 pub fn build_input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     audio_buffers: Arc<Vec<Mutex<Vec<f32>>>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>, // List of channels to use
-    convert: Option<fn(T) -> f32>, // Optional conversion function (for i32)
 ) -> Result<Stream>
 where
     T: Sample + SizedSample + ToPrimitive + Debug + AudioSample + 'static,
@@ -69,20 +64,21 @@ where
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             // Fill the audio buffers for each selected channel
-            for (i, sample) in data.iter().enumerate() {
+            let mut buffer_f32: Vec<f32> = Vec::with_capacity(data.len());
+
+            // Convert all samples to f32
+            for sample in data.iter() {
+                buffer_f32.push(AudioSample::to_f32(sample));
+            }
+
+            // Distribute samples to appropriate buffers
+            for (i, sample_as_f32) in buffer_f32.iter().enumerate() {
                 let channel = i % channels;
                 if selected_channels.contains(&channel) {
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-
-                    // Convert sample to f32 using the trait method or the provided conversion function
-                    let sample_as_f32 = if let Some(converter) = convert {
-                        converter(*sample) // Use the provided converter for i32
-                    } else {
-                        AudioSample::to_f32(sample) // Use trait method for other formats
-                    };
-
-                    buffer.push(sample_as_f32);
+                    
+                    buffer.push(*sample_as_f32);
 
                     // Manage buffer size by removing the oldest sample if it exceeds the max size
                     if buffer.len() > MAX_BUFFER_SIZE {

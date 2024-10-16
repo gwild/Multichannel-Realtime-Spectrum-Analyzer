@@ -108,20 +108,13 @@ fn main() -> Result<()> {
             // Create the spectrum app state
             let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
 
-            // Build input stream based on sample format, using conversion for I32
+            // Build input stream based on sample format
             let stream = match selected_config.sample_format() {
-                SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone(), None)?,
-                SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone(), None)?,
-                SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone(), None)?,
-                SampleFormat::I32 => build_input_stream::<i32>(
-                    &selected_device, 
-                    &stream_config, 
-                    audio_buffers.clone(), 
-                    spectrum_app.clone(), 
-                    selected_channels.clone(),
-                    Some(convert::i32_to_f32),  // Use the conversion function for i32
-                )?,
-                SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone(), None)?,
+                SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?, // Removed conversion function
+                SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 _ => return Err(anyhow::anyhow!("Unsupported sample format")),
             };
 

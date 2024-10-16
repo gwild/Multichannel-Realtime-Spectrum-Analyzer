@@ -448,6 +448,8 @@ dependencies = [
  "eframe",
  "egui 0.22.0",
  "epi",
+ "jack",
+ "num-traits",
  "rustfft",
 ]
 
@@ -474,6 +476,12 @@ dependencies = [
  "shlex",
  "syn 2.0.79",
 ]
+
+[[package]]
+name = "bitflags"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aad18937a628ec6abcd26d1489012cc0e18c21798210f491af69ded9b881106d"
 
 [[package]]
 name = "bitflags"
@@ -1503,6 +1511,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "jack"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e15fc592e2e5a74a105ff507083c04db1aa20ba1b90d425362ba000e57422df"
+dependencies = [
+ "bitflags 0.7.0",
+ "jack-sys",
+ "lazy_static",
+ "libc",
+]
+
+[[package]]
+name = "jack-sys"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b91f2d2d10bc2bab38f4dfa4bc77123a988828af39dd3f30dd9db14d44f2cc1"
+dependencies = [
+ "lazy_static",
+ "libc",
+ "libloading 0.6.7",
+ "pkg-config",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1559,6 +1591,16 @@ name = "libc"
 version = "0.2.159"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "561d97a539a36e26a9a5fad1ea11a3039a67714694aaa379433e580854bc3dc5"
+
+[[package]]
+name = "libloading"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "351a32417a12d5f7e82c368a66781e307834dae04c6ce0cd4456d52989229883"
+dependencies = [
+ "cfg-if",
+ "winapi",
+]
 
 [[package]]
 name = "libloading"
