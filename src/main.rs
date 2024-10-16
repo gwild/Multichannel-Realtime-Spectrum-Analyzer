@@ -6,7 +6,7 @@ mod convert;  // Add the new module
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use std::io::{self, Read};
+use std::io::{self};
 use std::sync::{Arc, Mutex};
 use audio_stream::{build_input_stream, CircularBuffer}; // Import CircularBuffer
 use plot::{MyApp, SpectrumApp};
@@ -110,13 +110,13 @@ fn main() -> Result<()> {
             // Create the spectrum app state
             let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
 
-            // Build input stream based on sample format
+            // Build input stream based on sample format, prioritizing F32
             let stream = match selected_config.sample_format() {
                 SampleFormat::F32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::I16 => build_input_stream::<i16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::U16 => build_input_stream::<u16>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::I32 => build_input_stream::<i32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
-                SampleFormat::F64 => build_input_stream::<f64>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::I16 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::U16 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::I32 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
+                SampleFormat::F64 => build_input_stream::<f32>(&selected_device, &stream_config, audio_buffers.clone(), spectrum_app.clone(), selected_channels.clone())?,
                 _ => return Err(anyhow::anyhow!("Unsupported sample format")),
             };
 
