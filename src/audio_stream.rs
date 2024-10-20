@@ -110,25 +110,14 @@ where
                 let audio_data = buffer.get();
 
                 if !audio_data.is_empty() { // Ensure there is data to process
-                    // Compute the partials
+                    // Compute the partials and FFT results
                     let partials = compute_spectrum(audio_data, sample_rate);
-                    let partials_converted: Vec<(f64, f64)> = partials
-                        .iter()
-                        .map(|&(freq, amp)| (f64::from(freq), f64::from(amp)))
-                        .collect();
 
-                    // Print partials results for debugging
-                    println!("Channel {}: Partial Results: {:?}", channel, partials_converted);
-                        
-                    partials_results.push(partials_converted);
-
-                    // Compute FFT results
-                    let fft = compute_spectrum(audio_data, sample_rate);
-                    let fft_converted: Vec<(f64, f64)> = fft
-                        .iter()
-                        .map(|&(freq, amp)| (f64::from(freq), f64::from(amp)))
-                        .collect();
-                    fft_results.push(fft_converted);
+                    // Store the results as f32
+                    partials_results.push(partials.clone());
+                    fft_results.push(partials.clone());
+                    
+                    println!("Channel {}: Partial Results: {:?}", channel, partials);
                 } else {
                     // Optionally log a warning if there is no data to process
                     eprintln!("No data in buffer for channel {} to process.", channel);

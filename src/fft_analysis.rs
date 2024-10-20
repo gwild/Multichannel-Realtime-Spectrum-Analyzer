@@ -3,7 +3,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 const NUM_PARTIALS: usize = 12;
 const MIN_FREQUENCY: f32 = 20.0;
 const MAX_FREQUENCY: f32 = 1000.0;
-const DB_THRESHOLD: f32 = -64.0; // 24 dB threshold
+const DB_THRESHOLD: f32 = -32.0; // 24 dB threshold
 
 /// Computes the FFT spectrum from the given audio buffer.
 /// Returns a vector of (frequency, amplitude_db) pairs.
@@ -48,7 +48,7 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32) -> Vec<(f32, f32)> {
             } else {
                 f32::MIN // Avoid logarithm of zero by using a small negative value
             };
-            (frequency, amplitude_db)
+            (frequency, amplitude_db.abs()) // Return without rounding here
         })
         .collect();
 
@@ -67,13 +67,14 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32) -> Vec<(f32, f32)> {
         }
     }
 
-    // Limit the number of results to NUM_PARTIALS
-    filtered.iter()
+    // Round the results to two decimal places
+    let rounded_results: Vec<(f32, f32)> = filtered
+        .into_iter()
         .take(NUM_PARTIALS)
-        .map(|&(frequency, amplitude)| {
-            (round_to_two_decimals(frequency), round_to_two_decimals(amplitude))
-        })
-        .collect()
+        .map(|(freq, amp)| (round_to_two_decimals(freq), round_to_two_decimals(amp)))
+        .collect();
+
+    rounded_results // Return the rounded results
 }
 
 /// Rounds a floating point number to two decimal places.
