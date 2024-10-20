@@ -96,7 +96,7 @@ where
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
                     
                     // Convert the sample and push it into the circular buffer
-                    let sample_as_f32 = AudioSample::to_f32(sample);
+                    let sample_as_f32 = AudioSample::to_f32(sample); // Use the trait method for conversion
                     buffer.push(sample_as_f32);
                 }
             }
