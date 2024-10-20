@@ -3,7 +3,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 const NUM_PARTIALS: usize = 12;
 const MIN_FREQUENCY: f32 = 20.0;
 const MAX_FREQUENCY: f32 = 1000.0;
-const DB_THRESHOLD: f32 = -24.0; // 24 dB threshold
+const DB_THRESHOLD: f32 = -64.0; // 24 dB threshold
 
 /// Computes the FFT spectrum from the given audio buffer.
 /// Returns a vector of (frequency, amplitude_db) pairs.

@@ -1,7 +1,7 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
-mod convert;  // Add the new module
+// mod convert;  // Add the new module
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -12,7 +12,7 @@ use audio_stream::{build_input_stream, CircularBuffer}; // Import CircularBuffer
 use plot::{MyApp, SpectrumApp};
 use eframe::NativeOptions;
 
-const MAX_BUFFER_SIZE: usize = 4096; // Set your desired buffer size
+const MAX_BUFFER_SIZE: usize = 512; // Set your desired buffer size
 
 fn main() -> Result<()> {
     let host = cpal::default_host();

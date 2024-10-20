@@ -7,7 +7,6 @@ use crate::fft_analysis::compute_spectrum;
 use crate::plot::SpectrumApp;
 use std::fmt::Debug;
 
-const MAX_BUFFER_SIZE: usize = 4096; // Define a max buffer size
 const MAX_I32: f32 = i32::MAX as f32; // Define the max value for scaling
 
 // Trait for processing audio samples
@@ -120,7 +119,7 @@ where
 
                     // Print partials results for debugging
                     println!("Channel {}: Partial Results: {:?}", channel, partials_converted);
-                    
+                        
                     partials_results.push(partials_converted);
 
                     // Compute FFT results
