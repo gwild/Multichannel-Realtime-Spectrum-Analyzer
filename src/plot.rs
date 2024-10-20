@@ -1,10 +1,9 @@
 use std::sync::{Arc, Mutex};
 use eframe::egui;
-// use crate::fft_analysis;
 
 pub struct SpectrumApp {
-    pub partials: Vec<Vec<(f64, f64)>>, // Frequency, amplitude pairs for partials
-    pub fft_results: Vec<Vec<(f64, f64)>>, // Frequency, amplitude pairs for FFT results
+    pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
+    pub fft_results: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for FFT results
 }
 
 impl SpectrumApp {
@@ -64,7 +63,7 @@ impl eframe::App for MyApp {
                         } else {
                             spectrum_app.fft_results[channel]
                                 .iter()
-                                .map(|&(freq, amp)| [freq, amp])
+                                .map(|&(freq, amp)| [freq as f64, amp as f64]) // Convert f32 to f64
                                 .collect()
                         };
 
@@ -85,7 +84,7 @@ impl eframe::App for MyApp {
                         } else {
                             spectrum_app.partials[channel]
                                 .iter()
-                                .map(|&(freq, amp)| egui::plot::Bar::new(freq, amp).width(3.0))
+                                .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64).width(3.0)) // Convert f32 to f64
                                 .collect()
                         };
 
