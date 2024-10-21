@@ -3,12 +3,14 @@ use eframe::egui;
 
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
+    pub fft_results: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for FFT results
 }
 
 impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
-            partials: vec![Vec::new(); num_channels], // Initialize partial results
+            partials: vec![Vec::new(); num_channels],
+            fft_results: vec![Vec::new(); num_channels], // Initialize FFT results
         }
     }
 }
@@ -30,7 +32,7 @@ impl eframe::App for MyApp {
         ctx.set_visuals(dark_visuals);
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Frequency vs Amplitude (Partials)");
+            ui.label("Frequency vs Amplitude");
 
             // Define colors for each channel
             let colors = vec![
@@ -53,8 +55,30 @@ impl eframe::App for MyApp {
                 .include_y(0.0)    // Set y scale to 0
                 .include_y(80.0)   // Maximum y scale set to 80
                 .show(ui, |plot_ui| {
+                    // Iterate over each channel's FFT results and plot lines
+                    for channel in 0..spectrum_app.fft_results.len() {
+                        // Plot empty or minimal data if the channel has no signal
+                        let line: Vec<[f64; 2]> = if spectrum_app.fft_results[channel].is_empty() {
+                            vec![[0.0, 0.0]] // Dummy value to ensure the channel appears in the legend
+                        } else {
+                            spectrum_app.fft_results[channel]
+                                .iter()
+                                .map(|&(freq, amp)| [freq as f64, amp as f64]) // Convert f32 to f64
+                                .collect()
+                        };
+
+                        // Create a line chart for the FFT results
+                        let line_chart = egui::plot::Line::new(line)
+                            .name(format!("FFT Channel {}", channel + 1))
+                            .color(colors[channel % colors.len()]);
+
+                        // Draw the line chart in the plot UI
+                        plot_ui.line(line_chart);
+                    }
+
                     // Plot partials as bars for each channel
                     for channel in 0..spectrum_app.partials.len() {
+                        // Plot empty or minimal data if the channel has no signal
                         let bars: Vec<egui::plot::Bar> = if spectrum_app.partials[channel].is_empty() {
                             vec![egui::plot::Bar::new(0.0, 0.0)] // Dummy value to ensure the channel appears in the legend
                         } else {

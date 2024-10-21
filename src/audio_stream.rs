@@ -103,7 +103,7 @@ where
 
             // Compute spectrum for each selected channel and store the partials and FFT results
             let mut partials_results = Vec::with_capacity(selected_channels.len());
-            let mut fft_results = Vec::with_capacity(selected_channels.len());
+            // let mut fft_results = Vec::with_capacity(selected_channels.len());
 
             for (i, &channel) in selected_channels.iter().enumerate() {
                 let buffer = audio_buffers[i].lock().unwrap();
@@ -115,7 +115,7 @@ where
 
                     // Store the results as f32
                     partials_results.push(partials.clone());
-                    fft_results.push(partials.clone());
+                    // fft_results.push(partials.clone());
                     
                     println!("Channel {}: Partial Results: {:?}", channel, partials);
                 } else {
@@ -127,7 +127,7 @@ where
             // Update the spectrum_app with the new partials and FFT results for each channel
             let mut app = spectrum_app.lock().unwrap();
             app.partials.clone_from_slice(&partials_results);
-            app.fft_results.clone_from_slice(&fft_results);
+            // app.fft_results.clone_from_slice(&fft_results);
         },
         move |err| {
             eprintln!("Stream error: {:?}", err);
