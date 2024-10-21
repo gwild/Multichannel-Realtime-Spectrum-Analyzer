@@ -125,7 +125,7 @@ fn main() -> Result<()> {
 
             // Launch the eframe application for plotting
             let native_options = NativeOptions::default();
-            eframe::run_native(
+            if let Err(e) = eframe::run_native(
                 "Real-Time Spectrum Analyzer",
                 native_options,
                 Box::new(move |_cc| {
@@ -133,7 +133,9 @@ fn main() -> Result<()> {
                         spectrum: spectrum_app.clone(),  // Pass spectrum app to MyApp
                     })
                 }),
-            );
+            ) {
+                eprintln!("Error launching application: {:?}", e);
+            }
         } else {
             println!("Invalid configuration index. Exiting.");
         }
