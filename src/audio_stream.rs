@@ -82,6 +82,9 @@ pub fn build_input_stream<T>(
 where
     T: Sample + SizedSample + ToPrimitive + Debug + AudioSample + 'static,
 {
+    println!("Building input stream with config: {:?}", config);
+    println!("Selected channels: {:?}", selected_channels);
+
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
 
@@ -135,5 +138,6 @@ where
         None,
     )?;
 
+    println!("Stream built successfully");
     Ok(stream)
 }
