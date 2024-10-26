@@ -8,6 +8,7 @@ use crate::plot::SpectrumApp;
 use std::fmt::Debug;
 
 const MAX_I32: f32 = i32::MAX as f32; // Define the max value for scaling
+const NUM_PARTIALS: usize = 12;
 
 // Trait for processing audio samples
 pub trait AudioSample {
@@ -77,11 +78,16 @@ pub fn build_input_stream<T>(
     config: &StreamConfig,
     audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
-    selected_channels: Vec<usize>, // List of channels to use
+    selected_channels: Vec<usize>,
 ) -> Result<Stream>
 where
     T: Sample + SizedSample + ToPrimitive + Debug + AudioSample + 'static,
 {
+    // Add this check at the beginning of the function
+    if selected_channels.is_empty() {
+        return Err(anyhow::anyhow!("No channels selected"));
+    }
+
     println!("Building input stream with config: {:?}", config);
     println!("Selected channels: {:?}", selected_channels);
 
@@ -97,40 +103,33 @@ where
                 if selected_channels.contains(&channel) {
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-                    
-                    // Convert the sample and push it into the circular buffer
-                    let sample_as_f32 = AudioSample::to_f32(sample); // Use the trait method for conversion
+                    let sample_as_f32 = AudioSample::to_f32(sample);
                     buffer.push(sample_as_f32);
                 }
             }
 
-            // Compute spectrum for each selected channel and store the partials and FFT results
-            let mut partials_results = Vec::with_capacity(selected_channels.len());
-            // let mut fft_results = Vec::with_capacity(selected_channels.len());
+            // Initialize partials_results with zeroes for all channels
+            let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
+            // Compute spectrum for each selected channel
             for (i, &channel) in selected_channels.iter().enumerate() {
                 let buffer = audio_buffers[i].lock().unwrap();
                 let audio_data = buffer.get();
 
-                if !audio_data.is_empty() { // Ensure there is data to process
-                    // Compute the partials and FFT results
-                    let partials = compute_spectrum(audio_data, sample_rate);
-
-                    // Store the results as f32
-                    partials_results.push(partials.clone());
-                    // fft_results.push(partials.clone());
-                    
-                    println!("Channel {}: Partial Results: {:?}", channel, partials);
-                } else {
-                    // Optionally log a warning if there is no data to process
-                    eprintln!("No data in buffer for channel {} to process.", channel);
+                if !audio_data.is_empty() {
+                    let computed_partials = compute_spectrum(audio_data, sample_rate);
+                    // Only update partials that were actually computed
+                    for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
+                        partials_results[i][j] = partial;
+                    }
                 }
+
+                println!("Channel {}: Partial Results: {:?}", channel, partials_results[i]);
             }
 
-            // Update the spectrum_app with the new partials and FFT results for each channel
+            // Update the spectrum_app with the new partials results
             let mut app = spectrum_app.lock().unwrap();
-            app.partials.clone_from_slice(&partials_results);
-            // app.fft_results.clone_from_slice(&fft_results);
+            app.partials = partials_results;
         },
         move |err| {
             eprintln!("Stream error: {:?}", err);

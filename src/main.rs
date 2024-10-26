@@ -43,31 +43,50 @@ fn main() -> Result<()> {
 
     // Print supported input configurations
     println!("Supported input configs:");
-    for config in selected_device.supported_input_configs()? {
-        println!("  {:?}", config);
+    let mut supported_configs = Vec::new();
+    for (i, config) in selected_device.supported_input_configs()?.enumerate() {
+        println!("  [{}]", i);
+        println!("    Channels: {}", config.channels());
+        println!("    Sample Rate: {} - {} Hz", config.min_sample_rate().0, config.max_sample_rate().0);
+        println!("    Buffer Size: {:?}", config.buffer_size());
+        println!("    Sample Format: {:?}", config.sample_format());
+        println!();  // Add a blank line between configs for better readability
+        supported_configs.push(config);
     }
 
-    // Get default input config
-    let default_config = selected_device.default_input_config()?;
-    println!("Default input config: {:?}", default_config);
+    println!("Enter the index of the desired configuration:");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let config_index: usize = input.trim().parse()?;
 
-    // Create a config with the default settings
-    let config: StreamConfig = default_config.clone().into();
+    let selected_config = supported_configs[config_index].with_max_sample_rate();
+    println!("Selected configuration:");
+    println!("  Channels: {}", selected_config.channels());
+    println!("  Sample Rate: {} Hz", selected_config.sample_rate().0);
+    println!("  Buffer Size: {:?}", selected_config.buffer_size());
+    println!("  Sample Format: {:?}", selected_config.sample_format());
 
-    // Prompt user for channel selection
-    print!("Enter the channel numbers to use (comma-separated, e.g., 0,1): ");
-    io::stdout().flush()?;
-    let mut channel_input = String::new();
-    io::stdin().read_line(&mut channel_input)?;
+    let config = StreamConfig::from(selected_config.clone());
+    let sample_format = selected_config.sample_format();
 
-    // Parse channel input
-    let selected_channels: Vec<usize> = channel_input
+    println!("\nEnter the channel numbers to use (comma-separated, e.g., 0,1):");
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let selected_channels: Vec<usize> = input
         .trim()
         .split(',')
         .filter_map(|s| s.parse().ok())
         .collect();
 
     println!("Selected channels: {:?}", selected_channels);
+
+    // After parsing selected_channels
+    let max_channel = config.channels as usize - 1;
+    for &channel in &selected_channels {
+        if channel > max_channel {
+            return Err(anyhow!("Invalid channel selected. Maximum channel is {}", max_channel));
+        }
+    }
 
     // Create audio buffers for selected channels
     let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
@@ -81,7 +100,7 @@ fn main() -> Result<()> {
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
 
     // Build the input stream
-    let stream = match default_config.sample_format() {
+    let stream = match sample_format {
         SampleFormat::F32 => build_input_stream::<f32>(
             selected_device,
             &config,
@@ -115,9 +134,7 @@ fn main() -> Result<()> {
         "Real-Time Spectrum Analyzer",
         native_options,
         Box::new(move |_cc| {
-            Box::new(plot::MyApp {
-                spectrum: spectrum_app.clone(),  // Pass spectrum app to MyApp
-            })
+            Box::new(plot::MyApp::new(spectrum_app.clone()))
         }),
     ) {
         eprintln!("Error launching application: {:?}", e);
