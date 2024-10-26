@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 use eframe::egui;
+use egui::plot::{Plot, BarChart};
+use eframe::NativeOptions;
 
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
@@ -74,4 +76,13 @@ impl eframe::App for MyApp {
                 });
         });
     }
+}
+
+// Add this function to make it accessible from main.rs
+pub fn run_native(
+    app_name: &str,
+    native_options: NativeOptions,
+    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>>,
+) -> Result<(), eframe::Error> {
+    eframe::run_native(app_name, native_options, app_creator)
 }

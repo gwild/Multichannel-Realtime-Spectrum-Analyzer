@@ -1,18 +1,15 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
-// mod convert;  // Add the new module
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
-use std::io::{self};
+use std::io;
 use std::sync::{Arc, Mutex};
-use audio_stream::{build_input_stream, CircularBuffer}; // Import CircularBuffer
-use plot::{MyApp, SpectrumApp};
-use eframe::NativeOptions;
+use audio_stream::{build_input_stream, CircularBuffer};
 
-const MAX_BUFFER_SIZE: usize = 512; // Set your desired buffer size
+const MAX_BUFFER_SIZE: usize = 512;
 
 fn main() -> Result<()> {
     let host = cpal::default_host();
@@ -108,7 +105,7 @@ fn main() -> Result<()> {
             );
 
             // Create the spectrum app state
-            let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
+            let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
 
             // Build input stream based on sample format, prioritizing F32
             let stream = match selected_config.sample_format() {
@@ -124,12 +121,12 @@ fn main() -> Result<()> {
             stream.play()?;
 
             // Launch the eframe application for plotting
-            let native_options = NativeOptions::default();
-            if let Err(e) = eframe::run_native(
+            let native_options = plot::NativeOptions::default();
+            if let Err(e) = plot::run_native(
                 "Real-Time Spectrum Analyzer",
                 native_options,
                 Box::new(move |_cc| {
-                    Box::new(MyApp {
+                    Box::new(plot::MyApp {
                         spectrum: spectrum_app.clone(),  // Pass spectrum app to MyApp
                     })
                 }),
