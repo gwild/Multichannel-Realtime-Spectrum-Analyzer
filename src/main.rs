@@ -2,6 +2,7 @@ mod audio_stream;
 mod fft_analysis;
 mod plot;
 
+use eframe::NativeOptions;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -121,7 +122,7 @@ fn main() -> Result<()> {
             stream.play()?;
 
             // Launch the eframe application for plotting
-            let native_options = plot::NativeOptions::default();
+            let native_options = NativeOptions::default();
             if let Err(e) = plot::run_native(
                 "Real-Time Spectrum Analyzer",
                 native_options,

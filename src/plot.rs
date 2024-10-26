@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
-use eframe::NativeOptions;
+pub use eframe::NativeOptions;
 
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
@@ -47,7 +47,7 @@ impl eframe::App for MyApp {
             ];
 
             // Customize plot style using Plot's settings
-            egui::plot::Plot::new("spectrum_plot")
+            Plot::new("spectrum_plot")
                 .legend(egui::plot::Legend::default())
                 .view_aspect(2.0)  // Adjust aspect ratio (optional)
                 .include_x(0.0)    // Fixed x scale from 0 Hz
@@ -66,7 +66,7 @@ impl eframe::App for MyApp {
                                 .collect()
                         };
 
-                        let bar_chart = egui::plot::BarChart::new(bars)
+                        let bar_chart = BarChart::new(bars)
                             .name(format!("Partials Channel {}", channel + 1))
                             .color(colors[channel % colors.len()]);
 
