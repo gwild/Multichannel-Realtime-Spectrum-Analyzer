@@ -1,11 +1,11 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::{DeviceTrait};
 use cpal::{Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use crate::conversion::{AudioSample, convert_i32_buffer_to_f32, f32_to_i16}; // Import conversions
-use rfd::MessageDialog;
 
 // Circular buffer implementation
 pub struct CircularBuffer {
@@ -55,11 +55,10 @@ pub fn build_input_stream(
     let sample_format = device.default_input_config()?.sample_format();
     println!("Detected sample format: {:?}", sample_format); // Print detected sample format
 
-    // Wait for the user to press the spacebar to continue
-    MessageDialog::new()
-        .set_title("Continue")
-        .set_description("Press the spacebar to continue...")
-        .show();
+    // Wait for user to press any key to continue
+    print!("Press any key to continue...");
+    io::stdout().flush()?;  // Ensure prompt is displayed before waiting
+    let _ = io::stdin().read_line(&mut String::new());
 
     let stream = match sample_format {
         cpal::SampleFormat::I16 => device.build_input_stream(
