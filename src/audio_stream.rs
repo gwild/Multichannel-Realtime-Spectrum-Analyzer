@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
