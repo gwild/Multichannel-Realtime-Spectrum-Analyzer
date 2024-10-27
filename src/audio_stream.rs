@@ -99,11 +99,12 @@ where
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            // Convert data to f32 if it's i32
-            let data_as_f32: Vec<f32> = if std::any::TypeId::of::<T>() == std::any::TypeId::of::<i32>() {
-                convert_i32_buffer_to_f32(data.iter().map(|s| s.to_i32().unwrap()).collect::<Vec<i32>>().as_slice(), channels)
-            } else {
-                data.iter().map(|s| AudioSample::to_f32(s)).collect() // Remove the & reference
+            // Ensure conversion for I32 samples
+            let data_as_f32: Vec<f32> = match std::any::TypeId::of::<T>() {
+                id if id == std::any::TypeId::of::<i32>() => {
+                    convert_i32_buffer_to_f32(data.iter().map(|s| s.to_i32().unwrap()).collect::<Vec<i32>>().as_slice(), channels)
+                }
+                _ => data.iter().map(|s| AudioSample::to_f32(s)).collect(),
             };
 
             // Fill the audio buffers for each selected channel
