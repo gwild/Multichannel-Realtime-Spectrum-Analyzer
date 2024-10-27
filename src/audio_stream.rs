@@ -6,6 +6,7 @@ use num_traits::ToPrimitive;
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use std::fmt::Debug;
+use crate::convert::{convert_i32_buffer_to_f32, f32_to_i16, i16_to_f32}; // Import conversion functions
 
 // Trait for processing audio samples
 pub trait AudioSample {
@@ -98,14 +99,20 @@ where
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
+            // Convert data to f32 if it's i32
+            let data_as_f32: Vec<f32> = if std::any::TypeId::of::<T>() == std::any::TypeId::of::<i32>() {
+                convert_i32_buffer_to_f32(data.iter().map(|s| s.to_i32().unwrap()).collect::<Vec<i32>>().as_slice(), channels)
+            } else {
+                data.iter().map(|s| AudioSample::to_f32(s)).collect() // Remove the & reference
+            };
+
             // Fill the audio buffers for each selected channel
-            for (i, sample) in data.iter().enumerate() {
+            for (i, &sample) in data_as_f32.iter().enumerate() {
                 let channel = i % channels;
                 if selected_channels.contains(&channel) {
                     let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
                     let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-                    let sample_as_f32 = AudioSample::to_f32(sample);
-                    buffer.push(sample_as_f32);
+                    buffer.push(sample);
                 }
             }
 
@@ -140,4 +147,20 @@ where
 
     println!("Stream built successfully");
     Ok(stream)
+}
+
+pub fn process_audio_stream(
+    input_samples: &[f32],
+    output_buffer: &mut [i16],
+    selected_channels: &[usize],
+) {
+    // Convert input samples from f32 to i16
+    let converted_samples = f32_to_i16(input_samples);
+
+    // Process each channel separately
+    for &channel in selected_channels {
+        // Assuming `output_buffer` is organized by channels
+        let channel_samples = &mut output_buffer[channel * input_samples.len()..(channel + 1) * input_samples.len()];
+        channel_samples.copy_from_slice(&converted_samples);
+    }
 }
