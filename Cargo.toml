@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cpal = "0.15"
+cpal = "0.15.3"
 rustfft = "6.0"
 egui = "0.22"
 eframe = "0.22"

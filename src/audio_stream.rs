@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 use std::io::{self, Write};
@@ -33,6 +33,21 @@ impl CircularBuffer {
     }
 }
 
+// Function to list supported input formats
+fn list_supported_input_formats(device: &cpal::Device) -> Result<(), anyhow::Error> {
+    let supported_configs = device.supported_input_configs()?;
+    println!("Supported input configurations:");
+    for config in supported_configs {
+        println!(
+            "Channels: {}, Sample Rate: {:?}, Sample Format: {:?}",
+            config.channels(),
+            config.min_sample_rate()..=config.max_sample_rate(),
+            config.sample_format()
+        );
+    }
+    Ok(())
+}
+
 // Build input stream function
 pub fn build_input_stream(
     device: &cpal::Device,
@@ -50,6 +65,9 @@ pub fn build_input_stream(
 
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
+
+    // List supported input formats for the selected device
+    list_supported_input_formats(device)?;
 
     // Iterate over supported configurations to find a compatible one
     let supported_configs = device.supported_input_configs()?;
@@ -110,7 +128,10 @@ pub fn build_input_stream(
                 },
                 None,
             )?),
-            _ => None,
+            _ => {
+                eprintln!("Unsupported sample format: {:?}", sample_format);
+                None
+            },
         };
 
         if stream.is_some() {
