@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::{DeviceTrait};
 use cpal::{Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
@@ -145,6 +145,7 @@ fn process_samples(
     app.partials = partials_results;
 }
 
+// Function for processing audio stream (optional, for output purposes)
 pub fn process_audio_stream(
     input_samples: &[f32],
     output_buffer: &mut [i16],
