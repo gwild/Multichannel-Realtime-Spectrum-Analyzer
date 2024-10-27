@@ -52,6 +52,8 @@ pub fn build_input_stream(
 
     // Determine the sample format and handle accordingly
     let sample_format = device.default_input_config()?.sample_format();
+    println!("Detected sample format: {:?}", sample_format); // Debugging line
+
     let stream = match sample_format {
         cpal::SampleFormat::I16 => device.build_input_stream(
             config,
