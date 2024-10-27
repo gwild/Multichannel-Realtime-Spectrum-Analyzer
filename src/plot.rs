@@ -18,6 +18,7 @@ impl SpectrumApp {
 pub struct MyApp {
     pub spectrum: Arc<Mutex<SpectrumApp>>,
     colors: Vec<egui::Color32>,
+    y_scale: f32, // Y scale for the plot
 }
 
 impl MyApp {
@@ -32,7 +33,11 @@ impl MyApp {
             egui::Color32::from_rgb(75, 0, 130),   // Channel 7 - Indigo
             egui::Color32::from_rgb(255, 255, 0),  // Channel 8 - Yellow
         ];
-        MyApp { spectrum, colors }
+        MyApp {
+            spectrum,
+            colors,
+            y_scale: 80.0, // Default Y scale value
+        }
     }
 }
 
@@ -48,6 +53,12 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("Frequency vs Amplitude (Partials)");
 
+            // Slider to adjust the Y scale
+            ui.horizontal(|ui| {
+                ui.label("Y Scale:");
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("Y Scale"));
+            });
+
             // Lock the spectrum app only for the duration of data access
             let partials = {
                 let spectrum_app = self.spectrum.lock().unwrap();
@@ -61,7 +72,7 @@ impl eframe::App for MyApp {
                 .include_x(0.0)    // Fixed x scale from 0 Hz
                 .include_x(1000.0) // Maximum x scale set to 1000 Hz
                 .include_y(0.0)    // Set y scale to 0
-                .include_y(80.0)   // Maximum y scale set to 80
+                .include_y(self.y_scale) // Use adjustable Y scale
                 .show(ui, |plot_ui| {
                     // Plot partials as bars for each channel
                     for (channel, channel_partials) in partials.iter().enumerate() {

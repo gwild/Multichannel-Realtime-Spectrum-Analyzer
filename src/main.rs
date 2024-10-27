@@ -1,7 +1,7 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
-mod convert;
+mod conversion;
 
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

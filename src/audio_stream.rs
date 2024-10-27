@@ -1,50 +1,10 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait}; // Removed HostTrait as it's unused
-use cpal::{Stream, StreamConfig}; // Removed Sample and SizedSample as they're unused
+use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::{Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
-use crate::convert::{convert_i32_buffer_to_f32, f32_to_i16}; // Removed i16_to_f32 as it's unused
-
-// Trait for processing audio samples
-pub trait AudioSample {
-    fn to_f32(&self) -> f32; // Convert to f32
-}
-
-impl AudioSample for f32 {
-    fn to_f32(&self) -> f32 {
-        *self // Already f32
-    }
-}
-
-impl AudioSample for i32 {
-    fn to_f32(&self) -> f32 {
-        if *self == i32::MIN {
-            -1.0
-        } else {
-            *self as f32 / i32::MAX as f32
-        }
-    }
-}
-
-// Implementing the trait for additional types
-impl AudioSample for i16 {
-    fn to_f32(&self) -> f32 {
-        (*self as f32 / i16::MAX as f32).clamp(-1.0, 1.0) // Scale i16 to f32
-    }
-}
-
-impl AudioSample for u16 {
-    fn to_f32(&self) -> f32 {
-        (*self as f32 / u16::MAX as f32).clamp(0.0, 1.0) // Scale u16 to f32
-    }
-}
-
-impl AudioSample for f64 {
-    fn to_f32(&self) -> f32 {
-        *self as f32 // Convert f64 to f32 directly
-    }
-}
+use crate::conversion::{AudioSample, convert_i32_buffer_to_f32, f32_to_i16}; // Import conversions
 
 // Circular buffer implementation
 pub struct CircularBuffer {
@@ -91,12 +51,12 @@ pub fn build_input_stream(
     let sample_rate = config.sample_rate.0;
 
     // Determine the sample format and handle accordingly
-    let sample_format = device.default_input_config()?.sample_format(); // Use method call
+    let sample_format = device.default_input_config()?.sample_format();
     let stream = match sample_format {
         cpal::SampleFormat::I16 => device.build_input_stream(
             config,
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let data_as_f32: Vec<f32> = data.iter().map(|s| AudioSample::to_f32(s)).collect();
+                let data_as_f32: Vec<f32> = data.iter().map(|s| s.to_f32()).collect();
                 process_samples(data_as_f32, channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
             },
             move |err| {
@@ -107,7 +67,7 @@ pub fn build_input_stream(
         cpal::SampleFormat::U16 => device.build_input_stream(
             config,
             move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let data_as_f32: Vec<f32> = data.iter().map(|s| AudioSample::to_f32(s)).collect();
+                let data_as_f32: Vec<f32> = data.iter().map(|s| s.to_f32()).collect();
                 process_samples(data_as_f32, channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
             },
             move |err| {
@@ -172,7 +132,6 @@ fn process_samples(
 
         if !audio_data.is_empty() {
             let computed_partials = compute_spectrum(audio_data, sample_rate);
-            // Only update partials that were actually computed
             for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                 partials_results[i][j] = partial;
             }
@@ -196,7 +155,6 @@ pub fn process_audio_stream(
 
     // Process each channel separately
     for &channel in selected_channels {
-        // Assuming `output_buffer` is organized by channels
         let channel_samples = &mut output_buffer[channel * input_samples.len()..(channel + 1) * input_samples.len()];
         channel_samples.copy_from_slice(&converted_samples);
     }
