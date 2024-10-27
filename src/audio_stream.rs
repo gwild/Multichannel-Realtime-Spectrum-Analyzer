@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use crate::conversion::{AudioSample, convert_i32_buffer_to_f32, f32_to_i16}; // Import conversions
+use rfd::MessageDialog;
 
 // Circular buffer implementation
 pub struct CircularBuffer {
@@ -52,7 +53,13 @@ pub fn build_input_stream(
 
     // Determine the sample format and handle accordingly
     let sample_format = device.default_input_config()?.sample_format();
-    println!("Detected sample format: {:?}", sample_format); // Debugging line
+    println!("Detected sample format: {:?}", sample_format); // Print detected sample format
+
+    // Wait for the user to press the spacebar to continue
+    MessageDialog::new()
+        .set_title("Continue")
+        .set_description("Press the spacebar to continue...")
+        .show();
 
     let stream = match sample_format {
         cpal::SampleFormat::I16 => device.build_input_stream(
