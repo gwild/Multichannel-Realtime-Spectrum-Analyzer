@@ -51,64 +51,75 @@ pub fn build_input_stream(
     let channels = config.channels as usize;
     let sample_rate = config.sample_rate.0;
 
-    // Determine the sample format and handle accordingly
-    let sample_format = device.default_input_config()?.sample_format();
-    println!("Detected sample format: {:?}", sample_format); // Print detected sample format
+    // Iterate over supported configurations to find a compatible one
+    let supported_configs = device.supported_input_configs()?;
+    let mut stream = None;
 
-    // Wait for user to press any key to continue
-    print!("Press any key to continue...");
-    io::stdout().flush()?;  // Ensure prompt is displayed before waiting
-    let _ = io::stdin().read_line(&mut String::new());
+    for supported_config in supported_configs {
+        let sample_format = supported_config.sample_format();
+        println!("Trying sample format: {:?}", sample_format);
 
-    let stream = match sample_format {
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let data_as_f32: Vec<f32> = data.iter().map(|s| s.to_f32()).collect();
-                process_samples(data_as_f32, channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
-            },
-            move |err| {
-                eprintln!("Stream error: {:?}", err);
-            },
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            config,
-            move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let data_as_f32: Vec<f32> = data.iter().map(|s| s.to_f32()).collect();
-                process_samples(data_as_f32, channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
-            },
-            move |err| {
-                eprintln!("Stream error: {:?}", err);
-            },
-            None,
-        )?,
-        cpal::SampleFormat::I32 => device.build_input_stream(
-            config,
-            move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                let data_as_f32 = convert_i32_buffer_to_f32(data, channels);
-                process_samples(data_as_f32, channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
-            },
-            move |err| {
-                eprintln!("Stream error: {:?}", err);
-            },
-            None,
-        )?,
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                process_samples(data.to_vec(), channels, &audio_buffers, &spectrum_app, &selected_channels, sample_rate);
-            },
-            move |err| {
-                eprintln!("Stream error: {:?}", err);
-            },
-            None,
-        )?,
-        _ => return Err(anyhow::anyhow!("Unsupported sample format in Rust")),
-    };
+        let config = supported_config.with_max_sample_rate().into();
 
-    println!("Stream built successfully");
-    Ok(stream)
+        // Clone the Arc and Vec for each iteration
+        let audio_buffers_clone = Arc::clone(&audio_buffers);
+        let spectrum_app_clone = Arc::clone(&spectrum_app);
+        let selected_channels_clone = selected_channels.clone();
+
+        stream = match sample_format {
+            cpal::SampleFormat::I16 => Some(device.build_input_stream(
+                &config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let data_as_f32: Vec<f32> = data.iter().map(|s| *s as f32).collect();
+                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
+                },
+                move |err| {
+                    eprintln!("Stream error: {:?}", err);
+                },
+                None,
+            )?),
+            cpal::SampleFormat::U16 => Some(device.build_input_stream(
+                &config,
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    let data_as_f32: Vec<f32> = data.iter().map(|s| *s as f32).collect();
+                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
+                },
+                move |err| {
+                    eprintln!("Stream error: {:?}", err);
+                },
+                None,
+            )?),
+            cpal::SampleFormat::I32 => Some(device.build_input_stream(
+                &config,
+                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    let data_as_f32 = convert_i32_buffer_to_f32(data, channels);
+                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
+                },
+                move |err| {
+                    eprintln!("Stream error: {:?}", err);
+                },
+                None,
+            )?),
+            cpal::SampleFormat::F32 => Some(device.build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    process_samples(data.to_vec(), channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
+                },
+                move |err| {
+                    eprintln!("Stream error: {:?}", err);
+                },
+                None,
+            )?),
+            _ => None,
+        };
+
+        if stream.is_some() {
+            println!("Stream built successfully with format: {:?}", sample_format);
+            break;
+        }
+    }
+
+    stream.ok_or_else(|| anyhow::anyhow!("Unsupported sample format in Rust"))
 }
 
 // Helper function to process samples
