@@ -1,6 +1,6 @@
 use rustfft::{FftPlanner, num_complex::Complex};
 
-const NUM_PARTIALS: usize = 12;
+pub const NUM_PARTIALS: usize = 12;
 const MIN_FREQUENCY: f32 = 20.0;
 const MAX_FREQUENCY: f32 = 1000.0;
 const DB_THRESHOLD: f32 = -32.0; // 24 dB threshold

@@ -3,12 +3,9 @@ use cpal::traits::DeviceTrait;
 use cpal::{Stream, StreamConfig, Sample, SizedSample};
 use std::sync::{Arc, Mutex};
 use num_traits::ToPrimitive;
-use crate::fft_analysis::compute_spectrum;
+use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use std::fmt::Debug;
-
-const MAX_I32: f32 = i32::MAX as f32; // Define the max value for scaling
-const NUM_PARTIALS: usize = 12;
 
 // Trait for processing audio samples
 pub trait AudioSample {
@@ -23,7 +20,11 @@ impl AudioSample for f32 {
 
 impl AudioSample for i32 {
     fn to_f32(&self) -> f32 {
-        (*self as f32 / MAX_I32).clamp(-1.0, 1.0) // Scale i32 to f32
+        if *self == i32::MIN {
+            -1.0
+        } else {
+            *self as f32 / i32::MAX as f32
+        }
     }
 }
 
