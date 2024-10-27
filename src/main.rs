@@ -102,21 +102,21 @@ fn main() -> Result<()> {
 
     // Build the input stream
     let stream = match sample_format {
-        SampleFormat::F32 => build_input_stream::<f32>(
+        SampleFormat::F32 => build_input_stream(
             selected_device,
             &config,
             audio_buffers.clone(),
             spectrum_app.clone(),
             selected_channels.clone(),
         ),
-        SampleFormat::I16 => build_input_stream::<i16>(
+        SampleFormat::I16 => build_input_stream(
             selected_device,
             &config,
             audio_buffers.clone(),
             spectrum_app.clone(),
             selected_channels.clone(),
         ),
-        SampleFormat::U16 => build_input_stream::<u16>(
+        SampleFormat::U16 => build_input_stream(
             selected_device,
             &config,
             audio_buffers.clone(),

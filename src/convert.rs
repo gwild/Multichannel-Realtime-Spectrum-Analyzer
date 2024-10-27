@@ -1,4 +1,4 @@
-pub fn convert_i32_buffer_to_f32(input_buffer: &[i32], num_channels: usize) -> Vec<f32> {
+pub fn convert_i32_buffer_to_f32(input_buffer: &[i32], _num_channels: usize) -> Vec<f32> {
     input_buffer
         .iter()
         .map(|&sample| {
