@@ -104,7 +104,7 @@ pub fn build_input_stream(
             },
             None,
         )?,
-        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+        _ => return Err(anyhow::anyhow!("Unsupported sample format in Rust")),
     };
 
     println!("Stream built successfully");
