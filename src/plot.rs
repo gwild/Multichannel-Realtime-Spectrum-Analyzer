@@ -19,6 +19,7 @@ pub struct MyApp {
     pub spectrum: Arc<Mutex<SpectrumApp>>,
     colors: Vec<egui::Color32>,
     y_scale: f32, // Y scale for the plot
+    x_max: f64,
 }
 
 impl MyApp {
@@ -37,6 +38,7 @@ impl MyApp {
             spectrum,
             colors,
             y_scale: 80.0, // Default Y scale value
+            x_max: 1000.0,
         }
     }
 }
@@ -57,6 +59,8 @@ impl eframe::App for MyApp {
             ui.horizontal(|ui| {
                 ui.label("Y Scale:");
                 ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("Y Scale"));
+                ui.label("Bar Width:");
+                ui.add(egui::Slider::new(&mut self.x_max, 100.0..=5000.0).text("Hz"));
             });
 
             // Lock the spectrum app only for the duration of data access
@@ -70,7 +74,7 @@ impl eframe::App for MyApp {
                 .legend(egui::plot::Legend::default())
                 .view_aspect(2.0)  // Adjust aspect ratio (optional)
                 .include_x(0.0)    // Fixed x scale from 0 Hz
-                .include_x(1000.0) // Maximum x scale set to 1000 Hz
+                .include_x(self.x_max)  // Use configurable maximum
                 .include_y(0.0)    // Set y scale to 0
                 .include_y(self.y_scale) // Use adjustable Y scale
                 .show(ui, |plot_ui| {
