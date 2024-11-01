@@ -468,6 +468,7 @@ dependencies = [
  "num-traits",
  "rfd",
  "rustfft",
+ "winapi",
 ]
 
 [[package]]
