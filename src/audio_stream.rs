@@ -159,7 +159,7 @@ fn process_samples(
             let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
             let mut buffer = audio_buffers[buffer_index].lock().unwrap();
             buffer.push(sample);
-            println!("Pushed sample to channel {}: {}", channel, sample); // Debugging line
+            // println!("Pushed sample to channel {}: {}", channel, sample); // Debugging line
         }
     }
 
@@ -185,7 +185,7 @@ fn process_samples(
     // Update the spectrum_app with the new partials results
     let mut app = spectrum_app.lock().unwrap();
     app.partials = partials_results;
-    println!("Updated spectrum app with new partials results."); // Debugging line
+    // println!("Updated spectrum app with new partials results."); // Debugging line
 }
 
 // Function for processing audio stream (optional, for output purposes)
