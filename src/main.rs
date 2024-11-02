@@ -9,6 +9,7 @@ use cpal::{SampleFormat, StreamConfig};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use audio_stream::{build_input_stream, CircularBuffer};
+use eframe::NativeOptions;
 
 const MAX_BUFFER_SIZE: usize = 512;
 
@@ -130,7 +131,10 @@ fn main() -> Result<()> {
     stream.play()?;
 
     // Launch the eframe application for plotting
-    let native_options = plot::NativeOptions::default();
+    let native_options = NativeOptions {
+        initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)), // Set window size to 960x420
+        ..Default::default()
+    };
     if let Err(e) = plot::run_native(
         "Real-Time Spectrum Analyzer",
         native_options,

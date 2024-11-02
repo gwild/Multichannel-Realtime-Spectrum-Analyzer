@@ -20,6 +20,8 @@ pub struct MyApp {
     colors: Vec<egui::Color32>,
     y_scale: f32, // Y scale for the plot
     x_max: f64,
+    alpha: u8, // Alpha value for colors
+    bar_width: f32, // New field for bar width
 }
 
 impl MyApp {
@@ -39,6 +41,8 @@ impl MyApp {
             colors,
             y_scale: 80.0, // Default Y scale value
             x_max: 1000.0,
+            alpha: 255, // Set default alpha to fully opaque
+            bar_width: 25.0, // Default bar width
         }
     }
 }
@@ -53,14 +57,32 @@ impl eframe::App for MyApp {
         ctx.set_visuals(dark_visuals);
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Frequency vs Amplitude (Partials)");
+            ui.label("First Twelve Partials per Channel");
 
-            // Slider to adjust the Y scale
+            // Slider to adjust the X max, Y max, and alpha
             ui.horizontal(|ui| {
-                ui.label("Y Scale:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("Y Scale"));
-                ui.label("Bar Width:");
+                ui.label("X Max:"); // Capitalize "X" in "X max"
                 ui.add(egui::Slider::new(&mut self.x_max, 100.0..=5000.0).text("Hz"));
+                ui.label("Y Max:"); // Change label to "Y max"
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("dB")); // Change "Scale" to "dB"
+                ui.label("Alpha:");
+                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
+                ui.label("Width:");
+                ui.add(egui::Slider::new(&mut self.bar_width, 0.0..=50.0).text(""));
+            });
+
+            // Add buttons for resetting to defaults and resetting the origin
+            ui.horizontal(|ui| {
+                if ui.button("Reset to Defaults").clicked() {
+                    self.y_scale = 80.0;
+                    self.x_max = 1000.0;
+                    self.alpha = 255; // Reset alpha to fully opaque
+                    self.bar_width = 25.0; // Reset bar width to default
+                }
+                if ui.button("Reset Origin").clicked() {
+                    self.y_scale = 80.0; // Reset y_scale to default
+                    self.x_max = 1000.0; // Reset x_max to default
+                }
             });
 
             // Lock the spectrum app only for the duration of data access
@@ -71,12 +93,23 @@ impl eframe::App for MyApp {
 
             // Customize plot style using Plot's settings
             Plot::new("spectrum_plot")
-                .legend(egui::plot::Legend::default())
-                .view_aspect(2.0)  // Adjust aspect ratio (optional)
+                .legend(egui::plot::Legend::default().position(egui::plot::Corner::LeftTop)) // Move legend to upper left
+                .view_aspect(3.0)  // Adjust aspect ratio to make the plot wider
                 .include_x(0.0)    // Fixed x scale from 0 Hz
                 .include_x(self.x_max)  // Use configurable maximum
                 .include_y(0.0)    // Set y scale to 0
                 .include_y(self.y_scale) // Use adjustable Y scale
+                .x_axis_formatter(|x, _| format!("{:.0} Hz", x)) // X-axis label
+                .y_axis_formatter(|y, _| format!("{:.0} dB", y)) // Y-axis label
+                .label_formatter(|name, value| {
+                    if name == "x" {
+                        format!("Frequency: {:?} Hz", value)
+                    } else {
+                        format!("Amplitude: {:?} dB", value)
+                    }
+                })
+                .show_x(true) // Show x-axis labels outside the plot
+                .show_y(true) // Show y-axis labels outside the plot
                 .show(ui, |plot_ui| {
                     // Plot partials as bars for each channel
                     for (channel, channel_partials) in partials.iter().enumerate() {
@@ -85,13 +118,20 @@ impl eframe::App for MyApp {
                         } else {
                             channel_partials
                                 .iter()
-                                .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64).width(3.0))
+                                .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64).width(self.bar_width as f64))
                                 .collect()
                         };
 
+                        let color = egui::Color32::from_rgba_unmultiplied(
+                            self.colors[channel % self.colors.len()].r(),
+                            self.colors[channel % self.colors.len()].g(),
+                            self.colors[channel % self.colors.len()].b(),
+                            self.alpha,
+                        );
+
                         let bar_chart = BarChart::new(bars)
-                            .name(format!("Partials Channel {}", channel + 1))
-                            .color(self.colors[channel % self.colors.len()]);
+                            .name(format!("Channel {}", channel)) // Updated legend label
+                            .color(color);
 
                         plot_ui.bar_chart(bar_chart);
                     }
