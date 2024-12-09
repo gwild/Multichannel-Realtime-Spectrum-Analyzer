@@ -4,25 +4,29 @@ mod plot;
 mod conversion;
 
 use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, StreamConfig};
+use portaudio as pa;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use audio_stream::{build_input_stream, CircularBuffer};
-use eframe::NativeOptions;
+use audio_stream::{CircularBuffer};
+use std::thread;
+use std::time::Duration;
 
-const MAX_BUFFER_SIZE: usize = 512;
+const MAX_BUFFER_SIZE: usize = 4096;
 
 fn main() -> Result<()> {
-    let host = cpal::default_host();
+    let pa = pa::PortAudio::new()?;
 
-    // Get a list of available input devices
-    let devices: Vec<_> = host.input_devices()?.collect();
+    // Get a list of available devices
+    let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
 
-    // Print device names and indexes
     println!("Available Input Devices:");
+    let mut input_devices = Vec::new();
     for (i, device) in devices.iter().enumerate() {
-        println!("  [{}] - {}", i, device.name()?);
+        let (index, info) = device;
+        if info.max_input_channels > 0 {
+            println!("  [{}] - {}", i, info.name);
+            input_devices.push(*index);
+        }
     }
 
     // Prompt user for device selection
@@ -31,45 +35,28 @@ fn main() -> Result<()> {
     let mut user_input = String::new();
     io::stdin().read_line(&mut user_input)?;
 
-    // Parse user input
     let device_index = user_input.trim().parse::<usize>()
         .map_err(|_| anyhow!("Invalid device index"))?;
-
-    // Check for valid input within available devices
-    if device_index >= devices.len() {
+    
+    if device_index >= input_devices.len() {
         return Err(anyhow!("Invalid device index. Exiting."));
     }
 
-    let selected_device = &devices[device_index];
-    println!("Selected device: {}", selected_device.name()?);
+    let selected_device_index = input_devices[device_index];
+    let selected_device_info = pa.device_info(selected_device_index)?;
 
-    // Print supported input configurations
-    println!("Supported input configs:");
-    let mut supported_configs = Vec::new();
-    for (i, config) in selected_device.supported_input_configs()?.enumerate() {
-        println!("  [{}]", i);
-        println!("    Channels: {}", config.channels());
-        println!("    Sample Rate: {} - {} Hz", config.min_sample_rate().0, config.max_sample_rate().0);
-        println!("    Buffer Size: {:?}", config.buffer_size());
-        println!("    Sample Format: {:?}", config.sample_format());
-        println!();  // Add a blank line between configs for better readability
-        supported_configs.push(config);
-    }
+    println!("Selected device: {}", selected_device_info.name);
 
-    println!("Enter the index of the desired configuration:");
+    let default_sample_rate = selected_device_info.default_sample_rate;
+
+    // Prompt user for channel configuration
+    println!("\nEnter the number of channels to use (max {}):", selected_device_info.max_input_channels);
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    let config_index: usize = input.trim().parse()?;
-
-    let selected_config = supported_configs[config_index].with_max_sample_rate();
-    println!("Selected configuration:");
-    println!("  Channels: {}", selected_config.channels());
-    println!("  Sample Rate: {} Hz", selected_config.sample_rate().0);
-    println!("  Buffer Size: {:?}", selected_config.buffer_size());
-    println!("  Sample Format: {:?}", selected_config.sample_format());
-
-    let config = StreamConfig::from(selected_config.clone());
-    let sample_format = selected_config.sample_format();
+    let num_channels: i32 = input.trim().parse()?;
+    if num_channels > selected_device_info.max_input_channels {
+        return Err(anyhow!("Invalid number of channels. Maximum is {}", selected_device_info.max_input_channels));
+    }
 
     println!("\nEnter the channel numbers to use (comma-separated, e.g., 0,1):");
     let mut input = String::new();
@@ -82,15 +69,6 @@ fn main() -> Result<()> {
 
     println!("Selected channels: {:?}", selected_channels);
 
-    // After parsing selected_channels
-    let max_channel = config.channels as usize - 1;
-    for &channel in &selected_channels {
-        if channel > max_channel {
-            return Err(anyhow!("Invalid channel selected. Maximum channel is {}", max_channel));
-        }
-    }
-
-    // Create audio buffers for selected channels
     let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
         selected_channels
             .iter()
@@ -98,51 +76,48 @@ fn main() -> Result<()> {
             .collect(),
     );
 
-    // Create spectrum app
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
 
-    // Build the input stream
-    let stream = match sample_format {
-        SampleFormat::F32 => build_input_stream(
-            selected_device,
-            &config,
-            audio_buffers.clone(),
-            spectrum_app.clone(),
-            selected_channels.clone(),
-        ),
-        SampleFormat::I16 => build_input_stream(
-            selected_device,
-            &config,
-            audio_buffers.clone(),
-            spectrum_app.clone(),
-            selected_channels.clone(),
-        ),
-        SampleFormat::U16 => build_input_stream(
-            selected_device,
-            &config,
-            audio_buffers.clone(),
-            spectrum_app.clone(),
-            selected_channels.clone(),
-        ),
-        _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-    }?;
+    // Stream settings
+    let latency = selected_device_info.default_low_input_latency;
+    let input_params = pa::StreamParameters::<f32>::new(
+        selected_device_index,
+        num_channels,
+        true,
+        latency,
+    );
 
-    // Start the stream
-    stream.play()?;
+    let settings = pa::InputStreamSettings::new(
+        input_params,
+        default_sample_rate,
+        MAX_BUFFER_SIZE as u32,
+    );
 
-    // Launch the eframe application for plotting
-    let native_options = NativeOptions {
-        initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)), // Set window size to 960x420
-        ..Default::default()
-    };
-    if let Err(e) = plot::run_native(
-        "Real-Time Spectrum Analyzer",
-        native_options,
-        Box::new(move |_cc| {
-            Box::new(plot::MyApp::new(spectrum_app.clone()))
-        }),
-    ) {
-        eprintln!("Error launching application: {:?}", e);
+    // Initialize and start the stream
+    let mut stream = pa.open_blocking_stream(settings)?;
+
+    stream.start()?;
+    println!("Stream started with {} channels at {} Hz.", num_channels, default_sample_rate);
+
+    // Read audio input in a loop
+    loop {
+        match stream.read(MAX_BUFFER_SIZE as u32) {
+            Ok(buffer) => {
+                for (channel, &sample) in buffer.iter().enumerate() {
+                    if let Some(audio_buffer) = audio_buffers.get(channel) {
+                        let mut audio_buffer = audio_buffer.lock().unwrap();
+                        audio_buffer.push(sample);
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Error reading stream: {:?}", err);
+                break;
+            }
+        }
+
+        // Simulate processing delay or perform actual processing here
+        thread::sleep(Duration::from_millis(10));
     }
 
     Ok(())

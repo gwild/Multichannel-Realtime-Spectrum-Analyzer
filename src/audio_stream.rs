@@ -1,11 +1,10 @@
 use anyhow::Result;
-use cpal::traits::{DeviceTrait, HostTrait};
-use cpal::{Stream, StreamConfig};
+use portaudio as pa;
 use std::sync::{Arc, Mutex};
 use std::io::{self, Write};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
-use crate::conversion::{AudioSample, convert_i32_buffer_to_f32, f32_to_i16}; // Import conversions
+use portaudio::stream::InputCallbackArgs;
 
 // Circular buffer implementation
 pub struct CircularBuffer {
@@ -23,7 +22,7 @@ impl CircularBuffer {
         }
     }
 
-    fn push(&mut self, value: f32) {
+    pub fn push(&mut self, value: f32) {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size; // Wrap around
     }
@@ -33,141 +32,67 @@ impl CircularBuffer {
     }
 }
 
-// Function to list supported input formats
-fn list_supported_input_formats(device: &cpal::Device) -> Result<(), anyhow::Error> {
-    let supported_configs = device.supported_input_configs()?;
-    println!("Supported input configurations:");
-    for config in supported_configs {
-        println!(
-            "Channels: {}, Sample Rate: {:?}, Sample Format: {:?}",
-            config.channels(),
-            config.min_sample_rate()..=config.max_sample_rate(),
-            config.sample_format()
-        );
-    }
-    Ok(())
-}
-
 // Build input stream function
 pub fn build_input_stream(
-    device: &cpal::Device,
-    config: &StreamConfig,
+    pa: &pa::PortAudio,
+    device_index: pa::DeviceIndex,
+    num_channels: i32,
+    sample_rate: f64,
     audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
-) -> Result<Stream> {
+) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
     if selected_channels.is_empty() {
         return Err(anyhow::anyhow!("No channels selected"));
     }
 
-    println!("Building input stream with config: {:?}", config);
-    println!("Selected channels: {:?}", selected_channels);
+    let latency = pa.device_info(device_index)?.default_low_input_latency;
+    let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
 
-    let channels = config.channels as usize;
-    let sample_rate = config.sample_rate.0;
+    let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
-    // List supported input formats for the selected device
-    list_supported_input_formats(device)?;
+    // Create the stream
+    let mut stream = pa.open_non_blocking_stream(
+        settings,
+        move |args: InputCallbackArgs<f32>| {
+            process_samples(
+                args.buffer.to_vec(),
+                num_channels as usize,
+                &audio_buffers,
+                &spectrum_app,
+                &selected_channels,
+                sample_rate as u32,
+            );
+            pa::Continue
+        },
+    )?;
 
-    // Iterate over supported configurations to find a compatible one
-    let supported_configs = device.supported_input_configs()?;
-    let mut stream = None;
+    println!("Stream created with device index: {:?}", device_index);
 
-    for supported_config in supported_configs {
-        let sample_format = supported_config.sample_format();
-        println!("Trying sample format: {:?}", sample_format);
-
-        let config = supported_config.with_max_sample_rate().into();
-
-        // Clone the Arc and Vec for each iteration
-        let audio_buffers_clone = Arc::clone(&audio_buffers);
-        let spectrum_app_clone = Arc::clone(&spectrum_app);
-        let selected_channels_clone = selected_channels.clone();
-
-        stream = match sample_format {
-            cpal::SampleFormat::I16 => Some(device.build_input_stream(
-                &config,
-                move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let data_as_f32: Vec<f32> = data.iter().map(|s| *s as f32).collect();
-                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
-                },
-                move |err| {
-                    eprintln!("Stream error: {:?}", err);
-                },
-                None,
-            )?),
-            cpal::SampleFormat::U16 => Some(device.build_input_stream(
-                &config,
-                move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    let data_as_f32: Vec<f32> = data.iter().map(|s| *s as f32).collect();
-                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
-                },
-                move |err| {
-                    eprintln!("Stream error: {:?}", err);
-                },
-                None,
-            )?),
-            cpal::SampleFormat::I32 => Some(device.build_input_stream(
-                &config,
-                move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    let data_as_f32 = convert_i32_buffer_to_f32(data, channels);
-                    process_samples(data_as_f32, channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
-                },
-                move |err| {
-                    eprintln!("Stream error: {:?}", err);
-                },
-                None,
-            )?),
-            cpal::SampleFormat::F32 => Some(device.build_input_stream(
-                &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    process_samples(data.to_vec(), channels, &audio_buffers_clone, &spectrum_app_clone, &selected_channels_clone, sample_rate);
-                },
-                move |err| {
-                    eprintln!("Stream error: {:?}", err);
-                },
-                None,
-            )?),
-            _ => {
-                eprintln!("Unsupported sample format: {:?}", sample_format);
-                None
-            },
-        };
-
-        if stream.is_some() {
-            println!("Stream built successfully with format: {:?}", sample_format);
-            break;
-        }
-    }
-
-    stream.ok_or_else(|| anyhow::anyhow!("Unsupported sample format in Rust"))
+    Ok(stream)
 }
 
 // Helper function to process samples
 fn process_samples(
     data_as_f32: Vec<f32>,
-    channels: usize,
+    _channels: usize,
     audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: &Arc<Mutex<SpectrumApp>>,
     selected_channels: &[usize],
     sample_rate: u32,
 ) {
-    // Fill the audio buffers for each selected channel
     for (i, &sample) in data_as_f32.iter().enumerate() {
-        let channel = i % channels;
+        let channel = i % _channels;
         if selected_channels.contains(&channel) {
             let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
             let mut buffer = audio_buffers[buffer_index].lock().unwrap();
             buffer.push(sample);
-            // println!("Pushed sample to channel {}: {}", channel, sample); // Debugging line
         }
     }
 
-    // Initialize partials_results with zeroes for all channels
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-    // Compute spectrum for each selected channel
-    for (i, &channel) in selected_channels.iter().enumerate() {
+    for (i, &_channel) in selected_channels.iter().enumerate() {
         let buffer = audio_buffers[i].lock().unwrap();
         let audio_data = buffer.get();
 
@@ -176,31 +101,68 @@ fn process_samples(
             for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                 partials_results[i][j] = partial;
             }
-            println!("Channel {}: Computed Partials: {:?}", channel, computed_partials); // Debugging line
         }
-
-        println!("Channel {}: Partial Results: {:?}", channel, partials_results[i]);
     }
 
-    // Update the spectrum_app with the new partials results
     let mut app = spectrum_app.lock().unwrap();
     app.partials = partials_results;
-    // println!("Updated spectrum app with new partials results."); // Debugging line
 }
 
-// Function for processing audio stream (optional, for output purposes)
-pub fn process_audio_stream(
-    input_samples: &[f32],
-    output_buffer: &mut [i16],
-    selected_channels: &[usize],
-) {
-    // Convert input samples from f32 to i16
-    let converted_samples = f32_to_i16(input_samples);
+// Main function
+pub fn main() -> Result<()> {
+    let pa = pa::PortAudio::new()?;
 
-    // Process each channel separately
-    for &channel in selected_channels {
-        let channel_samples = &mut output_buffer[channel * input_samples.len()..(channel + 1) * input_samples.len()];
-        channel_samples.copy_from_slice(&converted_samples);
-        println!("Processed channel {} for output.", channel); // Debugging line
+    // List devices
+    let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
+    println!("Available Input Devices:");
+    for (i, (_index, info)) in devices.iter().enumerate() {
+        if info.max_input_channels > 0 {
+            println!("  [{}] - {}", i, info.name);
+        }
+    }
+
+    // Select a device
+    print!("Enter the index of the desired device: ");
+    io::stdout().flush()?;
+    let mut user_input = String::new();
+    io::stdin().read_line(&mut user_input)?;
+    let device_index = user_input.trim().parse::<usize>()?;
+    let selected_device_index = devices[device_index].0;
+    let selected_device_info = pa.device_info(selected_device_index)?;
+
+    println!("Selected device: {}", selected_device_info.name);
+
+    let num_channels = selected_device_info.max_input_channels;
+    let sample_rate = selected_device_info.default_sample_rate;
+
+    // Create audio buffers for selected channels
+    let selected_channels = vec![0, 1]; // Example: First two channels
+    let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
+        selected_channels
+            .iter()
+            .map(|_| Mutex::new(CircularBuffer::new(512)))
+            .collect(),
+    );
+
+    // Initialize spectrum app
+    let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
+
+    // Build and start the stream
+    let mut stream = build_input_stream(
+        &pa,
+        selected_device_index,
+        num_channels,
+        sample_rate,
+        audio_buffers.clone(),
+        spectrum_app.clone(),
+        selected_channels.clone(),
+    )?;
+    stream.start()?;
+
+    println!("Stream started!");
+
+    loop {
+        // Prevent the main thread from exiting
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
