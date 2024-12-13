@@ -16,7 +16,7 @@ use env_logger;
 use ctrlc;
 
 /// The maximum size of the circular audio buffer.
-const MAX_BUFFER_SIZE: usize = 512;
+const MAX_BUFFER_SIZE: usize = 4096;
 
 /// Entry point of the application.
 /// Initializes logging, sets up audio streams, and launches the GUI.
