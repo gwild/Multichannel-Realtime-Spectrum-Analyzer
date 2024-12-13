@@ -1,12 +1,16 @@
-use anyhow::Result;
+// src/audio_stream.rs
+
+use anyhow::{anyhow, Result};
 use portaudio as pa;
 use std::sync::{Arc, Mutex};
-use std::io::{self, Write};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use portaudio::stream::InputCallbackArgs;
 
-// Circular buffer implementation
+/// Circular buffer implementation for storing audio samples.
+/// 
+/// This buffer allows for continuous writing and reading of audio samples,
+/// maintaining a fixed size by overwriting the oldest data when new data arrives.
 pub struct CircularBuffer {
     buffer: Vec<f32>,
     head: usize,
@@ -14,6 +18,11 @@ pub struct CircularBuffer {
 }
 
 impl CircularBuffer {
+    /// Creates a new `CircularBuffer` with the specified size.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - The maximum number of samples the buffer can hold.
     pub fn new(size: usize) -> Self {
         CircularBuffer {
             buffer: vec![0.0; size],
@@ -22,17 +31,45 @@ impl CircularBuffer {
         }
     }
 
+    /// Pushes a new sample into the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The audio sample to be added.
     pub fn push(&mut self, value: f32) {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size; // Wrap around
     }
 
-    fn get(&self) -> &[f32] {
+    /// Retrieves the current contents of the buffer.
+    ///
+    /// # Returns
+    ///
+    /// A slice of the buffer containing the audio samples.
+    pub fn get(&self) -> &[f32] {
         &self.buffer
     }
 }
 
-// Build input stream function
+/// Builds and configures the audio input stream using PortAudio.
+///
+/// This function sets up a non-blocking input stream that captures audio data
+/// from the specified device and channels, processes the samples, and feeds them
+/// into the spectrum analyzer.
+///
+/// # Arguments
+///
+/// * `pa` - A reference to the initialized PortAudio instance.
+/// * `device_index` - The index of the selected audio input device.
+/// * `num_channels` - The number of audio channels to capture.
+/// * `sample_rate` - The sampling rate for the audio stream.
+/// * `audio_buffers` - Shared circular buffers for storing audio samples per channel.
+/// * `spectrum_app` - Shared reference to the spectrum analyzer application state.
+/// * `selected_channels` - Indices of the channels selected for analysis.
+///
+/// # Returns
+///
+/// A `Result` containing the configured PortAudio stream or an error.
 pub fn build_input_stream(
     pa: &pa::PortAudio,
     device_index: pa::DeviceIndex,
@@ -43,16 +80,21 @@ pub fn build_input_stream(
     selected_channels: Vec<usize>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
     if selected_channels.is_empty() {
-        return Err(anyhow::anyhow!("No channels selected"));
+        return Err(anyhow!("No channels selected"));
     }
 
-    let latency = pa.device_info(device_index)?.default_low_input_latency;
+    // Retrieve device information to get latency settings
+    let device_info = pa.device_info(device_index)?;
+    let latency = device_info.default_low_input_latency;
+
+    // Configure stream parameters
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
 
+    // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
-    // Create the stream
-    let mut stream = pa.open_non_blocking_stream(
+    // Create the non-blocking stream with a callback to process incoming audio data
+    let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
             process_samples(
@@ -72,97 +114,65 @@ pub fn build_input_stream(
     Ok(stream)
 }
 
-// Helper function to process samples
+/// Processes incoming audio samples and updates the spectrum analyzer.
+///
+/// This function extracts samples from the selected channels, pushes them into the
+/// corresponding circular buffers, computes the frequency spectrum, and updates
+/// the spectrum analyzer's state.
+///
+/// # Arguments
+///
+/// * `data_as_f32` - A vector of incoming audio samples in `f32` format.
+/// * `channels` - The total number of audio channels in the incoming data.
+/// * `audio_buffers` - Shared circular buffers for storing audio samples per channel.
+/// * `spectrum_app` - Shared reference to the spectrum analyzer application state.
+/// * `selected_channels` - Slice of channel indices selected for analysis.
+/// * `sample_rate` - The sampling rate of the audio stream.
 fn process_samples(
     data_as_f32: Vec<f32>,
-    _channels: usize,
+    channels: usize,
     audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: &Arc<Mutex<SpectrumApp>>,
     selected_channels: &[usize],
     sample_rate: u32,
 ) {
+    // Iterate over each sample and distribute it to the appropriate buffer
     for (i, &sample) in data_as_f32.iter().enumerate() {
-        let channel = i % _channels;
+        let channel = i % channels;
         if selected_channels.contains(&channel) {
-            let buffer_index = selected_channels.iter().position(|&ch| ch == channel).unwrap();
-            let mut buffer = audio_buffers[buffer_index].lock().unwrap();
-            buffer.push(sample);
-        }
-    }
-
-    let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
-    for (i, &_channel) in selected_channels.iter().enumerate() {
-        let buffer = audio_buffers[i].lock().unwrap();
-        let audio_data = buffer.get();
-
-        if !audio_data.is_empty() {
-            let computed_partials = compute_spectrum(audio_data, sample_rate);
-            for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
-                partials_results[i][j] = partial;
+            if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
+                if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
+                    buffer.push(sample);
+                } else {
+                    eprintln!("Failed to lock buffer for channel {}", buffer_index);
+                }
             }
         }
     }
 
-    let mut app = spectrum_app.lock().unwrap();
-    app.partials = partials_results;
-}
+    // Prepare a structure to hold the computed spectrum data
+    let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-// Main function
-pub fn main() -> Result<()> {
-    let pa = pa::PortAudio::new()?;
+    // Compute the spectrum for each selected channel
+    for (i, &_channel) in selected_channels.iter().enumerate() {
+        if let Ok(buffer) = audio_buffers[i].lock() {
+            let audio_data = buffer.get();
 
-    // List devices
-    let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
-    println!("Available Input Devices:");
-    for (i, (_index, info)) in devices.iter().enumerate() {
-        if info.max_input_channels > 0 {
-            println!("  [{}] - {}", i, info.name);
+            if !audio_data.is_empty() {
+                let computed_partials = compute_spectrum(audio_data, sample_rate);
+                for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
+                    partials_results[i][j] = partial;
+                }
+            }
+        } else {
+            eprintln!("Failed to lock buffer for spectrum analysis on channel {}", i);
         }
     }
 
-    // Select a device
-    print!("Enter the index of the desired device: ");
-    io::stdout().flush()?;
-    let mut user_input = String::new();
-    io::stdin().read_line(&mut user_input)?;
-    let device_index = user_input.trim().parse::<usize>()?;
-    let selected_device_index = devices[device_index].0;
-    let selected_device_info = pa.device_info(selected_device_index)?;
-
-    println!("Selected device: {}", selected_device_info.name);
-
-    let num_channels = selected_device_info.max_input_channels;
-    let sample_rate = selected_device_info.default_sample_rate;
-
-    // Create audio buffers for selected channels
-    let selected_channels = vec![0, 1]; // Example: First two channels
-    let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
-        selected_channels
-            .iter()
-            .map(|_| Mutex::new(CircularBuffer::new(512)))
-            .collect(),
-    );
-
-    // Initialize spectrum app
-    let spectrum_app = Arc::new(Mutex::new(SpectrumApp::new(selected_channels.len())));
-
-    // Build and start the stream
-    let mut stream = build_input_stream(
-        &pa,
-        selected_device_index,
-        num_channels,
-        sample_rate,
-        audio_buffers.clone(),
-        spectrum_app.clone(),
-        selected_channels.clone(),
-    )?;
-    stream.start()?;
-
-    println!("Stream started!");
-
-    loop {
-        // Prevent the main thread from exiting
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    // Update the spectrum analyzer's state with the new data
+    if let Ok(mut app) = spectrum_app.lock() {
+        app.partials = partials_results;
+    } else {
+        eprintln!("Failed to lock spectrum app");
     }
 }
