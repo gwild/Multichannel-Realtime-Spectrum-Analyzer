@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
 use crate::plot::SpectrumApp;
 use portaudio::stream::InputCallbackArgs;
+use log::{info, error};
 
 /// Circular buffer implementation for storing audio samples.
-/// 
+///
 /// This buffer allows for continuous writing and reading of audio samples,
-/// maintaining a fixed size by overwriting the oldest data when new data arrives.
+/// maintaining a fixed size by overwriting the oldest data when new samples arrive.
 pub struct CircularBuffer {
     buffer: Vec<f32>,
     head: usize,
@@ -93,12 +94,16 @@ pub fn build_input_stream(
     // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
+    info!("Opening non-blocking PortAudio stream.");
+
     // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
+            // Pass a Vec<f32> to match the process_samples signature
+            let data_clone = args.buffer.to_vec();
             process_samples(
-                args.buffer.to_vec(),
+                data_clone,
                 num_channels as usize,
                 &audio_buffers,
                 &spectrum_app,
@@ -109,7 +114,7 @@ pub fn build_input_stream(
         },
     )?;
 
-    println!("Stream created with device index: {:?}", device_index);
+    info!("PortAudio stream opened successfully.");
 
     Ok(stream)
 }
@@ -117,12 +122,12 @@ pub fn build_input_stream(
 /// Processes incoming audio samples and updates the spectrum analyzer.
 ///
 /// This function extracts samples from the selected channels, pushes them into the
-/// corresponding circular buffers, computes the frequency spectrum, and updates
-/// the spectrum analyzer's state.
+/// corresponding circular buffers, computes the frequency spectrum, updates the
+/// spectrum analyzer's state, and prints the partials results.
 ///
 /// # Arguments
 ///
-/// * `data_as_f32` - A vector of incoming audio samples in `f32` format.
+/// * `data_as_f32` - A `Vec<f32>` of incoming audio samples.
 /// * `channels` - The total number of audio channels in the incoming data.
 /// * `audio_buffers` - Shared circular buffers for storing audio samples per channel.
 /// * `spectrum_app` - Shared reference to the spectrum analyzer application state.
@@ -136,25 +141,27 @@ fn process_samples(
     selected_channels: &[usize],
     sample_rate: u32,
 ) {
-    // Iterate over each sample and distribute it to the appropriate buffer
+    // Fill the audio buffers for each selected channel
     for (i, &sample) in data_as_f32.iter().enumerate() {
         let channel = i % channels;
         if selected_channels.contains(&channel) {
             if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
                 if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
                     buffer.push(sample);
+                    // Uncomment the following line for detailed sample debugging
+                    // println!("Pushed sample to channel {}: {}", channel, sample);
                 } else {
-                    eprintln!("Failed to lock buffer for channel {}", buffer_index);
+                    error!("Failed to lock buffer for channel {}", buffer_index);
                 }
             }
         }
     }
 
-    // Prepare a structure to hold the computed spectrum data
+    // Initialize partials_results with zeroes for all channels
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-    // Compute the spectrum for each selected channel
-    for (i, &_channel) in selected_channels.iter().enumerate() {
+    // Compute spectrum for each selected channel
+    for (i, &channel) in selected_channels.iter().enumerate() {
         if let Ok(buffer) = audio_buffers[i].lock() {
             let audio_data = buffer.get();
 
@@ -163,16 +170,29 @@ fn process_samples(
                 for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                     partials_results[i][j] = partial;
                 }
+                // Print computed partials for the current channel
+                println!(
+                    "Channel {}: Computed Partials: {:?}",
+                    channel, computed_partials
+                );
             }
+
+            // Print partial results for the current channel
+            println!(
+                "Channel {}: Partial Results: {:?}",
+                channel, partials_results[i]
+            );
         } else {
-            eprintln!("Failed to lock buffer for spectrum analysis on channel {}", i);
+            error!("Failed to lock buffer for spectrum analysis on channel {}", i);
         }
     }
 
-    // Update the spectrum analyzer's state with the new data
+    // Update the spectrum_app with the new partials results
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
+        // Uncomment the following line for confirmation
+        // println!("Updated spectrum app with new partials results.");
     } else {
-        eprintln!("Failed to lock spectrum app");
+        error!("Failed to lock spectrum app.");
     }
 }
