@@ -1,5 +1,3 @@
-// src/main.rs
-
 mod audio_stream;
 mod fft_analysis;
 mod plot;
@@ -9,7 +7,8 @@ use anyhow::{anyhow, Result};
 use portaudio as pa;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use audio_stream::{build_input_stream, CircularBuffer};
+use std::sync::mpsc;
+use audio_stream::{build_input_stream, CircularBuffer, start_processing_thread};
 use eframe::NativeOptions;
 use log::{info, error};
 use env_logger;
@@ -92,9 +91,6 @@ fn run() -> Result<()> {
     );
     println!("  Sample Rate: {} Hz", default_sample_rate);
 
-    // Handle the unused `latency` variable by prefixing with an underscore
-    let _latency = selected_device_info.default_low_input_latency;
-
     // Prompt user for number of channels
     println!(
         "\nEnter the number of channels to use (max {}):",
@@ -155,6 +151,9 @@ fn run() -> Result<()> {
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     info!("Initialized spectrum analyzer application.");
 
+    // Set up a channel for audio processing
+    let (tx, rx) = mpsc::channel();
+
     // Define stream parameters compatible with audio_stream.rs
     let num_channels_i32 = num_channels; // Ensure it's i32 as expected
     let mut stream = build_input_stream(
@@ -165,6 +164,7 @@ fn run() -> Result<()> {
         audio_buffers.clone(),
         spectrum_app.clone(),
         selected_channels.clone(),
+        tx,
     )?;
     info!("Built audio input stream.");
 
@@ -173,6 +173,16 @@ fn run() -> Result<()> {
     info!(
         "Audio stream started with {} channels at {} Hz.",
         num_channels, default_sample_rate
+    );
+
+    // Start the processing thread
+    start_processing_thread(
+        num_channels as usize,
+        audio_buffers.clone(),
+        spectrum_app.clone(),
+        selected_channels.clone(),
+        default_sample_rate as u32,
+        rx,
     );
 
     // Setup for graceful shutdown
@@ -185,22 +195,16 @@ fn run() -> Result<()> {
     })
     .expect("Error setting Ctrl-C handler");
 
-    // Clone references for the audio processing thread (if needed)
-    let spectrum_app_clone = spectrum_app.clone();
-
     // Launch the GUI on the main thread
     let native_options = NativeOptions {
         initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)),
         ..Default::default()
     };
 
-    // Since the GUI runs on the main thread, we'll run it here.
-    // The audio processing is handled via PortAudio callbacks.
-    // Upon GUI closure, the main thread will proceed to shutdown.
     if let Err(e) = plot::run_native(
         "Real-Time Spectrum Analyzer",
         native_options,
-        Box::new(move |_cc| Box::new(plot::MyApp::new(spectrum_app_clone))),
+        Box::new(move |_cc| Box::new(plot::MyApp::new(spectrum_app.clone()))),
     ) {
         error!("Error launching GUI: {:?}", e);
     }
