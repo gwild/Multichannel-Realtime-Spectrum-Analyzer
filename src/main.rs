@@ -1,53 +1,55 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
-mod conversion;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, RwLock, Mutex, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc;
-use audio_stream::{build_input_stream, CircularBuffer, start_processing_thread};
+use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
-use log::{info, error};
+use log::{info, error, warn};
 use env_logger;
-use ctrlc;
+use fft_analysis::FFTConfig;
 
-/// The maximum size of the circular audio buffer.
 const MAX_BUFFER_SIZE: usize = 4096;
 
-/// Entry point of the application.
-/// Initializes logging, sets up audio streams, and launches the GUI.
 fn main() {
-    // Initialize the logger
     env_logger::init();
 
-    // Execute the run function and handle errors explicitly
     if let Err(e) = run() {
         error!("Application encountered an error: {:?}", e);
         std::process::exit(1);
     }
 }
 
-/// Main application logic.
-/// Sets up audio input streams, initializes the spectrum analyzer, and runs the GUI.
 fn run() -> Result<()> {
-    // Initialize PortAudio
     let pa = pa::PortAudio::new()?;
-    info!("PortAudio initialized successfully.");
+    info!("PortAudio initialized.");
 
-    // Get a list of available devices
+    let host = match pa.host_apis()
+        .into_iter()
+        .find(|(_, host_api_info)| host_api_info.host_type == pa::HostApiTypeId::ALSA)
+    {
+        Some((index, _)) => index,
+        None => {
+            warn!("ALSA not available, using default host API.");
+            pa.default_host_api()?
+        }
+    };
+
+    info!("Using host API: {:?}", host);
+
     let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
     info!("Retrieved list of audio devices.");
 
-    // Print available input devices
     println!("Available Input Devices:");
     let mut input_devices = Vec::new();
     for (i, device) in devices.iter().enumerate() {
         let (index, info) = device;
         if info.max_input_channels > 0 {
-            println!("  [{}] - {}", i, info.name);
+            println!("  [{}] - {} ({} channels)", i, info.name, info.max_input_channels);
             input_devices.push(*index);
         }
     }
@@ -56,7 +58,6 @@ fn run() -> Result<()> {
         return Err(anyhow!("No input audio devices found."));
     }
 
-    // Prompt user for device selection
     print!("Enter the index of the desired device: ");
     io::stdout().flush()?;
     let mut user_input = String::new();
@@ -67,160 +68,134 @@ fn run() -> Result<()> {
         .map_err(|_| anyhow!("Invalid device index"))?;
 
     if device_index >= input_devices.len() {
-        return Err(anyhow!(
-            "Invalid device index. Please select a valid index from the list."
-        ));
+        return Err(anyhow!("Invalid device index."));
     }
 
     let selected_device_index = input_devices[device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
-    info!(
-        "Selected device: {} (Channels: {}, Default Sample Rate: {} Hz)",
-        selected_device_info.name,
-        selected_device_info.max_input_channels,
-        selected_device_info.default_sample_rate
-    );
+    info!("Selected device: {} ({} channels)", selected_device_info.name, selected_device_info.max_input_channels);
 
-    let default_sample_rate = selected_device_info.default_sample_rate as f64;
-
-    // Print supported configurations
-    println!("Supported input configurations:");
-    println!(
-        "  Channels: 1 - {}",
-        selected_device_info.max_input_channels
-    );
-    println!("  Sample Rate: {} Hz", default_sample_rate);
-
-    // Prompt user for number of channels
-    println!(
-        "\nEnter the number of channels to use (max {}):",
-        selected_device_info.max_input_channels
-    );
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let num_channels: i32 = input
-        .trim()
-        .parse()
-        .map_err(|_| anyhow!("Invalid number of channels"))?;
-    if num_channels < 1 || num_channels > selected_device_info.max_input_channels {
-        return Err(anyhow!(
-            "Invalid number of channels. Please select between 1 and {} channels.",
-            selected_device_info.max_input_channels
-        ));
+    let supported_sample_rates = get_supported_sample_rates(selected_device_index, selected_device_info.max_input_channels, &pa);
+    if supported_sample_rates.is_empty() {
+        return Err(anyhow!("No supported sample rates for the selected device."));
     }
 
-    // Prompt user for specific channel numbers
-    println!("\nEnter the channel numbers to use (comma-separated, e.g., 0,1):");
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let selected_channels: Vec<usize> = input
+    println!("Supported sample rates:");
+    for (i, rate) in supported_sample_rates.iter().enumerate() {
+        println!("  [{}] - {} Hz", i, rate);
+    }
+
+    print!("Enter the index of the desired sample rate: ");
+    io::stdout().flush()?;
+    user_input.clear();
+    io::stdin().read_line(&mut user_input)?;
+    let sample_rate_index = user_input.trim().parse::<usize>()?;
+
+    if sample_rate_index >= supported_sample_rates.len() {
+        return Err(anyhow!("Invalid sample rate index."));
+    }
+    let selected_sample_rate = supported_sample_rates[sample_rate_index];
+
+    println!("Available channels: 0 to {}", selected_device_info.max_input_channels - 1);
+    println!("Enter channels to use (comma-separated, e.g., 0,1): ");
+    user_input.clear();
+    io::stdin().read_line(&mut user_input)?;
+    let selected_channels: Vec<usize> = user_input
         .trim()
         .split(',')
-        .filter_map(|s| s.trim().parse().ok())
+        .filter_map(|s| s.parse::<usize>().ok())
+        .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
         .collect();
 
-    // Validate selected channels
-    let max_channel = num_channels as usize - 1;
-    for &channel in &selected_channels {
-        if channel > max_channel {
-            return Err(anyhow!(
-                "Invalid channel selected: {}. Maximum channel is {}.",
-                channel,
-                max_channel
-            ));
-        }
-    }
-
     if selected_channels.is_empty() {
-        return Err(anyhow!("No channels selected. Please select at least one channel."));
+        return Err(anyhow!("No valid channels selected."));
     }
+    info!("Selected channels: {:?}", selected_channels);
 
-    println!("Selected channels: {:?}", selected_channels);
-    info!("User selected {} channels: {:?}", selected_channels.len(), selected_channels);
-
-    // Initialize audio buffers
-    let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
-        selected_channels
-            .iter()
-            .map(|_| Mutex::new(CircularBuffer::new(MAX_BUFFER_SIZE)))
-            .collect(),
-    );
-    info!("Initialized audio buffers for selected channels.");
-
-    // Initialize the spectrum analyzer application
+    let buffer = Arc::new(RwLock::new(CircularBuffer::new(MAX_BUFFER_SIZE)));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
-    info!("Initialized spectrum analyzer application.");
+    let fft_config = Arc::new(Mutex::new(FFTConfig {
+        min_frequency: 20.0,
+        max_frequency: 20000.0,
+        db_threshold: -32.0,
+    }));
 
-    // Set up a channel for audio processing
+    let running = Arc::new(AtomicBool::new(true));
     let (tx, rx) = mpsc::channel();
 
-    // Define stream parameters compatible with audio_stream.rs
-    let num_channels_i32 = num_channels; // Ensure it's i32 as expected
-    let mut stream = build_input_stream(
-        &pa,
-        selected_device_index,
-        num_channels_i32,
-        default_sample_rate,
-        audio_buffers.clone(),
-        spectrum_app.clone(),
-        selected_channels.clone(),
-        tx,
-    )?;
-    info!("Built audio input stream.");
+    let buffer_clone = Arc::clone(&buffer);
+    let running_clone = Arc::clone(&running);
+    let sampling_done = Arc::new(AtomicBool::new(false));
 
-    // Start the stream
-    stream.start()?;
-    info!(
-        "Audio stream started with {} channels at {} Hz.",
-        num_channels, default_sample_rate
-    );
+    std::thread::spawn({
+        let sampling_done = Arc::clone(&sampling_done);
+        move || {
+            start_sampling_thread(
+                running_clone,
+                buffer_clone,
+                tx,
+                selected_device_info.max_input_channels as usize,
+                selected_sample_rate,
+                Arc::new(RwLock::new(MAX_BUFFER_SIZE)),
+            );
+            sampling_done.store(true, Ordering::SeqCst);
+        }
+    });
 
-    // Start the processing thread
-    start_processing_thread(
-        num_channels as usize,
-        audio_buffers.clone(),
-        spectrum_app.clone(),
-        selected_channels.clone(),
-        default_sample_rate as u32,
-        rx,
-    );
+    let buffer_clone_fft = Arc::clone(&buffer);
+    let fft_config_fft = Arc::clone(&fft_config);
+    let spectrum_app_fft = Arc::clone(&spectrum_app);
 
-    // Setup for graceful shutdown
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    let running_clone = Arc::clone(&running);
+    std::thread::spawn(move || {
+        while !sampling_done.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        while running_clone.load(Ordering::SeqCst) {
+            if let Ok(_) = rx.recv() {
+                fft_analysis::process_audio_data(
+                    buffer_clone_fft.clone(),
+                    fft_config_fft.clone(),
+                    spectrum_app_fft.clone(),
+                    selected_channels.clone(),
+                    selected_sample_rate as u32,
+                );
+            }
+        }
+    });
 
-    // Set up Ctrl+C handler for graceful shutdown
-    ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    })
-    .expect("Error setting Ctrl-C handler");
+    tokio::task::block_in_place(|| {
+        plot::run_native(
+            "Real-Time Spectrum Analyzer",
+            NativeOptions {
+                initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)),
+                ..Default::default()
+            },
+            Box::new(move |_cc| Box::new(plot::MyApp::new(
+                spectrum_app.clone(),
+                fft_config.clone(),
+                Arc::new(Mutex::new(4096)),
+            ))),
+        )
+    }).map_err(|e| anyhow!(e.to_string()))?;
 
-    // Launch the GUI on the main thread
-    let native_options = NativeOptions {
-        initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)),
-        ..Default::default()
-    };
-
-    if let Err(e) = plot::run_native(
-        "Real-Time Spectrum Analyzer",
-        native_options,
-        Box::new(move |_cc| Box::new(plot::MyApp::new(spectrum_app.clone()))),
-    ) {
-        error!("Error launching GUI: {:?}", e);
-    }
-
-    info!("GUI closed. Initiating shutdown...");
-
-    // Signal to stop running
     running.store(false, Ordering::SeqCst);
-
-    // Stop the audio stream
-    stream.stop()?;
-    info!("Audio stream stopped.");
-
-    // Terminate PortAudio
     pa.terminate()?;
-    info!("PortAudio terminated.");
-
     Ok(())
+}
+
+fn get_supported_sample_rates(
+    device_index: pa::DeviceIndex,
+    num_channels: i32,
+    pa: &pa::PortAudio,
+) -> Vec<f64> {
+    let common_rates = [8000.0, 16000.0, 22050.0, 44100.0, 48000.0, 96000.0, 192000.0];
+    common_rates
+        .iter()
+        .cloned()
+        .filter(|&rate| {
+            let params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, 0.0);
+            pa.is_input_format_supported(params, rate).is_ok()
+        })
+        .collect()
 }

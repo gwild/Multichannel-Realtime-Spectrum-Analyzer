@@ -1,83 +1,142 @@
 use rustfft::{FftPlanner, num_complex::Complex};
+use std::sync::{Arc, RwLock, Mutex};
+use crate::plot::SpectrumApp;
+use crate::audio_stream::CircularBuffer;
+use log::info;
 
 pub const NUM_PARTIALS: usize = 12;
-const MIN_FREQUENCY: f32 = 20.0;
-const MAX_FREQUENCY: f32 = 1000.0;
-const DB_THRESHOLD: f32 = -32.0; // 24 dB threshold
 
-/// Computes the FFT spectrum from the given audio buffer.
-/// Returns a vector of (frequency, amplitude_db) pairs.
-pub fn compute_spectrum(buffer: &[f32], sample_rate: u32) -> Vec<(f32, f32)> {
+pub struct FFTConfig {
+    pub min_frequency: f32,
+    pub max_frequency: f32,
+    pub db_threshold: f32,
+}
+
+/// Computes the frequency spectrum from the provided audio buffer.
+pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) -> Vec<(f32, f32)> {
     if buffer.is_empty() {
-        return Vec::new();
+        return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    // Compute linear amplitude threshold at runtime
-    let linear_threshold = 10.0_f32.powf(DB_THRESHOLD / 20.0);
-
-    // Filter the signal in the time domain based on amplitude
+    let linear_threshold = 10.0_f32.powf(config.db_threshold / 20.0);
     let filtered_buffer: Vec<f32> = buffer
         .iter()
         .cloned()
-        .filter(|&sample| sample.abs() >= linear_threshold) // Keep only samples above the linear amplitude threshold
+        .filter(|&sample| sample.abs() >= linear_threshold)
         .collect();
 
     if filtered_buffer.is_empty() {
-        return Vec::new(); // Return early if no signal is above the threshold
+        return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(filtered_buffer.len());
+    let windowed_buffer: Vec<f32> = apply_blackman_harris(&filtered_buffer);
 
-    // Prepare the complex buffer for FFT
-    let mut complex_buffer: Vec<Complex<f32>> = filtered_buffer
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(windowed_buffer.len());
+
+    let mut complex_buffer: Vec<Complex<f32>> = windowed_buffer
         .iter()
         .map(|&x| Complex { re: x, im: 0.0 })
         .collect();
     fft.process(&mut complex_buffer);
 
-    // Calculate magnitudes and frequencies
     let mut magnitudes: Vec<_> = complex_buffer
         .iter()
         .enumerate()
         .map(|(i, &value)| {
-            let frequency = (i as f32) * (sample_rate as f32) / (filtered_buffer.len() as f32);
+            let frequency = (i as f32) * (sample_rate as f32) / (windowed_buffer.len() as f32);
             let amplitude = value.norm();
             let amplitude_db = if amplitude > 0.0 {
-                20.0 * amplitude.log(10.0)
+                20.0 * amplitude.log10()
             } else {
-                f32::MIN // Avoid logarithm of zero by using a small negative value
+                f32::MIN
             };
-            (frequency, amplitude_db.abs()) // Return without rounding here
+            (frequency, amplitude_db.abs())
         })
         .collect();
 
-    // Filter frequencies based on the defined limits
-    magnitudes.retain(|&(freq, _)| freq >= MIN_FREQUENCY && freq <= MAX_FREQUENCY);
+    magnitudes.retain(|&(freq, _)| freq >= config.min_frequency && freq <= config.max_frequency);
     magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    // Filter out frequencies that are too close together or below the dB threshold
     let mut filtered = Vec::new();
     let mut last_frequency = -1.0;
 
     for &(frequency, amplitude_db) in &magnitudes {
-        if frequency - last_frequency >= MIN_FREQUENCY && amplitude_db >= DB_THRESHOLD {
-            filtered.push((frequency, amplitude_db));
+        if frequency - last_frequency >= config.min_frequency && amplitude_db >= config.db_threshold {
+            let rounded_frequency = (frequency * 100.0).round() / 100.0;
+            let rounded_amplitude = (amplitude_db * 100.0).round() / 100.0;
+            filtered.push((rounded_frequency, rounded_amplitude));
             last_frequency = frequency;
         }
     }
 
-    // Round the results to two decimal places
-    let rounded_results: Vec<(f32, f32)> = filtered
-        .into_iter()
-        .take(NUM_PARTIALS)
-        .map(|(freq, amp)| (round_to_two_decimals(freq), round_to_two_decimals(amp)))
-        .collect();
+    while filtered.len() < NUM_PARTIALS {
+        filtered.push((0.0, 0.0));
+    }
 
-    rounded_results // Return the rounded results
+    filtered.truncate(NUM_PARTIALS);
+    filtered
 }
 
-/// Rounds a floating point number to two decimal places.
-fn round_to_two_decimals(value: f32) -> f32 {
-    (value * 100.0).round() / 100.0
+/// Applies Blackman-Harris windowing to the audio buffer.
+fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
+    let n = buffer.len();
+    buffer
+        .iter()
+        .enumerate()
+        .map(|(i, &sample)| {
+            let alpha0 = 0.35875;
+            let alpha1 = 0.48829;
+            let alpha2 = 0.14128;
+            let alpha3 = 0.01168;
+            let factor = alpha0
+                - alpha1 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos()
+                + alpha2 * (4.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos()
+                - alpha3 * (6.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
+            sample * factor
+        })
+        .collect()
+}
+
+/// Processes audio data from the circular buffer, computes the FFT, and updates the plot.
+pub fn process_audio_data(
+    buffer_clone_fft: Arc<RwLock<CircularBuffer>>,
+    fft_config_fft: Arc<Mutex<FFTConfig>>,
+    spectrum_app: Arc<Mutex<SpectrumApp>>,
+    selected_channels: Vec<usize>,
+    sample_rate: u32,
+) {
+    let buffer_data = {
+        let buffer = buffer_clone_fft.read().unwrap();
+        buffer.get_latest(1024 * selected_channels.len())  // Read enough samples for FFT
+    };
+
+    let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
+
+    for (channel_index, channel) in selected_channels.iter().enumerate() {
+        let channel_data = extract_channel_data(&buffer_data, *channel, selected_channels.len());
+
+        let config = fft_config_fft.lock().unwrap();
+        let spectrum = compute_spectrum(&channel_data, sample_rate, &*config);
+
+        if channel_index < all_channels_results.len() {
+            all_channels_results[channel_index] = spectrum;
+        }
+    }
+
+    // Log FFT results for debugging
+    info!("FFT Data: {:?}", all_channels_results);
+
+    if let Ok(mut spectrum) = spectrum_app.lock() {
+        spectrum.update_partials(all_channels_results);
+    }
+}
+
+/// Extracts audio data for a specific channel from the buffer.
+fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
+    buffer
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &sample)| if i % num_channels == channel { Some(sample) } else { None })
+        .collect()
 }

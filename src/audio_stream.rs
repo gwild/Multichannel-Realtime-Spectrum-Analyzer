@@ -1,9 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use portaudio as pa;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, Sender};
-use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS};
-use crate::plot::SpectrumApp;
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use portaudio::stream::InputCallbackArgs;
 use log::{info, error};
 
@@ -52,36 +51,37 @@ pub fn build_input_stream(
     device_index: pa::DeviceIndex,
     num_channels: i32,
     sample_rate: f64,
-    audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
-    spectrum_app: Arc<Mutex<SpectrumApp>>,
-    selected_channels: Vec<usize>,
+    buffer: Arc<RwLock<CircularBuffer>>,
     sender: Sender<Vec<f32>>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
-    if selected_channels.is_empty() {
-        return Err(anyhow!("No channels selected"));
-    }
-
-    // Retrieve device information to get latency settings
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
 
-    // Configure stream parameters
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
-
-    // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
     info!("Opening non-blocking PortAudio stream.");
 
-    // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
-            if let Err(e) = sender.send(args.buffer.to_vec()) {
-                error!("Failed to send audio buffer: {}", e);
-                return pa::Complete;
+            let buffer_data = args.buffer.to_vec();
+
+            // Lock the buffer and push new samples
+            if let Ok(mut buf) = buffer.write() {
+                for &sample in &buffer_data {
+                    buf.push(sample);
+                }
+            } else {
+                error!("Failed to lock audio buffer.");
             }
 
+            // Send buffer data to the processing thread
+            if let Err(e) = sender.send(buffer_data) {
+                error!("Failed to send audio buffer: {}", e);
+            }
+
+            // Handle overflow errors
             if args.flags.contains(pa::StreamCallbackFlags::INPUT_OVERFLOW) {
                 error!("Input overflow detected.");
             }
@@ -90,81 +90,42 @@ pub fn build_input_stream(
     )?;
 
     info!("PortAudio stream opened successfully.");
-
     Ok(stream)
 }
 
-/// Processes incoming audio samples and updates the spectrum analyzer.
-fn process_samples(
-    data_as_f32: Vec<f32>,
-    channels: usize,
-    audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
-    spectrum_app: &Arc<Mutex<SpectrumApp>>,
-    selected_channels: &[usize],
-    sample_rate: u32,
-) {
-    // Fill the audio buffers for each selected channel
-    for (i, &sample) in data_as_f32.iter().enumerate() {
-        let channel = i % channels;
-        if selected_channels.contains(&channel) {
-            if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
-                if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
-                    buffer.push(sample);
-                } else {
-                    error!("Failed to lock buffer for channel {}", buffer_index);
-                }
-            }
-        }
-    }
-
-    // Initialize partials_results with zeroes for all channels
-    let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
-    // Compute spectrum for each selected channel
-    for (i, &channel) in selected_channels.iter().enumerate() {
-        if let Ok(buffer) = audio_buffers[i].lock() {
-            let audio_data = buffer.get_latest(1024); // Adjust size as needed for FFT
-
-            if audio_data.len() >= 1024 { // Ensure sufficient data for FFT
-                let computed_partials = compute_spectrum(&audio_data, sample_rate);
-                for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
-                    partials_results[i][j] = partial;
-                }
-            }
-        }
-        println!(
-            "Channel {}: Partial Results: {:?}",
-            channel, partials_results[i]
-        );
-    }
-
-    // Update the spectrum_app with the new partials results
-    if let Ok(mut app) = spectrum_app.lock() {
-        app.partials = partials_results;
-    } else {
-        error!("Failed to lock spectrum app.");
-    }
-}
-
-/// Starts the processing thread to handle audio data and spectrum updates.
-pub fn start_processing_thread(
+/// Starts the audio sampling thread.
+pub fn start_sampling_thread(
+    running: Arc<AtomicBool>,
+    buffer: Arc<RwLock<CircularBuffer>>,
+    sender: Sender<Vec<f32>>,
     num_channels: usize,
-    audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
-    spectrum_app: Arc<Mutex<SpectrumApp>>,
-    selected_channels: Vec<usize>,
-    sample_rate: u32,
-    receiver: std::sync::mpsc::Receiver<Vec<f32>>,
+    sample_rate: f64,
+    _buffer_size: Arc<RwLock<usize>>,
 ) {
     std::thread::spawn(move || {
-        while let Ok(buffer) = receiver.recv() {
-            process_samples(
-                buffer,
-                num_channels,
-                &audio_buffers,
-                &spectrum_app,
-                &selected_channels,
-                sample_rate,
-            );
+        let pa = pa::PortAudio::new().expect("Failed to initialize PortAudio");
+
+        let mut stream = build_input_stream(
+            &pa,
+            pa.default_input_device().expect("No default input device available"),
+            num_channels as i32,
+            sample_rate,
+            buffer.clone(),
+            sender.clone(),
+        ).expect("Failed to build input stream");
+
+        stream.start().expect("Failed to start stream");
+        info!("Audio sampling thread started.");
+
+        // Keep sampling while running flag is true
+        while running.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
+
+        // Stop and clean up the stream when the program terminates
+        stream.stop().expect("Failed to stop stream");
+        stream.close().expect("Failed to close stream");
+        pa.terminate().expect("Failed to terminate PortAudio");
+        info!("Audio sampling thread stopped.");
     });
 }
