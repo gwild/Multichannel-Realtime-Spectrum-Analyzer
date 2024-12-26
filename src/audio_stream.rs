@@ -43,6 +43,13 @@ impl CircularBuffer {
         }
         data
     }
+
+    /// Clones the entire buffer to avoid data loss during processing.
+    pub fn clone_data(&self) -> Vec<f32> {
+        let mut data = self.buffer.clone();
+        data.rotate_left(self.head);
+        data
+    }
 }
 
 /// Builds and configures the audio input stream using PortAudio.
@@ -120,6 +127,11 @@ pub fn start_sampling_thread(
         // Keep sampling while running flag is true
         while running.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(buf) = buffer.read() {
+                info!("Buffer size: {}", buf.get_latest(256).len());
+            } else {
+                error!("Failed to read from buffer.");
+            }
         }
 
         // Stop and clean up the stream when the program terminates
