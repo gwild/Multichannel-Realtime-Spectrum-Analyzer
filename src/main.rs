@@ -169,7 +169,7 @@ fn run() -> Result<()> {
         plot::run_native(
             "Real-Time Spectrum Analyzer",
             NativeOptions {
-                initial_window_size: Some(eframe::epaint::Vec2::new(960.0, 420.0)),
+                initial_window_size: Some(eframe::epaint::Vec2::new(1024.0, 420.0)),
                 ..Default::default()
             },
             Box::new(move |_cc| Box::new(plot::MyApp::new(

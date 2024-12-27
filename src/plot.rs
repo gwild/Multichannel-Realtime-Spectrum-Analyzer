@@ -157,11 +157,11 @@ impl eframe::App for MyApp {
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
-                *self.buffer_size.lock().unwrap() = 8192;
+                *self.buffer_size.lock().unwrap() = 512;
 
                 for buffer in self.audio_buffers.iter() {
                     let mut buf = buffer.lock().unwrap();
-                    *buf = CircularBuffer::new(8192);
+                    *buf = CircularBuffer::new(512);
                 }
             }
 
@@ -207,9 +207,10 @@ impl eframe::App for MyApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
                 for (channel, channel_partials) in partials.iter().enumerate() {
+                    // CHANGED: show amplitude as rounded integer instead of one decimal
                     let formatted_partials: Vec<String> = channel_partials
                         .iter()
-                        .map(|&(freq, amp)| format!("({:.2}, {:.1})", freq, amp))
+                        .map(|&(freq, amp)| format!("({:.2}, {:.0})", freq, amp))
                         .collect();
                     ui.label(format!(
                         "Channel {}: [{}]",
