@@ -11,6 +11,7 @@ pub struct CircularBuffer {
     buffer: Vec<f32>,
     head: usize,
     size: usize,
+    cycle_count: usize,  // Track the number of times the buffer wraps around
 }
 
 impl CircularBuffer {
@@ -20,6 +21,7 @@ impl CircularBuffer {
             buffer: vec![0.0; size],
             head: 0,
             size,
+            cycle_count: 0,
         }
     }
 
@@ -27,6 +29,11 @@ impl CircularBuffer {
     pub fn push(&mut self, value: f32) {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size;
+
+        if self.head == 0 {
+            self.cycle_count += 1;
+            info!("Circular buffer has completed {} cycles.", self.cycle_count);
+        }
     }
 
     /// Retrieves the latest `count` samples.
