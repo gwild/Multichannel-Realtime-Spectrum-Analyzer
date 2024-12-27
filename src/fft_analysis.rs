@@ -1,5 +1,5 @@
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn};
@@ -98,51 +98,38 @@ fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-/// Processes audio data from the circular buffer, computes the FFT, and updates the plot.
+/// Processes audio data from circular buffers (one per channel) and computes FFT.
 pub fn process_audio_data(
-    buffer_clone_fft: Arc<RwLock<CircularBuffer>>,
+    buffer_clone_fft: Arc<Vec<Mutex<CircularBuffer>>>,
     fft_config_fft: Arc<Mutex<FFTConfig>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
     sample_rate: u32,
 ) {
-    let buffer_data = {
-        let buffer = buffer_clone_fft.read().unwrap();
-        buffer.get_latest(1024 * selected_channels.len())  // Read enough samples for FFT
-    };
-
-    // Check if buffer contains non-zero data
-    let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
-    if sum == 0.0 {
-        warn!("Buffer contains only zeroes, skipping FFT computation.");
-        return;
-    } else {
-        info!("Buffer contains non-zero data, proceeding with FFT.");
-    }
-
     let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
     for (channel_index, channel) in selected_channels.iter().enumerate() {
-        let channel_data = extract_channel_data(&buffer_data, *channel, selected_channels.len());
+        let buffer_data = {
+            let buffer = buffer_clone_fft[channel_index].lock().unwrap();
+            buffer.get_latest(1024)  // Fetch data from the channel buffer
+        };
+
+        // Check if buffer contains non-zero data
+        let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
+        if sum == 0.0 {
+            warn!("Buffer for channel {} contains only zeroes, skipping FFT.", channel);
+            continue;
+        } else {
+            info!("Processing FFT for channel {} with non-zero data.", channel);
+        }
 
         let config = fft_config_fft.lock().unwrap();
-        let spectrum = compute_spectrum(&channel_data, sample_rate, &*config);
+        let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
 
-        if channel_index < all_channels_results.len() {
-            all_channels_results[channel_index] = spectrum;
-        }
+        all_channels_results[channel_index] = spectrum;
     }
 
     if let Ok(mut spectrum) = spectrum_app.lock() {
         spectrum.update_partials(all_channels_results);
     }
-}
-
-/// Extracts audio data for a specific channel from the buffer.
-fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
-    buffer
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &sample)| if i % num_channels == channel { Some(sample) } else { None })
-        .collect()
 }

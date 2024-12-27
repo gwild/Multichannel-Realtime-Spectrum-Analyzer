@@ -5,7 +5,7 @@ mod plot;
 use anyhow::{anyhow, Result};
 use portaudio as pa;
 use std::io::{self, Write};
-use std::sync::{Arc, RwLock, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc;
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
@@ -112,7 +112,15 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
-    let buffer = Arc::new(RwLock::new(CircularBuffer::new(MAX_BUFFER_SIZE)));
+    let buffer_size = Arc::new(Mutex::new(MAX_BUFFER_SIZE));
+
+    let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
+        selected_channels
+            .iter()
+            .map(|_| Mutex::new(CircularBuffer::new(*buffer_size.lock().unwrap())))
+            .collect(),
+    );
+
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: 20.0,
@@ -123,26 +131,27 @@ fn run() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let (tx, rx) = mpsc::channel();
 
-    let buffer_clone = Arc::clone(&buffer);
+    let audio_buffers_clone = Arc::clone(&audio_buffers);
     let running_clone = Arc::clone(&running);
     let sampling_done = Arc::new(AtomicBool::new(false));
 
     std::thread::spawn({
         let sampling_done = Arc::clone(&sampling_done);
+        let selected_channels_clone = selected_channels.clone();
         move || {
             start_sampling_thread(
                 running_clone,
-                buffer_clone,
-                tx,
+                audio_buffers_clone,
                 selected_device_info.max_input_channels as usize,
                 selected_sample_rate,
-                Arc::new(RwLock::new(MAX_BUFFER_SIZE)),
+                selected_channels_clone,
+                tx,
             );
             sampling_done.store(true, Ordering::SeqCst);
         }
     });
 
-    let buffer_clone_fft = Arc::clone(&buffer);
+    let audio_buffers_clone_fft = Arc::clone(&audio_buffers);
     let fft_config_fft = Arc::clone(&fft_config);
     let spectrum_app_fft = Arc::clone(&spectrum_app);
 
@@ -154,7 +163,7 @@ fn run() -> Result<()> {
         while running_clone.load(Ordering::SeqCst) {
             if let Ok(_) = rx.recv() {
                 fft_analysis::process_audio_data(
-                    buffer_clone_fft.clone(),
+                    audio_buffers_clone_fft.clone(),
                     fft_config_fft.clone(),
                     spectrum_app_fft.clone(),
                     selected_channels.clone(),
@@ -174,7 +183,8 @@ fn run() -> Result<()> {
             Box::new(move |_cc| Box::new(plot::MyApp::new(
                 spectrum_app.clone(),
                 fft_config.clone(),
-                Arc::new(Mutex::new(4096)),
+                buffer_size.clone(),
+                audio_buffers.clone(),  // Pass audio_buffers to MyApp
             ))),
         )
     }).map_err(|e| anyhow!(e.to_string()))?;
