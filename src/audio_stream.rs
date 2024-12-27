@@ -30,6 +30,7 @@ impl CircularBuffer {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size;
 
+        // Increment cycle count when buffer wraps around
         if self.head == 0 {
             self.cycle_count += 1;
             info!("Circular buffer has completed {} cycles.", self.cycle_count);
@@ -134,11 +135,6 @@ pub fn start_sampling_thread(
         // Keep sampling while running flag is true
         while running.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            if let Ok(buf) = buffer.read() {
-                info!("Buffer size: {}", buf.get_latest(256).len());
-            } else {
-                error!("Failed to read from buffer.");
-            }
         }
 
         // Stop and clean up the stream when the program terminates

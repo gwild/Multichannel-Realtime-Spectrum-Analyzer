@@ -2,7 +2,7 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, RwLock, Mutex};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::info;
+use log::{info, warn};
 
 pub const NUM_PARTIALS: usize = 12;
 
@@ -111,6 +111,15 @@ pub fn process_audio_data(
         buffer.get_latest(1024 * selected_channels.len())  // Read enough samples for FFT
     };
 
+    // Check if buffer contains non-zero data
+    let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
+    if sum == 0.0 {
+        warn!("Buffer contains only zeroes, skipping FFT computation.");
+        return;
+    } else {
+        info!("Buffer contains non-zero data, proceeding with FFT.");
+    }
+
     let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
     for (channel_index, channel) in selected_channels.iter().enumerate() {
@@ -123,9 +132,6 @@ pub fn process_audio_data(
             all_channels_results[channel_index] = spectrum;
         }
     }
-
-    // Log FFT results for debugging
-    info!("FFT Data: {:?}", all_channels_results);
 
     if let Ok(mut spectrum) = spectrum_app.lock() {
         spectrum.update_partials(all_channels_results);
