@@ -1,6 +1,6 @@
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::Duration;
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
@@ -15,7 +15,46 @@ pub struct FFTConfig {
     pub db_threshold: f32,
 }
 
-/// Computes the frequency spectrum from the provided audio buffer.
+/// Spawns a thread to continuously process FFT data in the background.
+pub fn start_fft_processing(
+    buffer_clone_fft: Arc<Vec<Mutex<CircularBuffer>>>,
+    fft_config_fft: Arc<Mutex<FFTConfig>>,
+    spectrum_app: Arc<Mutex<SpectrumApp>>,
+    selected_channels: Vec<usize>,
+    sample_rate: u32,
+) {
+    thread::spawn(move || loop {
+        let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
+
+        for (channel_index, channel) in selected_channels.iter().enumerate() {
+            let buffer_data = {
+                let buffer = buffer_clone_fft[channel_index].lock().unwrap();
+                buffer.get().to_vec() // Clone buffer to avoid borrow conflicts
+            };
+
+            // Skip empty buffers to prevent unnecessary computation
+            let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
+            if sum == 0.0 {
+                warn!("Buffer for channel {} is empty, skipping FFT.", channel);
+                continue;
+            }
+
+            let config = fft_config_fft.lock().unwrap();
+            let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
+
+            all_channels_results[channel_index] = spectrum;
+        }
+
+        if let Ok(mut spectrum) = spectrum_app.lock() {
+            spectrum.update_partials(all_channels_results);
+        }
+
+        // Sleep to limit processing frequency to 10 Hz (100 ms)
+        sleep(Duration::from_millis(100));
+    });
+}
+
+/// Computes the frequency spectrum from the audio buffer.
 pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) -> Vec<(f32, f32)> {
     if buffer.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
@@ -99,43 +138,4 @@ fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
             sample * factor
         })
         .collect()
-}
-
-/// Processes audio data from circular buffers (one per channel) and computes FFT.
-pub fn process_audio_data(
-    buffer_clone_fft: Arc<Vec<Mutex<CircularBuffer>>>,
-    fft_config_fft: Arc<Mutex<FFTConfig>>,
-    spectrum_app: Arc<Mutex<SpectrumApp>>,
-    selected_channels: Vec<usize>,
-    sample_rate: u32,
-) {
-    let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
-    for (channel_index, channel) in selected_channels.iter().enumerate() {
-        let buffer_data = {
-            let buffer = buffer_clone_fft[channel_index].lock().unwrap();
-            buffer.get().to_vec() // Clone the buffer to avoid borrow issues
-        };
-
-        // Check if buffer contains non-zero data
-        let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
-        if sum == 0.0 {
-            warn!("Buffer for channel {} contains only zeroes, skipping FFT.", channel);
-            continue;
-        } else {
-            info!("Processing FFT for channel {} with non-zero data.", channel);
-        }
-
-        let config = fft_config_fft.lock().unwrap();
-        let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
-
-        all_channels_results[channel_index] = spectrum;
-    }
-
-    if let Ok(mut spectrum) = spectrum_app.lock() {
-        spectrum.update_partials(all_channels_results);
-    }
-
-    // Add a 100 ms sleep to limit loop execution frequency
-    sleep(Duration::from_millis(100));
 }
