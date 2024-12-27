@@ -4,6 +4,7 @@ use egui::plot::{Plot, BarChart};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
+use log::info;
 
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
@@ -19,7 +20,9 @@ impl SpectrumApp {
     pub fn update_partials(&mut self, new_partials: Vec<Vec<(f32, f32)>>) {
         for (channel, data) in new_partials.into_iter().enumerate() {
             if channel < self.partials.len() {
+                let log_data = data.clone();
                 self.partials[channel] = data;
+                info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
             }
         }
     }
@@ -79,7 +82,16 @@ impl eframe::App for MyApp {
                 ui.label("Min Frequency:");
                 ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
                 ui.label("Max Frequency:");
-                ui.add(egui::Slider::new(&mut fft_config.max_frequency, 500.0..=5000.0).text("Hz"));
+
+                let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
+                if ui
+                    .add(egui::Slider::new(&mut fft_config.max_frequency, 500.0..=nyquist_limit).text("Hz"))
+                    .changed()
+                {
+                    fft_config.max_frequency = fft_config.max_frequency.min(nyquist_limit);
+                    info!("Max frequency adjusted to {}", fft_config.max_frequency);
+                }
+
                 ui.label("DB Threshold:");
                 ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0).text("dB"));
             });
@@ -166,6 +178,7 @@ impl eframe::App for MyApp {
                     }
                 });
 
+            // Print partials directly to the GUI
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
                 for (channel, channel_partials) in partials.iter().enumerate() {
