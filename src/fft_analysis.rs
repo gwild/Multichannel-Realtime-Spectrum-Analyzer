@@ -1,7 +1,10 @@
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
+// Reminder: The following imports are protected. Any modification requires explicit permission.
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
 use std::time::Duration;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn};
@@ -23,34 +26,48 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
 ) {
-    thread::spawn(move || loop {
-        let mut all_channels_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
+    thread::spawn(move || {
+        loop {
+            // Added panic handling around the entire loop logic:
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut all_channels_results =
+                    vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-        for (channel_index, channel) in selected_channels.iter().enumerate() {
-            let buffer_data = {
-                let buffer = buffer_clone_fft[channel_index].lock().unwrap();
-                buffer.get().to_vec() // Clone buffer to avoid borrow conflicts
-            };
+                for (channel_index, channel) in selected_channels.iter().enumerate() {
+                    let buffer_data = {
+                        let buffer = buffer_clone_fft[channel_index].lock().unwrap();
+                        buffer.get().to_vec() // Clone buffer to avoid borrow conflicts
+                    };
 
-            // Skip empty buffers to prevent unnecessary computation
-            let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
-            if sum == 0.0 {
-                warn!("Buffer for channel {} is empty, skipping FFT.", channel);
+                    // Skip empty buffers to prevent unnecessary computation
+                    let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
+                    if sum == 0.0 {
+                        warn!("Buffer for channel {} is empty, skipping FFT.", channel);
+                        continue;
+                    }
+
+                    let config = fft_config_fft.lock().unwrap();
+                    let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
+
+                    all_channels_results[channel_index] = spectrum;
+                }
+
+                if let Ok(mut spectrum) = spectrum_app.lock() {
+                    spectrum.update_partials(all_channels_results);
+                }
+
+                // Sleep to limit processing frequency to 10 Hz (100 ms)
+                sleep(Duration::from_millis(100));
+            }));
+
+            if let Err(e) = result {
+                // If a panic occurred, log and print the error, then loop again
+                eprintln!("Panic in FFT thread: {:?}", e);
+                warn!("Panic in FFT thread: {:?}", e);
+                // Attempt to keep running instead of exiting:
                 continue;
             }
-
-            let config = fft_config_fft.lock().unwrap();
-            let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
-
-            all_channels_results[channel_index] = spectrum;
         }
-
-        if let Ok(mut spectrum) = spectrum_app.lock() {
-            spectrum.update_partials(all_channels_results);
-        }
-
-        // Sleep to limit processing frequency to 10 Hz (100 ms)
-        sleep(Duration::from_millis(100));
     });
 }
 
@@ -104,7 +121,8 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
     let mut last_frequency = -1.0;
 
     for &(frequency, amplitude_db) in &magnitudes {
-        if frequency - last_frequency >= config.min_frequency && amplitude_db >= config.db_threshold {
+        if frequency - last_frequency >= config.min_frequency && amplitude_db >= config.db_threshold
+        {
             let rounded_frequency = (frequency * 100.0).round() / 100.0;
             let rounded_amplitude = (amplitude_db * 100.0).round() / 100.0;
             filtered.push((rounded_frequency, rounded_amplitude));
@@ -139,3 +157,5 @@ fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
+
+// Total line count: 171
