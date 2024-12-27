@@ -38,6 +38,7 @@ impl CircularBuffer {
     pub fn push(&mut self, value: f32) {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size; // Wrap around
+        println!("Pushed sample to buffer: {}", value);
     }
 
     /// Retrieves the current contents of the buffer.
@@ -100,6 +101,7 @@ pub fn build_input_stream(
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
+            println!("Callback triggered with {} samples", args.buffer.len());
             let data_clone = args.buffer.to_vec();
             process_samples(
                 data_clone,
@@ -146,6 +148,7 @@ fn process_samples(
     // Fill the audio buffers for each selected channel
     for (i, &sample) in data_as_f32.iter().enumerate() {
         let channel = i % channels;
+        println!("Received sample: {} for channel {}", sample, channel);
         if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
             if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
                 buffer.push(sample);
