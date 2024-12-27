@@ -7,7 +7,7 @@ use portaudio as pa;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc;
-use audio_stream::{CircularBuffer, start_sampling_thread};
+use audio_stream::{CircularBuffer, build_input_stream};
 use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
@@ -25,7 +25,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let pa = pa::PortAudio::new()?;
+    let pa = Arc::new(pa::PortAudio::new()?);  // Use Arc to share pa
     info!("PortAudio initialized.");
 
     let host = match pa.host_apis()
@@ -129,8 +129,9 @@ fn run() -> Result<()> {
     }));
 
     let running = Arc::new(AtomicBool::new(true));
-    let (tx, rx) = mpsc::channel();
+    let (_tx, _rx) = mpsc::channel::<()>();
 
+    let pa_clone = Arc::clone(&pa);  // Clone for thread use
     let audio_buffers_clone = Arc::clone(&audio_buffers);
     let running_clone = Arc::clone(&running);
     let sampling_done = Arc::new(AtomicBool::new(false));
@@ -138,37 +139,28 @@ fn run() -> Result<()> {
     std::thread::spawn({
         let sampling_done = Arc::clone(&sampling_done);
         let selected_channels_clone = selected_channels.clone();
+        let spectrum_app_clone = Arc::clone(&spectrum_app);
+        let fft_config_clone = Arc::clone(&fft_config);
         move || {
-            start_sampling_thread(
-                running_clone,
-                audio_buffers_clone,
-                selected_device_info.max_input_channels as usize,
+            if let Ok(mut stream) = build_input_stream(
+                &pa_clone,
+                selected_device_index,
+                selected_device_info.max_input_channels as i32,
                 selected_sample_rate,
+                audio_buffers_clone.clone(),
+                spectrum_app_clone,
                 selected_channels_clone,
-                tx,
-            );
-            sampling_done.store(true, Ordering::SeqCst);
-        }
-    });
-
-    let audio_buffers_clone_fft = Arc::clone(&audio_buffers);
-    let fft_config_fft = Arc::clone(&fft_config);
-    let spectrum_app_fft = Arc::clone(&spectrum_app);
-
-    let running_clone = Arc::clone(&running);
-    std::thread::spawn(move || {
-        while !sampling_done.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        while running_clone.load(Ordering::SeqCst) {
-            if let Ok(_) = rx.recv() {
-                fft_analysis::process_audio_data(
-                    audio_buffers_clone_fft.clone(),
-                    fft_config_fft.clone(),
-                    spectrum_app_fft.clone(),
-                    selected_channels.clone(),
-                    selected_sample_rate as u32,
-                );
+                fft_config_clone,
+            ) {
+                stream.start().expect("Failed to start audio stream.");
+                sampling_done.store(true, Ordering::SeqCst);
+                while running_clone.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                stream.stop().expect("Failed to stop stream.");
+                stream.close().expect("Failed to close stream.");
+            } else {
+                error!("Failed to build audio stream.");
             }
         }
     });
@@ -184,16 +176,20 @@ fn run() -> Result<()> {
                 spectrum_app.clone(),
                 fft_config.clone(),
                 buffer_size.clone(),
-                audio_buffers.clone(),  // Pass audio_buffers to MyApp
+                audio_buffers.clone(),
             ))),
         )
     }).map_err(|e| anyhow!(e.to_string()))?;
 
-    running.store(false, Ordering::SeqCst);
-    pa.terminate()?;
+    let pa_clone = Arc::try_unwrap(pa)
+        .unwrap_or_else(|arc| Arc::into_inner(arc).unwrap());
+    pa_clone.terminate()?;
+
     Ok(())
 }
 
+// THE FUNCTION WAS NOT REMOVED
+// ONLY A FUCKING DEVIANT WOULD REMOVE THIS FUNCTION
 fn get_supported_sample_rates(
     device_index: pa::DeviceIndex,
     num_channels: i32,

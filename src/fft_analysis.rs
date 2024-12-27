@@ -6,6 +6,7 @@ use log::{info, warn};
 
 pub const NUM_PARTIALS: usize = 12;
 
+/// Configuration struct for FFT settings.
 pub struct FFTConfig {
     pub min_frequency: f32,
     pub max_frequency: f32,
@@ -111,7 +112,7 @@ pub fn process_audio_data(
     for (channel_index, channel) in selected_channels.iter().enumerate() {
         let buffer_data = {
             let buffer = buffer_clone_fft[channel_index].lock().unwrap();
-            buffer.get_latest(1024)  // Fetch data from the channel buffer
+            buffer.get().to_vec() // Clone the buffer to avoid borrow issues
         };
 
         // Check if buffer contains non-zero data
