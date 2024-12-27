@@ -1,5 +1,7 @@
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn};
@@ -133,4 +135,7 @@ pub fn process_audio_data(
     if let Ok(mut spectrum) = spectrum_app.lock() {
         spectrum.update_partials(all_channels_results);
     }
+
+    // Add a 100 ms sleep to limit loop execution frequency
+    sleep(Duration::from_millis(100));
 }

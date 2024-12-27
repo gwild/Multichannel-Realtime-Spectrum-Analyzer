@@ -1,3 +1,4 @@
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 use std::sync::{Arc, Mutex};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
@@ -6,10 +7,12 @@ use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
 }
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
@@ -28,6 +31,7 @@ impl SpectrumApp {
     }
 }
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct MyApp {
     pub spectrum: Arc<Mutex<SpectrumApp>>,
     pub fft_config: Arc<Mutex<FFTConfig>>,
@@ -39,6 +43,7 @@ pub struct MyApp {
     bar_width: f32,
 }
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl MyApp {
     pub fn new(
         spectrum: Arc<Mutex<SpectrumApp>>,
@@ -69,6 +74,7 @@ impl MyApp {
     }
 }
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
@@ -178,7 +184,6 @@ impl eframe::App for MyApp {
                     }
                 });
 
-            // Print partials directly to the GUI
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
                 for (channel, channel_partials) in partials.iter().enumerate() {
@@ -197,6 +202,7 @@ impl eframe::App for MyApp {
     }
 }
 
+// This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub fn run_native(
     app_name: &str,
     native_options: NativeOptions,
