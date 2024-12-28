@@ -38,7 +38,7 @@ impl CircularBuffer {
     pub fn push(&mut self, value: f32) {
         self.buffer[self.head] = value;
         self.head = (self.head + 1) % self.size; // Wrap around
-        info!("Pushed sample to buffer: {}", value);
+        // info!("Pushed sample to buffer: {}", value);
     }
 
     /// Retrieves the current contents of the buffer.
@@ -95,13 +95,13 @@ pub fn build_input_stream(
     // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
-    info!("Opening non-blocking PortAudio stream.");
+    // info!("Opening non-blocking PortAudio stream.");
 
     // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
-            info!("Callback triggered with {} samples", args.buffer.len());
+            // info!("Callback triggered with {} samples", args.buffer.len());
             let data_clone = args.buffer.to_vec();
             process_samples(
                 data_clone,
@@ -116,7 +116,7 @@ pub fn build_input_stream(
         },
     )?;
 
-    info!("PortAudio stream opened successfully.");
+    // info!("PortAudio stream opened successfully.");
 
     Ok(stream)
 }
@@ -148,7 +148,7 @@ fn process_samples(
     // Fill the audio buffers for each selected channel
     for (i, &sample) in data_as_f32.iter().enumerate() {
         let channel = i % channels;
-        info!("Received sample: {} for channel {}", sample, channel);
+        //info!("Received sample: {} for channel {}", sample, channel);
         if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
             if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
                 buffer.push(sample);
@@ -170,10 +170,10 @@ fn process_samples(
                 for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                     partials_results[i][j] = partial;
                 }
-                info!(
-                    "Channel {}: Partial Results: {:?}",
-                    channel, partials_results[i]
-                );
+                // info!(
+                //     "Channel {}: Partial Results: {:?}",
+                //     channel, partials_results[i]
+                // );
             }
         }
     }

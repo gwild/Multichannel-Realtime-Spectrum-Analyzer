@@ -29,7 +29,7 @@ impl SpectrumApp {
             if channel < self.partials.len() {
                 let log_data = data.clone();
                 self.partials[channel] = data;
-                info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
+                // info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
             }
         }
     }
@@ -68,7 +68,9 @@ impl MyApp {
             egui::Color32::from_rgb(75, 0, 130),
             egui::Color32::from_rgb(255, 255, 0),
         ];
-        MyApp {
+
+        // Create the MyApp instance as before (NO alterations/deletions)
+        let mut instance = MyApp {
             spectrum,
             fft_config,
             buffer_size,
@@ -80,7 +82,24 @@ impl MyApp {
 
             // Throttling: Initialize the last_repaint timer
             last_repaint: Instant::now(), // Reminder: Initialization of throttling timer added. Do not modify without permission.
+        };
+
+        // FIX IMPLEMENTATION:
+        // After we construct `instance`, we clamp `max_frequency` so the x scale
+        // is correct on startup, if current max_frequency exceeds nyquist_limit.
+        {
+            let buffer_s = instance.buffer_size.lock().unwrap();
+            let nyquist_limit = (*buffer_s as f32 / 2.0).min(20000.0);
+
+            let mut cfg = instance.fft_config.lock().unwrap();
+            if cfg.max_frequency > nyquist_limit {
+                cfg.max_frequency = nyquist_limit;
+                // info!("Clamped max frequency at startup to {}", cfg.max_frequency);
+            }
         }
+
+        // Return the newly created instance with the fix
+        instance
     }
 }
 
@@ -184,7 +203,7 @@ impl eframe::App for MyApp {
                 // If max freq is above new nyquist, clamp
                 if fft_config.max_frequency > nyquist_limit {
                     fft_config.max_frequency = nyquist_limit;
-                    info!("Auto-adjusted max frequency to {}", fft_config.max_frequency);
+                    // info!("Auto-adjusted max frequency to {}", fft_config.max_frequency);
                 }
             }
 
@@ -260,4 +279,4 @@ pub fn run_native(
     eframe::run_native(app_name, native_options, app_creator)
 }
 
-// Total line count: 253
+// Total line count: 259
