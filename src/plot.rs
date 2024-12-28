@@ -179,18 +179,18 @@ impl eframe::App for MyApp {
             if ui.button("Reset to Defaults").clicked() {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 fft_config.min_frequency = 20.0;
-                fft_config.max_frequency = 1000.0;
+                fft_config.max_frequency = 2048.0;
                 fft_config.db_threshold = -32.0;
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
                 let mut buf_size = self.buffer_size.lock().unwrap();
-                *buf_size = 512;
+                *buf_size = 4096;
                 reset_clicked = true;
 
                 for buffer in self.audio_buffers.iter() {
                     let mut buf = buffer.lock().unwrap();
-                    *buf = CircularBuffer::new(512);
+                    *buf = CircularBuffer::new(2048);
                 }
             }
 
