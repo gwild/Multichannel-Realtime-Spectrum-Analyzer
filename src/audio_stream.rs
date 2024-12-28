@@ -15,6 +15,7 @@ use log::{info, error};
 // We import AtomicUsize to help track how many times a function is called,
 // providing a clue if the code freezes due to a callback no longer being invoked.
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};  // Timeout feature
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 // Reminder: This doc comment and struct definition must remain as is.
@@ -57,7 +58,6 @@ impl CircularBuffer {
 
         // ADDED (commented out by default, can be toggled):
         // info!("Pushed sample to buffer: {}", value);
-        // Possibly we add or remove debugging logs here by toggling comment.
     }
 
     /// Retrieves the current contents of the buffer.
@@ -107,41 +107,38 @@ pub fn build_input_stream(
         return Err(anyhow!("No channels selected"));
     }
 
-    // Retrieve device information to get latency settings
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
-
-    // Configure stream parameters
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
-
-    // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
 
-    // Could add debug logs or memory usage checks here. For example:
-    // info!("Attempting to open non-blocking PortAudio stream at sample_rate = {}", sample_rate);
+    let last_call = Arc::new(Mutex::new(Instant::now()));  // Timeout tracking
 
     let stream = pa.open_non_blocking_stream(
         settings,
-        move |args: InputCallbackArgs<f32>| {
-            // Optionally log callback usage:
-            // info!("Callback triggered with {} samples", args.buffer.len());
+        {
+            let last_call = last_call.clone();
+            move |args: InputCallbackArgs<f32>| {
+                let mut last_time = last_call.lock().unwrap();
+                if last_time.elapsed() > Duration::from_secs(5) {
+                    error!("Timeout: No audio callback in the last 5 seconds.");
+                }
+                *last_time = Instant::now();
 
-            let data_clone = args.buffer.to_vec();
-            process_samples(
-                data_clone,
-                num_channels as usize,
-                &audio_buffers,
-                &spectrum_app,
-                &selected_channels,
-                sample_rate as u32,
-                &fft_config,
-            );
-            pa::Continue
+                let data_clone = args.buffer.to_vec();
+                process_samples(
+                    data_clone,
+                    num_channels as usize,
+                    &audio_buffers,
+                    &spectrum_app,
+                    &selected_channels,
+                    sample_rate as u32,
+                    &fft_config,
+                );
+                pa::Continue
+            }
         },
     )?;
-
-    // Additional debug logs if needed
-    // info!("PortAudio stream opened successfully with device index {}", device_index);
 
     Ok(stream)
 }
@@ -173,28 +170,19 @@ fn process_samples(
     sample_rate: u32,
     fft_config: &Arc<Mutex<FFTConfig>>,
 ) {
-    // ADDED LINES (example debug counter to track how often we get callbacks):
     {
-        // We keep a static counter of how many times `process_samples` is called
         static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
         let calls = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
         if calls % 100 == 0 {
-            // Once every 100 calls, we log a debug line:
             info!("process_samples called {} times so far", calls);
         }
     }
 
-    // Fill the audio buffers for each selected channel
     for (i, &sample) in data_as_f32.iter().enumerate() {
         let channel = i % channels;
-        // We could add logs for each sample, but that can be too frequent:
-        // debug!("sample {} on channel {}", sample, channel);
-
         if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
             if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
                 buffer.push(sample);
-            } else {
-                error!("Failed to lock buffer for channel {}", buffer_index);
             }
         }
     }
@@ -202,7 +190,6 @@ fn process_samples(
     let config = fft_config.lock().unwrap();
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-    // Compute spectrum for each selected channel
     for (i, &channel) in selected_channels.iter().enumerate() {
         if let Ok(buffer) = audio_buffers[i].lock() {
             let audio_data = buffer.get();
@@ -211,7 +198,6 @@ fn process_samples(
                 for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                     partials_results[i][j] = partial;
                 }
-                // info!("Channel {}: Partial Results: {:?}", channel, partials_results[i]);
             }
         }
     }
@@ -219,11 +205,6 @@ fn process_samples(
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
     }
-
-    // Could add further system monitoring (like memory usage) or freeze detection checks here
-    // e.g., calling sysinfo or reading /proc/meminfo. That code would also be appended lines.
 }
 
-// This section is protected. No lines removed. We only added debugging lines above.
-
-// Total line count: 197
+// Total line count: 239
