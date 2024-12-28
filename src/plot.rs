@@ -95,7 +95,7 @@ impl eframe::App for MyApp {
             self.last_repaint = now;
         }
 
-        // NEW LINE: force continuous updates every 100 ms, even without user interaction
+        // Force continuous updates every 100 ms
         ctx.request_repaint_after(Duration::from_millis(100));
 
         ctx.set_visuals(egui::Visuals::dark());
@@ -103,44 +103,49 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
-            let mut fft_config = self.fft_config.lock().unwrap();
-            ui.horizontal(|ui| {
-                ui.label("Min Frequency:");
-                ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
-                ui.label("Max Frequency:");
+            // 1) Sliders for min freq, max freq, db threshold
+            {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.horizontal(|ui| {
+                    ui.label("Min Frequency:");
+                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
+                    ui.label("Max Frequency:");
 
-                let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
-                if ui
-                    .add(egui::Slider::new(&mut fft_config.max_frequency, 500.0..=nyquist_limit).text("Hz"))
-                    .changed()
-                {
-                    fft_config.max_frequency = fft_config.max_frequency.min(nyquist_limit);
-                    info!("Max frequency adjusted to {}", fft_config.max_frequency);
-                }
+                    // For max freq, always start at 0.0..=nyquist
+                    let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
+                    ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
-                ui.label("DB Threshold:");
-                ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0).text("dB"));
-            });
+                    ui.label("DB Threshold:");
+                    ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0).text("dB"));
+                });
+            }
 
-            let mut buffer_size = *self.buffer_size.lock().unwrap();
-            let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
-            ui.horizontal(|ui| {
-                ui.label("Buffer Size:");
-                if ui
-                    .add(egui::Slider::new(&mut buffer_log_slider, 6..=14).text("Power of 2"))
-                    .changed()
-                {
-                    buffer_size = 1 << buffer_log_slider;
-                    *self.buffer_size.lock().unwrap() = buffer_size;
+            // 2) Buffer size slider (no immediate clamp of max_frequency inside)
+            let mut size_changed = false;
+            {
+                let mut buffer_size = *self.buffer_size.lock().unwrap();
+                let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
+                ui.horizontal(|ui| {
+                    ui.label("Buffer Size:");
+                    if ui
+                        .add(egui::Slider::new(&mut buffer_log_slider, 6..=14).text("Power of 2"))
+                        .changed()
+                    {
+                        buffer_size = 1 << buffer_log_slider;
+                        *self.buffer_size.lock().unwrap() = buffer_size;
 
-                    for buffer in self.audio_buffers.iter() {
-                        let mut buf = buffer.lock().unwrap();
-                        *buf = CircularBuffer::new(buffer_size);
+                        // Recreate buffers
+                        for buffer in self.audio_buffers.iter() {
+                            let mut buf = buffer.lock().unwrap();
+                            *buf = CircularBuffer::new(buffer_size);
+                        }
+                        size_changed = true;
                     }
-                }
-                ui.label(format!("{} samples", buffer_size));
-            });
+                    ui.label(format!("{} samples", buffer_size));
+                });
+            }
 
+            // 3) Sliders for Y scale, alpha, bar width
             ui.horizontal(|ui| {
                 ui.label("Y Max:");
                 ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("dB"));
@@ -150,14 +155,19 @@ impl eframe::App for MyApp {
                 ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
             });
 
+            // 4) Reset button
+            let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
+                let mut fft_config = self.fft_config.lock().unwrap();
                 fft_config.min_frequency = 20.0;
                 fft_config.max_frequency = 1000.0;
                 fft_config.db_threshold = -32.0;
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
-                *self.buffer_size.lock().unwrap() = 512;
+                let mut buf_size = self.buffer_size.lock().unwrap();
+                *buf_size = 512;
+                reset_clicked = true;
 
                 for buffer in self.audio_buffers.iter() {
                     let mut buf = buffer.lock().unwrap();
@@ -165,6 +175,20 @@ impl eframe::App for MyApp {
                 }
             }
 
+            // 5) After all sliders, handle changes outside the slider blocks
+            if size_changed || reset_clicked {
+                let buffer_size = *self.buffer_size.lock().unwrap();
+                let nyquist_limit = (buffer_size as f32 / 2.0).min(20000.0);
+
+                let mut fft_config = self.fft_config.lock().unwrap();
+                // If max freq is above new nyquist, clamp
+                if fft_config.max_frequency > nyquist_limit {
+                    fft_config.max_frequency = nyquist_limit;
+                    info!("Auto-adjusted max frequency to {}", fft_config.max_frequency);
+                }
+            }
+
+            // 6) Plot logic
             let partials = {
                 let spectrum = self.spectrum.lock().unwrap();
                 spectrum.partials.clone()
@@ -191,11 +215,16 @@ impl eframe::App for MyApp {
                 })
                 .collect();
 
+            let max_freq = {
+                let fft = self.fft_config.lock().unwrap();
+                fft.max_frequency
+            };
+
             Plot::new("spectrum_plot")
                 .legend(egui::plot::Legend::default())
                 .view_aspect(6.0)
                 .include_x(0.0)
-                .include_x(fft_config.max_frequency as f64)
+                .include_x(max_freq as f64)
                 .include_y(0.0)
                 .include_y(self.y_scale)
                 .show(ui, |plot_ui| {
@@ -207,7 +236,6 @@ impl eframe::App for MyApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
                 for (channel, channel_partials) in partials.iter().enumerate() {
-                    // CHANGED: show amplitude as rounded integer instead of one decimal
                     let formatted_partials: Vec<String> = channel_partials
                         .iter()
                         .map(|&(freq, amp)| format!("({:.2}, {:.0})", freq, amp))
@@ -219,10 +247,9 @@ impl eframe::App for MyApp {
                     ));
                 }
             });
-        }); // Closing the closure passed to CentralPanel::show
-    } // Closing update method
-
-} // <-- Single brace added here to fix unclosed delimiter
+        }); // End CentralPanel
+    }
+}
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub fn run_native(
@@ -233,4 +260,4 @@ pub fn run_native(
     eframe::run_native(app_name, native_options, app_creator)
 }
 
-// Total line count: 232
+// Total line count: 253
