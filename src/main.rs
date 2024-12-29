@@ -294,7 +294,7 @@ fn reset_audio_devices(pa: &Arc<pa::PortAudio>) -> Result<()> {
 fn ensure_audio_device_ready(pa: &pa::PortAudio, device_index: pa::DeviceIndex) -> bool {
     let params = pa::StreamParameters::<f32>::new(device_index, 1, true, 0.0);
     if let Ok(mut stream) = pa.open_non_blocking_stream(
-        pa::InputStreamSettings::new(params, 44100.0, 256),
+        pa::InputStreamSettings::new(params, 48000.0, 512),
         |_args| pa::Continue,
     ) {
         stream.close().is_ok()
