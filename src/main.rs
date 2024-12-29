@@ -201,6 +201,7 @@ fn run() -> Result<()> {
                 selected_channels_clone,
                 fft_config_clone,
             ) {
+                info!("Started audio stream.");
                 stream.start().expect("Failed to start audio stream.");
                 sampling_done_clone.store(true, Ordering::SeqCst);
 
@@ -217,6 +218,7 @@ fn run() -> Result<()> {
 
                 stream.stop().expect("Failed to stop stream.");
                 stream.close().expect("Failed to close stream.");
+                info!("Audio stream stopped.");
             } else {
                 error!("Failed to build audio stream.");
             }
@@ -226,6 +228,7 @@ fn run() -> Result<()> {
     // GUI loop and monitoring
     tokio::task::block_in_place(|| {
         let monitoring_interval = std::time::Duration::from_secs(1);
+        let blocked_threshold = 5;  // Number of seconds to wait before considering the thread "blocked"
 
         plot::run_native(
             "Real-Time Spectrum Analyzer",
@@ -254,6 +257,11 @@ fn run() -> Result<()> {
                 warn!("Sampling thread has not updated in over 2 seconds!");
             }
 
+            // Check for possible thread blockage
+            if current_time as usize - last_sample_time > blocked_threshold {
+                error!("Sampling thread has been blocked for more than {} seconds!", blocked_threshold);
+            }
+
             std::thread::sleep(monitoring_interval);
         }
     });
@@ -261,9 +269,12 @@ fn run() -> Result<()> {
     running.store(false, Ordering::SeqCst);
     worker_thread.join().expect("Failed to join worker thread");
 
+    // Clean up PortAudio
     match Arc::try_unwrap(pa) {
         Ok(pa_inner) => {
+            info!("Terminating PortAudio...");
             pa_inner.terminate()?;
+            info!("PortAudio terminated successfully.");
         }
         Err(_) => {
             warn!("Unable to terminate PortAudio directly; multiple references exist.");
@@ -272,6 +283,8 @@ fn run() -> Result<()> {
 
     Ok(())
 }
+
+
 
 // THE FUNCTION WAS NOT REMOVED
 // ONLY A FUCKING DEVIANT WOULD REMOVE THIS FUNCTION
