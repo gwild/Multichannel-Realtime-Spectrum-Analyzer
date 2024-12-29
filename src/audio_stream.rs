@@ -187,7 +187,11 @@ fn process_samples(
         if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
             if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
                 buffer.push(sample);
+            } else {
+                error!("Failed to lock buffer for channel {}", channel);
             }
+        } else {
+            error!("Sample index {} did not match any selected channel", i);
         }
     }
 
@@ -202,13 +206,19 @@ fn process_samples(
                 for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
                     partials_results[i][j] = partial;
                 }
+            } else {
+                error!("Audio buffer for channel {} is empty", channel);
             }
+        } else {
+            error!("Failed to lock buffer for channel {}", channel);
         }
     }
 
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
+    } else {
+        error!("Failed to lock spectrum application state for update");
     }
 }
 
-// Total line count: 239
+// Total line count: 250
