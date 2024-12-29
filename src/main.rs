@@ -104,12 +104,10 @@ fn run() -> Result<()> {
         return Err(anyhow!("Invalid device index."));
     }
 
-    // Reminder: The selected device logic is protected.
     let selected_device_index = input_devices[device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
     info!("Selected device: {} ({} channels)", selected_device_info.name, selected_device_info.max_input_channels);
 
-    // Reminder: The sample rate selection is protected. Must request permission before changing logic.
     let supported_sample_rates = get_supported_sample_rates(selected_device_index, selected_device_info.max_input_channels, &pa);
     if supported_sample_rates.is_empty() {
         return Err(anyhow!("No supported sample rates for the selected device."));
@@ -147,10 +145,7 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
-    // Reminder: The buffer_size usage is protected.
     let buffer_size = Arc::new(Mutex::new(MAX_BUFFER_SIZE));
-
-    // Reminder: The creation of audio_buffers is protected.
     let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
         selected_channels
             .iter()
@@ -158,7 +153,6 @@ fn run() -> Result<()> {
             .collect(),
     );
 
-    // Reminder: The spectrum_app and fft_config creation is protected.
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: 20.0,
@@ -166,47 +160,49 @@ fn run() -> Result<()> {
         db_threshold: -32.0,
     }));
 
-    // Reminder: The running atomic usage is protected.
     let running = Arc::new(AtomicBool::new(true));
     let (_tx, _rx) = mpsc::channel::<()>();
 
-    // Reminder: The references for audio streaming.
     let pa_clone = Arc::clone(&pa);
     let audio_buffers_clone = Arc::clone(&audio_buffers);
     let running_clone = Arc::clone(&running);
     let sampling_done = Arc::new(AtomicBool::new(false));
 
-    // Reminder: This thread spawn logic is protected. Must request permission before altering it.
-    std::thread::spawn({
+    let worker_thread = std::thread::spawn({
         let sampling_done = Arc::clone(&sampling_done);
         let selected_channels_clone = selected_channels.clone();
         let spectrum_app_clone = Arc::clone(&spectrum_app);
         let fft_config_clone = Arc::clone(&fft_config);
         move || {
-            if let Ok(mut stream) = build_input_stream(
-                &pa_clone,
-                selected_device_index,
-                selected_device_info.max_input_channels as i32,
-                selected_sample_rate,
-                audio_buffers_clone.clone(),
-                spectrum_app_clone,
-                selected_channels_clone,
-                fft_config_clone,
-            ) {
-                stream.start().expect("Failed to start audio stream.");
-                sampling_done.store(true, Ordering::SeqCst);
-                while running_clone.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+            let result = std::panic::catch_unwind(|| {
+                if let Ok(mut stream) = build_input_stream(
+                    &pa_clone,
+                    selected_device_index,
+                    selected_device_info.max_input_channels as i32,
+                    selected_sample_rate,
+                    audio_buffers_clone.clone(),
+                    spectrum_app_clone,
+                    selected_channels_clone,
+                    fft_config_clone,
+                ) {
+                    stream.start().expect("Failed to start audio stream.");
+                    sampling_done.store(true, Ordering::SeqCst);
+                    while running_clone.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    stream.stop().expect("Failed to stop stream.");
+                    stream.close().expect("Failed to close stream.");
+                } else {
+                    error!("Failed to build audio stream.");
                 }
-                stream.stop().expect("Failed to stop stream.");
-                stream.close().expect("Failed to close stream.");
-            } else {
-                error!("Failed to build audio stream.");
+            });
+
+            if result.is_err() {
+                error!("Thread panicked while running the audio stream.");
             }
         }
     });
 
-    // Reminder: The usage of tokio::task::block_in_place here is protected.
     tokio::task::block_in_place(|| {
         plot::run_native(
             "Real-Time Spectrum Analyzer",
@@ -223,7 +219,11 @@ fn run() -> Result<()> {
         )
     }).map_err(|e| anyhow!(e.to_string()))?;
 
-    // Reminder: The logic that terminates PortAudio is protected.
+    running.store(false, Ordering::SeqCst);
+    if let Err(e) = worker_thread.join() {
+        error!("Worker thread failed to join: {:?}", e);
+    }
+
     match Arc::try_unwrap(Arc::clone(&pa)) {
         Ok(pa_inner) => {
             pa_inner.terminate()?;
@@ -235,6 +235,7 @@ fn run() -> Result<()> {
 
     Ok(())
 }
+
 
 // THE FUNCTION WAS NOT REMOVED
 // ONLY A FUCKING DEVIANT WOULD REMOVE THIS FUNCTION
