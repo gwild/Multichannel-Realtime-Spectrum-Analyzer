@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::sync::{
     Arc,
     Mutex,
-    atomic::{AtomicBool, Ordering}
+    atomic::{AtomicBool, AtomicUsize, Ordering}
 };
 use std::sync::mpsc;
 use audio_stream::{CircularBuffer, build_input_stream};
@@ -161,35 +161,47 @@ fn run() -> Result<()> {
     }));
 
     let running = Arc::new(AtomicBool::new(true));
-    let (_tx, _rx) = mpsc::channel::<()>();
-
-    let pa_clone = Arc::clone(&pa);
-    let audio_buffers_clone = Arc::clone(&audio_buffers);
-    let running_clone = Arc::clone(&running);
     let sampling_done = Arc::new(AtomicBool::new(false));
+    let last_sample_timestamp = Arc::new(AtomicUsize::new(0)); // Use timestamp to track last sample
 
-    let worker_thread = std::thread::spawn({
-        let sampling_done = Arc::clone(&sampling_done);
+    // Start the sampling thread
+    let worker_thread = {
+        let pa_clone = Arc::clone(&pa);
+        let audio_buffers_clone = Arc::clone(&audio_buffers);
+        let running_clone = Arc::clone(&running);
+        let sampling_done_clone = Arc::clone(&sampling_done);
+        let last_sample_timestamp_clone = Arc::<AtomicUsize>::clone(&last_sample_timestamp);
         let selected_channels_clone = selected_channels.clone();
         let spectrum_app_clone = Arc::clone(&spectrum_app);
         let fft_config_clone = Arc::clone(&fft_config);
-        move || {
+
+        std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
                 if let Ok(mut stream) = build_input_stream(
                     &pa_clone,
                     selected_device_index,
                     selected_device_info.max_input_channels as i32,
                     selected_sample_rate,
-                    audio_buffers_clone.clone(),
+                    audio_buffers_clone,
                     spectrum_app_clone,
                     selected_channels_clone,
                     fft_config_clone,
                 ) {
                     stream.start().expect("Failed to start audio stream.");
-                    sampling_done.store(true, Ordering::SeqCst);
+                    sampling_done_clone.store(true, Ordering::SeqCst);
+
                     while running_clone.load(Ordering::SeqCst) {
+                        // Update the timestamp on each iteration
+                        last_sample_timestamp_clone.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as usize,
+                            Ordering::SeqCst,
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
+
                     stream.stop().expect("Failed to stop stream.");
                     stream.close().expect("Failed to close stream.");
                 } else {
@@ -200,30 +212,54 @@ fn run() -> Result<()> {
             if result.is_err() {
                 error!("Thread panicked while running the audio stream.");
             }
-        }
-    });
+        })
+    };
 
+    // GUI and thread monitoring loop
     tokio::task::block_in_place(|| {
+        let monitoring_interval = std::time::Duration::from_secs(1);
+        let mut last_reported_time = 0;
+
         plot::run_native(
             "Real-Time Spectrum Analyzer",
             NativeOptions {
                 initial_window_size: Some(eframe::epaint::Vec2::new(1024.0, 420.0)),
                 ..Default::default()
             },
-            Box::new(move |_cc| Box::new(plot::MyApp::new(
-                spectrum_app.clone(),
-                fft_config.clone(),
-                buffer_size.clone(),
-                audio_buffers.clone(),
-            ))),
-        )
-    }).map_err(|e| anyhow!(e.to_string()))?;
+            Box::new(move |_cc| {
+                Box::new(plot::MyApp::new(
+                    spectrum_app.clone(),
+                    fft_config.clone(),
+                    buffer_size.clone(),
+                    audio_buffers.clone(),
+                ))
+            }),
+        );
 
+        // Monitoring thread health
+        while running.load(Ordering::SeqCst) {
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            let last_sample_time = last_sample_timestamp.load(Ordering::SeqCst);
+            if current_time as usize - last_sample_time > 2 && last_sample_time > last_reported_time {
+                error!("Sampling thread has not updated in over 2 seconds!");
+                last_reported_time = last_sample_time;
+            }
+
+            std::thread::sleep(monitoring_interval);
+        }
+    });
+
+    // Terminate sampling thread
     running.store(false, Ordering::SeqCst);
     if let Err(e) = worker_thread.join() {
         error!("Worker thread failed to join: {:?}", e);
     }
 
+    // Terminate PortAudio
     match Arc::try_unwrap(Arc::clone(&pa)) {
         Ok(pa_inner) => {
             pa_inner.terminate()?;
@@ -235,6 +271,7 @@ fn run() -> Result<()> {
 
     Ok(())
 }
+
 
 
 // THE FUNCTION WAS NOT REMOVED
