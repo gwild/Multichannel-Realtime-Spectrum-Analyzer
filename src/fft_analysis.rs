@@ -8,6 +8,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const NUM_PARTIALS: usize = 12;
 
@@ -18,6 +19,7 @@ pub struct FFTConfig {
     pub db_threshold: f32,
 }
 
+#[allow(dead_code)]
 /// Spawns a thread to continuously process FFT data in the background.
 pub fn start_fft_processing(
     buffer_clone_fft: Arc<Vec<Mutex<CircularBuffer>>>,
@@ -25,10 +27,10 @@ pub fn start_fft_processing(
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
     sample_rate: u32,
+    shutdown_flag: Arc<AtomicBool>,  // Accept shutdown flag
 ) {
     thread::spawn(move || {
-        loop {
-            // Added panic handling around the entire loop logic:
+        while !shutdown_flag.load(Ordering::Relaxed) {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let mut all_channels_results =
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
@@ -36,10 +38,9 @@ pub fn start_fft_processing(
                 for (channel_index, channel) in selected_channels.iter().enumerate() {
                     let buffer_data = {
                         let buffer = buffer_clone_fft[channel_index].lock().unwrap();
-                        buffer.get().to_vec() // Clone buffer to avoid borrow conflicts
+                        buffer.get().to_vec()
                     };
 
-                    // Skip empty buffers to prevent unnecessary computation
                     let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
                     if sum == 0.0 {
                         warn!("Buffer for channel {} is empty, skipping FFT.", channel);
@@ -56,18 +57,14 @@ pub fn start_fft_processing(
                     spectrum.update_partials(all_channels_results);
                 }
 
-                // Sleep to limit processing frequency to 10 Hz (100 ms)
                 sleep(Duration::from_millis(100));
             }));
 
             if let Err(e) = result {
-                // If a panic occurred, log and print the error, then loop again
-                eprintln!("Panic in FFT thread: {:?}", e);
                 warn!("Panic in FFT thread: {:?}", e);
-                // Attempt to keep running instead of exiting:
-                continue;
             }
         }
+        info!("FFT processing thread shutting down.");
     });
 }
 

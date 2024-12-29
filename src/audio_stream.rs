@@ -5,16 +5,13 @@
 
 // This section is protected. No modifications to imports, logic, or structure without permission.
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};  // Add this line
-use std::time::{Duration, Instant};  // Timeout feature
-
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};  // Add this line
 use anyhow::{anyhow, Result};
 use portaudio as pa;
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS, FFTConfig};
 use crate::plot::SpectrumApp;
 use portaudio::stream::InputCallbackArgs;
 use log::{info, debug, error};  // If needed, keep these; otherwise, remove them.
-
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -96,7 +93,6 @@ impl CircularBuffer {
 ///
 /// A `Result` containing the configured PortAudio stream or an error.
 // Reminder: This function is protected. We can only add comments, not remove code.
-
 pub fn build_input_stream(
     pa: &pa::PortAudio,
     device_index: pa::DeviceIndex,
@@ -106,31 +102,31 @@ pub fn build_input_stream(
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
     fft_config: Arc<Mutex<FFTConfig>>,
+    shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
     if selected_channels.is_empty() {
         return Err(anyhow!("No channels selected"));
     }
 
-    // Retrieve device information to get latency settings
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
-
-    // Configure stream parameters
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
-
-    // Define stream settings with the specified sample rate and frames per buffer
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
-
-    // info!("Opening non-blocking PortAudio stream.");
-    // Note: We might add debug prints of system resources here with permission.
 
     // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
-            // info!("Callback triggered with {} samples", args.buffer.len());
+            // Check if shutdown flag is set before processing
+            if shutdown_flag.load(Ordering::Relaxed) {
+                info!("Shutdown flag detected. Stopping audio stream...");
+                return pa::Complete;  // Stop the stream gracefully
+            }
+
+            info!("PortAudio callback triggered with {} samples", args.buffer.len());
             let data_clone = args.buffer.to_vec();
-            process_samples(
+
+            if let Err(e) = process_samples(
                 data_clone,
                 num_channels as usize,
                 &audio_buffers,
@@ -138,15 +134,22 @@ pub fn build_input_stream(
                 &selected_channels,
                 sample_rate as u32,
                 &fft_config,
-            );
-            pa::Continue
+            ) {
+                error!("Error processing samples: {}", e);
+            }
+
+            pa::Continue  // Continue running if no shutdown is detected
         },
     )?;
 
-    // info!("PortAudio stream opened successfully.");
+    info!("PortAudio stream opened successfully for device {:?}", device_index);
 
     Ok(stream)
 }
+
+
+
+
 // This section is protected. The following function processes incoming samples. 
 // We may add memory usage or freeze detection logs. Only appended lines, no removals.
 
@@ -173,7 +176,7 @@ fn process_samples(
     selected_channels: &[usize],
     sample_rate: u32,
     fft_config: &Arc<Mutex<FFTConfig>>,
-) {
+) -> Result<(), anyhow::Error> {
     {
         static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
         let calls = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -197,6 +200,7 @@ fn process_samples(
                 buffer.push(sample);
             } else {
                 error!("Failed to lock buffer for channel {}", channel);
+                return Err(anyhow!("Failed to lock buffer for channel {}", channel));
             }
         }
     }
@@ -204,7 +208,7 @@ fn process_samples(
     // Debugging: log when entering the FFT computation
     info!("Starting FFT computation...");
 
-    let config = fft_config.lock().unwrap();
+    let config = fft_config.lock().map_err(|_| anyhow!("Failed to lock FFT config"))?;
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
     for (i, &channel) in selected_channels.iter().enumerate() {
@@ -223,6 +227,7 @@ fn process_samples(
             }
         } else {
             error!("Failed to lock buffer for channel {}", channel);
+            return Err(anyhow!("Failed to lock buffer for channel {}", channel));
         }
     }
 
@@ -231,10 +236,16 @@ fn process_samples(
 
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
+    } else {
+        error!("Failed to lock spectrum app for updating partials.");
+        return Err(anyhow!("Failed to lock spectrum app for updating partials."));
     }
     
     // Debugging: log when the function finishes processing
     info!("Finished processing samples and updating spectrum.");
+
+    Ok(())
 }
+
 
 // Total line count: 239

@@ -14,7 +14,6 @@ use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering}
 };
-use std::sync::mpsc;
 use audio_stream::{CircularBuffer, build_input_stream};
 use eframe::NativeOptions;
 use log::{info, error, warn};
@@ -57,7 +56,6 @@ fn run() -> Result<()> {
     let pa = Arc::new(pa::PortAudio::new()?);
     info!("PortAudio initialized.");
 
-    // Reset devices if no devices are detected
     let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
     if devices.is_empty() {
         warn!("No devices found. Attempting to reset devices.");
@@ -78,7 +76,6 @@ fn run() -> Result<()> {
         if info.max_input_channels > 0 {
             println!("  [{}] - {} ({} channels)", i, info.name, info.max_input_channels);
 
-            // Check if the device is ready by attempting to open and close it
             if ensure_audio_device_ready(&pa, *index) {
                 input_devices.push(*index);
             } else {
@@ -91,7 +88,6 @@ fn run() -> Result<()> {
         return Err(anyhow!("No input audio devices found."));
     }
 
-    // User selects device
     print!("Enter the index of the desired device: ");
     io::stdout().flush()?;
     let mut user_input = String::new();
@@ -178,6 +174,11 @@ fn run() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let sampling_done = Arc::new(AtomicBool::new(false));
     let last_sample_timestamp = Arc::new(AtomicUsize::new(0));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    // Clone shutdown_flag before passing to the worker thread
+    let shutdown_flag_clone_for_thread = Arc::clone(&shutdown_flag);
+    let shutdown_flag_clone_for_gui = Arc::clone(&shutdown_flag);
 
     // Start the sampling thread
     let worker_thread = {
@@ -200,6 +201,8 @@ fn run() -> Result<()> {
                 spectrum_app_clone,
                 selected_channels_clone,
                 fft_config_clone,
+                shutdown_flag_clone_for_thread,  // Pass shutdown flag clone
+
             ) {
                 info!("Started audio stream.");
                 stream.start().expect("Failed to start audio stream.");
@@ -227,9 +230,6 @@ fn run() -> Result<()> {
 
     // GUI loop and monitoring
     tokio::task::block_in_place(|| {
-        let monitoring_interval = std::time::Duration::from_secs(1);
-        let blocked_threshold = 5;  // Number of seconds to wait before considering the thread "blocked"
-
         plot::run_native(
             "Real-Time Spectrum Analyzer",
             NativeOptions {
@@ -242,44 +242,14 @@ fn run() -> Result<()> {
                     fft_config.clone(),
                     buffer_size.clone(),
                     audio_buffers.clone(),
+                    shutdown_flag_clone_for_gui,  // Use GUI clone
                 ))
             }),
-        );
-
-        while running.load(Ordering::SeqCst) {
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            let last_sample_time = last_sample_timestamp.load(Ordering::SeqCst);
-            if current_time as usize - last_sample_time > 2 {
-                warn!("Sampling thread has not updated in over 2 seconds!");
-            }
-
-            // Check for possible thread blockage
-            if current_time as usize - last_sample_time > blocked_threshold {
-                error!("Sampling thread has been blocked for more than {} seconds!", blocked_threshold);
-            }
-
-            std::thread::sleep(monitoring_interval);
-        }
+        ).expect("Failed to run native plot");
     });
 
     running.store(false, Ordering::SeqCst);
     worker_thread.join().expect("Failed to join worker thread");
-
-    // Clean up PortAudio
-    match Arc::try_unwrap(pa) {
-        Ok(pa_inner) => {
-            info!("Terminating PortAudio...");
-            pa_inner.terminate()?;
-            info!("PortAudio terminated successfully.");
-        }
-        Err(_) => {
-            warn!("Unable to terminate PortAudio directly; multiple references exist.");
-        }
-    }
 
     Ok(())
 }

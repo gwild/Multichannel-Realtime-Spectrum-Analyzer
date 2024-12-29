@@ -6,8 +6,7 @@ pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
-
-// Importing necessary types for GUI throttling.
+use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 
@@ -27,7 +26,6 @@ impl SpectrumApp {
     pub fn update_partials(&mut self, new_partials: Vec<Vec<(f32, f32)>>) {
         for (channel, data) in new_partials.into_iter().enumerate() {
             if channel < self.partials.len() {
-                let log_data = data.clone();
                 self.partials[channel] = data;
                 // info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
             }
@@ -48,6 +46,7 @@ pub struct MyApp {
 
     // Throttling: Added to track the last repaint time
     last_repaint: Instant, // Reminder: This field was added to implement GUI throttling. Do not modify without permission.
+    shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -57,6 +56,7 @@ impl MyApp {
         fft_config: Arc<Mutex<FFTConfig>>,
         buffer_size: Arc<Mutex<usize>>,
         audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
+        shutdown_flag: Arc<AtomicBool>,  // Accept shutdown flag
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -70,7 +70,7 @@ impl MyApp {
         ];
 
         // Create the MyApp instance as before (NO alterations/deletions)
-        let mut instance = MyApp {
+        let instance = MyApp {
             spectrum,
             fft_config,
             buffer_size,
@@ -82,6 +82,7 @@ impl MyApp {
 
             // Throttling: Initialize the last_repaint timer
             last_repaint: Instant::now(), // Reminder: Initialization of throttling timer added. Do not modify without permission.
+            shutdown_flag,  // Store shutdown flag
         };
 
         // FIX IMPLEMENTATION:
@@ -94,7 +95,7 @@ impl MyApp {
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
                 cfg.max_frequency = nyquist_limit;
-                // info!("Clamped max frequency at startup to {}", cfg.max_frequency);
+                info!("Clamped max frequency at startup to {}", cfg.max_frequency);
             }
         }
 
@@ -105,7 +106,14 @@ impl MyApp {
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 // Implementing eframe::App for MyApp
+
 impl eframe::App for MyApp {
+    fn on_close_event(&mut self) -> bool {
+        info!("Closing GUI window...");
+        self.shutdown_flag.store(true, Ordering::Relaxed);  // Set shutdown flag to stop processing threads
+        true // Allow the window to close
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Throttling: Limit repaint to at most 10 times per second (every 100 ms)
         let now = Instant::now();
@@ -130,7 +138,6 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
                     ui.label("Max Frequency:");
 
-                    // For max freq, always start at 0.0..=nyquist
                     let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
@@ -153,7 +160,6 @@ impl eframe::App for MyApp {
                         buffer_size = 1 << buffer_log_slider;
                         *self.buffer_size.lock().unwrap() = buffer_size;
 
-                        // Recreate buffers
                         for buffer in self.audio_buffers.iter() {
                             let mut buf = buffer.lock().unwrap();
                             *buf = CircularBuffer::new(buffer_size);
@@ -200,10 +206,8 @@ impl eframe::App for MyApp {
                 let nyquist_limit = (buffer_size as f32 / 2.0).min(20000.0);
 
                 let mut fft_config = self.fft_config.lock().unwrap();
-                // If max freq is above new nyquist, clamp
                 if fft_config.max_frequency > nyquist_limit {
                     fft_config.max_frequency = nyquist_limit;
-                    // info!("Auto-adjusted max frequency to {}", fft_config.max_frequency);
                 }
             }
 
@@ -266,7 +270,7 @@ impl eframe::App for MyApp {
                     ));
                 }
             });
-        }); // End CentralPanel
+        });
     }
 }
 
@@ -274,9 +278,19 @@ impl eframe::App for MyApp {
 pub fn run_native(
     app_name: &str,
     native_options: NativeOptions,
-    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<dyn eframe::App>>,
+    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,  // Expect Box<MyApp>
 ) -> Result<(), eframe::Error> {
-    eframe::run_native(app_name, native_options, app_creator)
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    eframe::run_native(
+        app_name,
+        native_options,
+        Box::new(move |cc| {
+            let mut app = app_creator(cc);
+            app.shutdown_flag = shutdown_flag.clone();  // Directly assign to MyApp
+            app as Box<dyn eframe::App>
+        }),
+    )
 }
 
 // Total line count: 259
