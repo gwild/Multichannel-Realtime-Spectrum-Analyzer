@@ -82,7 +82,7 @@ fn run() -> Result<()> {
             if ensure_audio_device_ready(&pa, *index) {
                 input_devices.push(*index);
             } else {
-                error!("Device {} is not ready for use.", info.name);
+                warn!("Device {} is not ready for use.", info.name);
             }
         }
     }
@@ -91,6 +91,7 @@ fn run() -> Result<()> {
         return Err(anyhow!("No input audio devices found."));
     }
 
+    // User selects device
     print!("Enter the index of the desired device: ");
     io::stdout().flush()?;
     let mut user_input = String::new();
@@ -106,9 +107,16 @@ fn run() -> Result<()> {
 
     let selected_device_index = input_devices[device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
-    info!("Selected device: {} ({} channels)", selected_device_info.name, selected_device_info.max_input_channels);
+    info!(
+        "Selected device: {} ({} channels)",
+        selected_device_info.name, selected_device_info.max_input_channels
+    );
 
-    let supported_sample_rates = get_supported_sample_rates(selected_device_index, selected_device_info.max_input_channels, &pa);
+    let supported_sample_rates = get_supported_sample_rates(
+        selected_device_index,
+        selected_device_info.max_input_channels,
+        &pa,
+    );
     if supported_sample_rates.is_empty() {
         return Err(anyhow!("No supported sample rates for the selected device."));
     }
@@ -122,14 +130,20 @@ fn run() -> Result<()> {
     io::stdout().flush()?;
     user_input.clear();
     io::stdin().read_line(&mut user_input)?;
-    let sample_rate_index = user_input.trim().parse::<usize>()?;
+    let sample_rate_index = user_input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("Invalid sample rate index"))?;
 
     if sample_rate_index >= supported_sample_rates.len() {
         return Err(anyhow!("Invalid sample rate index."));
     }
     let selected_sample_rate = supported_sample_rates[sample_rate_index];
 
-    println!("Available channels: 0 to {}", selected_device_info.max_input_channels - 1);
+    println!(
+        "Available channels: 0 to {}",
+        selected_device_info.max_input_channels - 1
+    );
     println!("Enter channels to use (comma-separated, e.g., 0,1): ");
     user_input.clear();
     io::stdin().read_line(&mut user_input)?;
@@ -145,6 +159,7 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
+    // Set up shared resources
     let buffer_size = Arc::new(Mutex::new(MAX_BUFFER_SIZE));
     let audio_buffers: Arc<Vec<Mutex<CircularBuffer>>> = Arc::new(
         selected_channels
@@ -162,7 +177,7 @@ fn run() -> Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
     let sampling_done = Arc::new(AtomicBool::new(false));
-    let last_sample_timestamp = Arc::new(AtomicUsize::new(0)); // Use timestamp to track last sample
+    let last_sample_timestamp = Arc::new(AtomicUsize::new(0));
 
     // Start the sampling thread
     let worker_thread = {
@@ -170,55 +185,47 @@ fn run() -> Result<()> {
         let audio_buffers_clone = Arc::clone(&audio_buffers);
         let running_clone = Arc::clone(&running);
         let sampling_done_clone = Arc::clone(&sampling_done);
-        let last_sample_timestamp_clone = Arc::<AtomicUsize>::clone(&last_sample_timestamp);
+        let last_sample_timestamp_clone = Arc::clone(&last_sample_timestamp);
         let selected_channels_clone = selected_channels.clone();
         let spectrum_app_clone = Arc::clone(&spectrum_app);
         let fft_config_clone = Arc::clone(&fft_config);
 
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
-                if let Ok(mut stream) = build_input_stream(
-                    &pa_clone,
-                    selected_device_index,
-                    selected_device_info.max_input_channels as i32,
-                    selected_sample_rate,
-                    audio_buffers_clone,
-                    spectrum_app_clone,
-                    selected_channels_clone,
-                    fft_config_clone,
-                ) {
-                    stream.start().expect("Failed to start audio stream.");
-                    sampling_done_clone.store(true, Ordering::SeqCst);
+            if let Ok(mut stream) = build_input_stream(
+                &pa_clone,
+                selected_device_index,
+                selected_device_info.max_input_channels as i32,
+                selected_sample_rate,
+                audio_buffers_clone,
+                spectrum_app_clone,
+                selected_channels_clone,
+                fft_config_clone,
+            ) {
+                stream.start().expect("Failed to start audio stream.");
+                sampling_done_clone.store(true, Ordering::SeqCst);
 
-                    while running_clone.load(Ordering::SeqCst) {
-                        // Update the timestamp on each iteration
-                        last_sample_timestamp_clone.store(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs() as usize,
-                            Ordering::SeqCst,
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-
-                    stream.stop().expect("Failed to stop stream.");
-                    stream.close().expect("Failed to close stream.");
-                } else {
-                    error!("Failed to build audio stream.");
+                while running_clone.load(Ordering::SeqCst) {
+                    last_sample_timestamp_clone.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as usize,
+                        Ordering::SeqCst,
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-            });
 
-            if result.is_err() {
-                error!("Thread panicked while running the audio stream.");
+                stream.stop().expect("Failed to stop stream.");
+                stream.close().expect("Failed to close stream.");
+            } else {
+                error!("Failed to build audio stream.");
             }
         })
     };
 
-    // GUI and thread monitoring loop
+    // GUI loop and monitoring
     tokio::task::block_in_place(|| {
         let monitoring_interval = std::time::Duration::from_secs(1);
-        let mut last_reported_time = 0;
 
         plot::run_native(
             "Real-Time Spectrum Analyzer",
@@ -236,7 +243,6 @@ fn run() -> Result<()> {
             }),
         );
 
-        // Monitoring thread health
         while running.load(Ordering::SeqCst) {
             let current_time = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -244,23 +250,18 @@ fn run() -> Result<()> {
                 .as_secs();
 
             let last_sample_time = last_sample_timestamp.load(Ordering::SeqCst);
-            if current_time as usize - last_sample_time > 2 && last_sample_time > last_reported_time {
-                error!("Sampling thread has not updated in over 2 seconds!");
-                last_reported_time = last_sample_time;
+            if current_time as usize - last_sample_time > 2 {
+                warn!("Sampling thread has not updated in over 2 seconds!");
             }
 
             std::thread::sleep(monitoring_interval);
         }
     });
 
-    // Terminate sampling thread
     running.store(false, Ordering::SeqCst);
-    if let Err(e) = worker_thread.join() {
-        error!("Worker thread failed to join: {:?}", e);
-    }
+    worker_thread.join().expect("Failed to join worker thread");
 
-    // Terminate PortAudio
-    match Arc::try_unwrap(Arc::clone(&pa)) {
+    match Arc::try_unwrap(pa) {
         Ok(pa_inner) => {
             pa_inner.terminate()?;
         }
@@ -271,8 +272,6 @@ fn run() -> Result<()> {
 
     Ok(())
 }
-
-
 
 // THE FUNCTION WAS NOT REMOVED
 // ONLY A FUCKING DEVIANT WOULD REMOVE THIS FUNCTION
