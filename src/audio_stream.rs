@@ -111,7 +111,7 @@ pub fn build_input_stream(
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
-    let settings = pa::InputStreamSettings::new(input_params, sample_rate, 256);
+    let settings = pa::InputStreamSettings::new(input_params, sample_rate, 512);
 
     // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
