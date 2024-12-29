@@ -13,7 +13,7 @@ use portaudio as pa;
 use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS, FFTConfig};
 use crate::plot::SpectrumApp;
 use portaudio::stream::InputCallbackArgs;
-use log::{info, error};  // If needed, keep these; otherwise, remove them.
+use log::{info, debug, error};  // If needed, keep these; otherwise, remove them.
 
 
 // This section is protected. Must keep the existing doc comments and struct as is.
@@ -167,10 +167,10 @@ pub fn build_input_stream(
 /// * `fft_config` - FFT configuration for processing the spectrum.
 fn process_samples(
     data_as_f32: Vec<f32>,
-    channels: usize, // Total number of channels
+    channels: usize,
     audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: &Arc<Mutex<SpectrumApp>>,
-    selected_channels: &[usize], // Indices of selected channels
+    selected_channels: &[usize],
     sample_rate: u32,
     fft_config: &Arc<Mutex<FFTConfig>>,
 ) {
@@ -182,37 +182,35 @@ fn process_samples(
         }
     }
 
-    // Loop through selected channels only
-    for (i, &selected_channel) in selected_channels.iter().enumerate() {
-        // Calculate the index in the data buffer that corresponds to the selected channel
-        let channel_offset = selected_channel;
+    // Debugging: log when entering the data processing loop
+    info!("Starting to process audio samples...");
 
-        if channel_offset < channels {
-            // Calculate the start index for the channel in the data buffer
-            let start_index = channel_offset;
-            let sample = data_as_f32[start_index]; // We only need one sample per channel
-
-            // Find the corresponding buffer for this channel
-            if let Ok(mut buffer) = audio_buffers[i].lock() {
-                buffer.push(sample); // Push the sample into the buffer
+    // Iterate through the audio samples and assign them to buffers
+    for (i, &sample) in data_as_f32.iter().enumerate() {
+        let channel = i % channels;
+        
+        if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
+            // Debugging: log when a sample is processed for a selected channel
+            debug!("Processing sample {} for channel {}", i, channel);
+            
+            if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
+                buffer.push(sample);
             } else {
-                error!("Failed to lock buffer for channel {}", selected_channel);
+                error!("Failed to lock buffer for channel {}", channel);
             }
-        } else {
-            // Error message if the selected channel index exceeds the available channels
-            error!(
-                "Selected channel {} is out of range. Total input channels: {}",
-                selected_channel,
-                channels
-            );
         }
     }
+
+    // Debugging: log when entering the FFT computation
+    info!("Starting FFT computation...");
 
     let config = fft_config.lock().unwrap();
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-    // Process the selected channels for spectrum computation
     for (i, &channel) in selected_channels.iter().enumerate() {
+        // Debugging: log before processing each selected channel for FFT
+        debug!("Computing spectrum for channel {}", channel);
+        
         if let Ok(buffer) = audio_buffers[i].lock() {
             let audio_data = buffer.get();
             if !audio_data.is_empty() {
@@ -221,20 +219,22 @@ fn process_samples(
                     partials_results[i][j] = partial;
                 }
             } else {
-                error!("Audio buffer for channel {} is empty", channel);
+                debug!("Audio data for channel {} is empty", channel);
             }
         } else {
             error!("Failed to lock buffer for channel {}", channel);
         }
     }
 
-    // Update the spectrum application with the new partials results
+    // Debugging: log when spectrum results are updated
+    info!("Updating spectrum with computed partials...");
+
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
-    } else {
-        error!("Failed to lock spectrum application state for update");
     }
+    
+    // Debugging: log when the function finishes processing
+    info!("Finished processing samples and updating spectrum.");
 }
-
 
 // Total line count: 239
