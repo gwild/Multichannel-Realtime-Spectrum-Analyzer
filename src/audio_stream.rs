@@ -167,10 +167,10 @@ pub fn build_input_stream(
 /// * `fft_config` - FFT configuration for processing the spectrum.
 fn process_samples(
     data_as_f32: Vec<f32>,
-    channels: usize,
+    channels: usize, // Total number of channels
     audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
     spectrum_app: &Arc<Mutex<SpectrumApp>>,
-    selected_channels: &[usize],
+    selected_channels: &[usize], // Indices of selected channels
     sample_rate: u32,
     fft_config: &Arc<Mutex<FFTConfig>>,
 ) {
@@ -182,22 +182,36 @@ fn process_samples(
         }
     }
 
-    for (i, &sample) in data_as_f32.iter().enumerate() {
-        let channel = i % channels;
-        if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
-            if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
-                buffer.push(sample);
+    // Loop through selected channels only
+    for (i, &selected_channel) in selected_channels.iter().enumerate() {
+        // Calculate the index in the data buffer that corresponds to the selected channel
+        let channel_offset = selected_channel;
+
+        if channel_offset < channels {
+            // Calculate the start index for the channel in the data buffer
+            let start_index = channel_offset;
+            let sample = data_as_f32[start_index]; // We only need one sample per channel
+
+            // Find the corresponding buffer for this channel
+            if let Ok(mut buffer) = audio_buffers[i].lock() {
+                buffer.push(sample); // Push the sample into the buffer
             } else {
-                error!("Failed to lock buffer for channel {}", channel);
+                error!("Failed to lock buffer for channel {}", selected_channel);
             }
         } else {
-            error!("Sample index {} did not match any selected channel", i);
+            // Error message if the selected channel index exceeds the available channels
+            error!(
+                "Selected channel {} is out of range. Total input channels: {}",
+                selected_channel,
+                channels
+            );
         }
     }
 
     let config = fft_config.lock().unwrap();
     let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
+    // Process the selected channels for spectrum computation
     for (i, &channel) in selected_channels.iter().enumerate() {
         if let Ok(buffer) = audio_buffers[i].lock() {
             let audio_data = buffer.get();
@@ -214,6 +228,7 @@ fn process_samples(
         }
     }
 
+    // Update the spectrum application with the new partials results
     if let Ok(mut app) = spectrum_app.lock() {
         app.partials = partials_results;
     } else {
@@ -221,4 +236,5 @@ fn process_samples(
     }
 }
 
-// Total line count: 250
+
+// Total line count: 239
