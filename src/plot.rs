@@ -197,7 +197,9 @@ impl eframe::App for MyApp {
                 let mut buf = self.audio_buffer.write().unwrap();
                 
                 // Corrected: Initialize CircularBuffer with correct size and channel count
-                let channels = fft_config.lock().unwrap().num_channels;  // Assuming num_channels is tracked
+                let fft_config_guard = fft_config.lock().unwrap();
+                let channels = fft_config_guard.num_channels;
+
                 *buf = CircularBuffer::new(2048, channels);  // Pass buffer size and channel count dynamically
             }
 
