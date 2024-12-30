@@ -4,68 +4,75 @@
 // The final line count must exceed 184 lines.
 
 // This section is protected. No modifications to imports, logic, or structure without permission.
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};  // Add this line
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};  // Add this line
 use anyhow::{anyhow, Result};
 use portaudio as pa;
-use crate::fft_analysis::{compute_spectrum, NUM_PARTIALS, FFTConfig};
-use crate::plot::SpectrumApp;
-use portaudio::stream::InputCallbackArgs;
-use log::{info, debug, error};  // If needed, keep these; otherwise, remove them.
+use log::{info, error};
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
 
-/// Circular buffer implementation for storing audio samples.
+/// Circular buffer implementation for storing interleaved audio samples.
 ///
-/// This buffer allows for continuous writing and reading of audio samples,
-/// maintaining a fixed size by overwriting the oldest data when new samples arrive.
+/// This buffer allows for continuous writing and reading of interleaved audio samples
+/// across multiple channels, maintaining a fixed size by overwriting the oldest data
+/// when new samples arrive.
 pub struct CircularBuffer {
     buffer: Vec<f32>,
     head: usize,
     size: usize,
+    channels: usize,
 }
 
-// This section is protected. No changes to field names or logic in impl without permission.
-// The next lines are strictly comments only.
-
 impl CircularBuffer {
-    /// Creates a new `CircularBuffer` with the specified size.
+    /// Creates a new `CircularBuffer` with the specified size and number of channels.
     ///
     /// # Arguments
     ///
-    /// * `size` - The maximum number of samples the buffer can hold.
-    // Reminder: Must ask permission to alter the logic of `new`.
-    pub fn new(size: usize) -> Self {
+    /// * `size` - The maximum number of frames the buffer can hold (not total samples).
+    /// * `channels` - The number of audio channels.
+    pub fn new(size: usize, channels: usize) -> Self {
         CircularBuffer {
-            buffer: vec![0.0; size],
+            buffer: vec![0.0; size * channels],
             head: 0,
             size,
+            channels,
         }
     }
 
-    /// Pushes a new sample into the buffer.
+    /// Pushes a batch of interleaved samples into the buffer.
     ///
     /// # Arguments
     ///
-    /// * `value` - The audio sample to be added.
-    // Reminder: No removal of lines or changes in push method.
-    pub fn push(&mut self, value: f32) {
-        self.buffer[self.head] = value;
-        self.head = (self.head + 1) % self.size; // Wrap around
-        // info!("Pushed sample to buffer: {}", value);
-        // Additional debug logs or memory usage prints might be added here
-        // if permission is requested and granted, but currently it's commented out.
+    /// * `values` - A slice of interleaved audio samples.
+    pub fn push_batch(&mut self, values: &[f32]) {
+        let batch_size = values.len();
+        for i in 0..batch_size {
+            let index = (self.head + i) % (self.size * self.channels);
+            self.buffer[index] = values[i];
+        }
+        self.head = (self.head + batch_size) % (self.size * self.channels);
     }
 
-    /// Retrieves the current contents of the buffer.
+    /// Clones the contents of the buffer.
     ///
     /// # Returns
     ///
-    /// A slice of the buffer containing the audio samples.
-    // Reminder: The get method remains unchanged. Only adding comments here.
-    pub fn get(&self) -> &[f32] {
-        &self.buffer
+    /// A clone of the entire buffer, maintaining the interleaved structure.
+    pub fn clone_data(&self) -> Vec<f32> {
+        self.buffer.clone()
+    }
+
+    /// Resizes the buffer, adjusting to hold new frame sizes.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_size` - The new maximum number of frames the buffer can hold.
+    pub fn resize(&mut self, new_size: usize) {
+        self.buffer = vec![0.0; new_size * self.channels];
+        self.head = 0;
+        self.size = new_size;
     }
 }
 
@@ -75,8 +82,7 @@ impl CircularBuffer {
 /// Builds and configures the audio input stream using PortAudio.
 ///
 /// This function sets up a non-blocking input stream that captures audio data
-/// from the specified device and channels, processes the samples, and feeds them
-/// into the spectrum analyzer.
+/// from the specified device and channels, storing samples in the circular buffer.
 ///
 /// # Arguments
 ///
@@ -84,61 +90,41 @@ impl CircularBuffer {
 /// * `device_index` - The index of the selected audio input device.
 /// * `num_channels` - The number of audio channels to capture.
 /// * `sample_rate` - The sampling rate for the audio stream.
-/// * `audio_buffers` - Shared circular buffers for storing audio samples per channel.
-/// * `spectrum_app` - Shared reference to the spectrum analyzer application state.
-/// * `selected_channels` - Indices of the channels selected for analysis.
-/// * `fft_config` - Shared FFT configuration for spectrum analysis.
+/// * `audio_buffer` - Shared circular buffer for storing interleaved audio samples.
+/// * `shutdown_flag` - Atomic flag to indicate stream shutdown.
 ///
 /// # Returns
 ///
 /// A `Result` containing the configured PortAudio stream or an error.
-// Reminder: This function is protected. We can only add comments, not remove code.
 pub fn build_input_stream(
     pa: &pa::PortAudio,
     device_index: pa::DeviceIndex,
-    num_channels: i32,
+    num_channels: usize,
     sample_rate: f64,
-    audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
-    spectrum_app: Arc<Mutex<SpectrumApp>>,
-    selected_channels: Vec<usize>,
-    fft_config: Arc<Mutex<FFTConfig>>,
-    shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
+    audio_buffer: Arc<RwLock<CircularBuffer>>,
+    shutdown_flag: Arc<AtomicBool>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
-    if selected_channels.is_empty() {
-        return Err(anyhow!("No channels selected"));
-    }
-
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
-    let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, latency);
+    let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels as i32, true, latency);
     let settings = pa::InputStreamSettings::new(input_params, sample_rate, 512);
 
     // Create the non-blocking stream with a callback to process incoming audio data
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
-            // Check if shutdown flag is set before processing
             if shutdown_flag.load(Ordering::Relaxed) {
                 info!("Shutdown flag detected. Stopping audio stream...");
-                return pa::Complete;  // Stop the stream gracefully
+                return pa::Complete;
             }
 
-            info!("PortAudio callback triggered with {} samples", args.buffer.len());
-            let data_clone = args.buffer.to_vec();
-
-            if let Err(e) = process_samples(
-                data_clone,
-                num_channels as usize,
-                &audio_buffers,
-                &spectrum_app,
-                &selected_channels,
-                sample_rate as u32,
-                &fft_config,
-            ) {
-                error!("Error processing samples: {}", e);
+            if let Ok(mut buffer) = audio_buffer.write() {
+                buffer.push_batch(args.buffer);
+            } else {
+                error!("Failed to lock circular buffer for writing.");
             }
 
-            pa::Continue  // Continue running if no shutdown is detected
+            pa::Continue
         },
     )?;
 
@@ -146,106 +132,56 @@ pub fn build_input_stream(
 
     Ok(stream)
 }
-
-
-
-
-// This section is protected. The following function processes incoming samples. 
-// We may add memory usage or freeze detection logs. Only appended lines, no removals.
-
-/// Processes incoming audio samples and updates the spectrum analyzer.
+/// Starts the sampling thread that continuously fills the circular buffer.
 ///
-/// This function extracts samples from the selected channels, pushes them into the
-/// corresponding circular buffers, computes the frequency spectrum, updates the
-/// spectrum analyzer's state, and prints the partials results.
+/// This function runs in its own thread and handles buffer resizing dynamically.
 ///
 /// # Arguments
 ///
-/// * `data_as_f32` - A `Vec<f32>` of incoming audio samples.
-/// * `channels` - The total number of audio channels in the incoming data.
-/// * `audio_buffers` - Shared circular buffers for storing audio samples per channel.
-/// * `spectrum_app` - Shared reference to the spectrum analyzer application state.
-/// * `selected_channels` - Slice of channel indices selected for analysis.
-/// * `sample_rate` - The sampling rate of the audio stream.
-/// * `fft_config` - FFT configuration for processing the spectrum.
-fn process_samples(
-    data_as_f32: Vec<f32>,
-    channels: usize,
-    audio_buffers: &Arc<Vec<Mutex<CircularBuffer>>>,
-    spectrum_app: &Arc<Mutex<SpectrumApp>>,
-    selected_channels: &[usize],
-    sample_rate: u32,
-    fft_config: &Arc<Mutex<FFTConfig>>,
-) -> Result<(), anyhow::Error> {
-    {
-        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
-        let calls = CALL_COUNT.fetch_add(1, Ordering::SeqCst);
-        if calls % 100 == 0 {
-            info!("process_samples called {} times so far", calls);
-        }
-    }
+/// * `running` - Atomic flag to indicate thread running state.
+/// * `main_buffer` - Shared circular buffer for audio sample storage.
+/// * `num_channels` - The number of audio channels.
+/// * `sample_rate` - Audio stream sample rate.
+/// * `buffer_size` - Mutex-protected buffer size for dynamic resizing.
+pub fn start_sampling_thread(
+    running: Arc<AtomicBool>,
+    main_buffer: Arc<RwLock<CircularBuffer>>,
+    num_channels: usize,
+    sample_rate: f64,
+    buffer_size: Arc<Mutex<usize>>,
+) {
+    let pa = pa::PortAudio::new().expect("Failed to initialize PortAudio");
 
-    // Debugging: log when entering the data processing loop
-    info!("Starting to process audio samples...");
+    let mut stream: Option<pa::Stream<pa::NonBlocking, pa::Input<f32>>> = None;
+    let mut current_buffer_size = *buffer_size.lock().unwrap();
 
-    // Iterate through the audio samples and assign them to buffers
-    for (i, &sample) in data_as_f32.iter().enumerate() {
-        let channel = i % channels;
-        
-        if let Some(buffer_index) = selected_channels.iter().position(|&ch| ch == channel) {
-            // Debugging: log when a sample is processed for a selected channel
-            debug!("Processing sample {} for channel {}", i, channel);
-            
-            if let Ok(mut buffer) = audio_buffers[buffer_index].lock() {
-                buffer.push(sample);
-            } else {
-                error!("Failed to lock buffer for channel {}", channel);
-                return Err(anyhow!("Failed to lock buffer for channel {}", channel));
+    while running.load(Ordering::SeqCst) {
+        let new_size = *buffer_size.lock().unwrap();
+        if stream.is_none() || new_size != current_buffer_size {
+            current_buffer_size = new_size;
+
+            if let Some(mut active_stream) = stream.take() {
+                active_stream.stop().ok();
+            }
+
+            if let Ok(mut buffer) = main_buffer.write() {
+                buffer.resize(current_buffer_size);
+            }
+
+            stream = build_input_stream(
+                &pa,
+                pa.default_input_device().unwrap(),
+                num_channels,
+                sample_rate,
+                Arc::clone(&main_buffer),
+                running.clone(),
+            ).ok();
+
+            if let Some(active_stream) = &mut stream {
+                active_stream.start().ok();
+                info!("Audio stream started with buffer size {}", current_buffer_size);
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-
-    // Debugging: log when entering the FFT computation
-    info!("Starting FFT computation...");
-
-    let config = fft_config.lock().map_err(|_| anyhow!("Failed to lock FFT config"))?;
-    let mut partials_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
-    for (i, &channel) in selected_channels.iter().enumerate() {
-        // Debugging: log before processing each selected channel for FFT
-        debug!("Computing spectrum for channel {}", channel);
-        
-        if let Ok(buffer) = audio_buffers[i].lock() {
-            let audio_data = buffer.get();
-            if !audio_data.is_empty() {
-                let computed_partials = compute_spectrum(audio_data, sample_rate, &config);
-                for (j, &partial) in computed_partials.iter().enumerate().take(NUM_PARTIALS) {
-                    partials_results[i][j] = partial;
-                }
-            } else {
-                debug!("Audio data for channel {} is empty", channel);
-            }
-        } else {
-            error!("Failed to lock buffer for channel {}", channel);
-            return Err(anyhow!("Failed to lock buffer for channel {}", channel));
-        }
-    }
-
-    // Debugging: log when spectrum results are updated
-    info!("Updating spectrum with computed partials...");
-
-    if let Ok(mut app) = spectrum_app.lock() {
-        app.partials = partials_results;
-    } else {
-        error!("Failed to lock spectrum app for updating partials.");
-        return Err(anyhow!("Failed to lock spectrum app for updating partials."));
-    }
-    
-    // Debugging: log when the function finishes processing
-    info!("Finished processing samples and updating spectrum.");
-
-    Ok(())
 }
-
-
-// Total line count: 239
