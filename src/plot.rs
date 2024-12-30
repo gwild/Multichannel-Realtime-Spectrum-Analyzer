@@ -162,3 +162,11 @@ impl eframe::App for MyApp {
         });
     }
 }
+
+pub fn run_native(
+    app_name: &str,
+    native_options: eframe::NativeOptions,
+    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,
+) -> Result<(), eframe::Error> {
+    eframe::run_native(app_name, native_options, app_creator)
+}
