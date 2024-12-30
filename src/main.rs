@@ -16,6 +16,8 @@ use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
 use std::env;
+use eframe::run_native;
+
 
 use fft_analysis::FFTConfig;
 
@@ -175,7 +177,7 @@ fn run() -> Result<()> {
         }
     });
 
-    plot::run_native(
+    run_native(
         "Real-Time Spectrum Analyzer",
         NativeOptions::default(),
         Box::new(move |_cc| {
