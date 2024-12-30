@@ -2,7 +2,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
-pub use eframe::NativeOptions;
+// pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
