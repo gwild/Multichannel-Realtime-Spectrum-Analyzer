@@ -191,7 +191,7 @@ fn run() -> Result<()> {
     ).expect("Failed to run native plot");
 
     Ok(())
-
+}
 fn get_supported_sample_rates(
     device_index: pa::DeviceIndex,
     num_channels: i32,
