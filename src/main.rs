@@ -145,9 +145,11 @@ fn run() -> Result<()> {
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: 20.0,
-        max_frequency: 20000.0,
+        max_frequency: 2048.0,
         db_threshold: -32.0,
+        num_channels: selected_channels.len(),  // Set to number of selected channels
     }));
+
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 let shutdown_flag_for_thread = Arc::clone(&shutdown_flag);  // Clone for thread
