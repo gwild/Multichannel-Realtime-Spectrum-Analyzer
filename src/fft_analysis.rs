@@ -17,7 +17,9 @@ pub struct FFTConfig {
     pub min_frequency: f32,
     pub max_frequency: f32,
     pub db_threshold: f32,
+    pub num_channels: usize,  // Add channel count to config
 }
+
 
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
