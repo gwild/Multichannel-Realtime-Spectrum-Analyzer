@@ -162,7 +162,7 @@ fn run() -> Result<()> {
             if let Ok(mut stream) = build_input_stream(
                 &pa_clone,
                 selected_device_index,
-                selected_device_info.max_input_channels as i32,
+                selected_device_info.max_input_channels as usize,
                 selected_sample_rate,
                 audio_buffer_clone,
                 shutdown_flag_clone,
