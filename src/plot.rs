@@ -198,7 +198,8 @@ impl eframe::App for MyApp {
                 
                 // Corrected: Initialize CircularBuffer with correct size and channel count
                 let fft_config_guard = fft_config.lock().unwrap();
-                let channels = fft_config_guard.num_channels;
+                let channels = fft_config_guard.num_channels;  // Directly access the field
+
 
                 *buf = CircularBuffer::new(2048, channels);  // Pass buffer size and channel count dynamically
             }
