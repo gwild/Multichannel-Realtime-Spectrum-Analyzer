@@ -84,7 +84,6 @@ fn run() -> Result<()> {
     if device_index >= input_devices.len() {
         return Err(anyhow!("Invalid device index."));
     }
-}
     let selected_device_index = input_devices[device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
     info!(
@@ -191,7 +190,7 @@ fn run() -> Result<()> {
     ).expect("Failed to run native plot");
 
     Ok(())
-
+}
 fn get_supported_sample_rates(
     device_index: pa::DeviceIndex,
     num_channels: i32,
