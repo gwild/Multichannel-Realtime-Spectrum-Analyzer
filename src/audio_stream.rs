@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};  // Add this line
 use portaudio as pa;
 use log::{info, error};
-
+use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
@@ -104,7 +104,7 @@ pub fn build_input_stream(
     sample_rate: f64,
     audio_buffer: Arc<RwLock<CircularBuffer>>,
     shutdown_flag: Arc<AtomicBool>,
-) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>> {
+) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     let latency = device_info.default_low_input_latency;
     let input_params = pa::StreamParameters::<f32>::new(device_index, num_channels as i32, true, latency);
