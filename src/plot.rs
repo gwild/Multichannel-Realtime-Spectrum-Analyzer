@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
+pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
@@ -45,7 +46,7 @@ impl MyApp {
         spectrum: Arc<Mutex<SpectrumApp>>,
         fft_config: Arc<Mutex<FFTConfig>>,
         buffer_size: Arc<Mutex<usize>>,
-        audio_buffer: Arc<RwLock<CircularBuffer>>,  // Accept single buffer
+        audio_buffer: Arc<RwLock<CircularBuffer>>,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         let colors = vec![
@@ -68,7 +69,6 @@ impl MyApp {
             shutdown_flag,
         };
 
-        // Clamp max_frequency at startup based on buffer size
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
             let nyquist_limit = (*buffer_s as f32 / 2.0).min(20000.0);
@@ -101,14 +101,12 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
-            // FFT Configuration Sliders
             {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
                     ui.label("Min Frequency:");
                     ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0));
                     ui.label("Max Frequency:");
-
                     let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit));
                     ui.label("DB Threshold:");
@@ -116,7 +114,6 @@ impl eframe::App for MyApp {
                 });
             }
 
-            // Dynamic Buffer Resizing
             let mut buffer_size = *self.buffer_size.lock().unwrap();
             let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
             ui.horizontal(|ui| {
@@ -130,7 +127,6 @@ impl eframe::App for MyApp {
                 ui.label(format!("{} samples", buffer_size));
             });
 
-            // Reset Button Logic
             if ui.button("Reset to Defaults").clicked() {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 fft_config.min_frequency = 20.0;
@@ -142,10 +138,10 @@ impl eframe::App for MyApp {
                 self.bar_width = 5.0;
 
                 let mut buffer_size = self.buffer_size.lock().unwrap();
-                *buffer_size = 4096;  // Default buffer size
+                *buffer_size = 4096;
 
                 let mut buf = self.audio_buffer.write().unwrap();
-                buf.resize(4096);  // Resize the circular buffer directly
+                buf.resize(4096);
 
                 info!("Buffer and spectrum reset to default values.");
             }
@@ -154,14 +150,14 @@ impl eframe::App for MyApp {
 }
 pub fn run_native(
     app_name: &str,
-    native_options: eframe::NativeOptions,
+    native_options: NativeOptions,
     app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,
 ) -> Result<(), eframe::Error> {
     eframe::run_native(
         app_name,
         native_options,
         Box::new(move |cc| {
-            let app: Box<MyApp> = app_creator(cc);  
+            let app: Box<MyApp> = app_creator(cc);
             app as Box<dyn eframe::App>  // Coerce MyApp to dyn App
         }),
     )
