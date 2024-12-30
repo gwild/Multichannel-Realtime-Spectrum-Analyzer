@@ -168,5 +168,12 @@ pub fn run_native(
     native_options: eframe::NativeOptions,
     app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,
 ) -> Result<(), eframe::Error> {
-    eframe::run_native(app_name, native_options, app_creator)
+    eframe::run_native(
+        app_name,
+        native_options,
+        Box::new(move |cc| {
+            let app: Box<MyApp> = app_creator(cc);  // Create the app
+            app as Box<dyn eframe::App>             // Coerce to trait object
+        }),
+    )
 }
