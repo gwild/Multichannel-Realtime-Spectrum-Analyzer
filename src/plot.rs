@@ -9,6 +9,8 @@ use log::info;
 use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
+use std::sync::RwLock;
+
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
@@ -74,16 +76,15 @@ impl MyApp {
             spectrum,
             fft_config,
             buffer_size,
-            audio_buffers,
+            audio_buffer,  // Correct field name
             colors,
             y_scale: 80.0,
             alpha: 255,
             bar_width: 5.0,
-
-            // Throttling: Initialize the last_repaint timer
-            last_repaint: Instant::now(), // Reminder: Initialization of throttling timer added. Do not modify without permission.
-            shutdown_flag,  // Store shutdown flag
+            last_repaint: Instant::now(),
+            shutdown_flag,
         };
+
 
         // FIX IMPLEMENTATION:
         // After we construct `instance`, we clamp `max_frequency` so the x scale
@@ -188,12 +189,16 @@ impl eframe::App for MyApp {
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
+                
                 let mut buf_size = self.buffer_size.lock().unwrap();
                 *buf_size = 4096;
                 reset_clicked = true;
-
+            
                 let mut buf = self.audio_buffer.write().unwrap();
-                *buf = CircularBuffer::new(2048);
+                
+                // Corrected: Initialize CircularBuffer with correct size and channel count
+                let channels = fft_config.lock().unwrap().num_channels;  // Assuming num_channels is tracked
+                *buf = CircularBuffer::new(2048, channels);  // Pass buffer size and channel count dynamically
             }
 
             // 5) After all sliders, handle changes outside the slider blocks
