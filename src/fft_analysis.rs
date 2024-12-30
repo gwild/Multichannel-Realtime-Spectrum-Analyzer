@@ -19,8 +19,7 @@ pub struct FFTConfig {
     pub db_threshold: f32,
 }
 
-#[allow(dead_code)]
-/// Spawns a thread to continuously process FFT data in the background.
+/// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
     audio_buffer: Arc<RwLock<CircularBuffer>>,  // Single buffer for all channels
     fft_config: Arc<Mutex<FFTConfig>>,
@@ -32,6 +31,7 @@ pub fn start_fft_processing(
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
             let result = catch_unwind(AssertUnwindSafe(|| {
+                // Clone the circular buffer for processing
                 let buffer_clone = {
                     let buffer = audio_buffer.read().unwrap();
                     buffer.clone_data()
@@ -40,6 +40,7 @@ pub fn start_fft_processing(
                 let mut all_channels_results =
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
+                // Process each channel separately by de-interleaving the buffer
                 for (channel_index, channel) in selected_channels.iter().enumerate() {
                     let buffer_data = extract_channel_data(&buffer_clone, channel_index, selected_channels.len());
 
@@ -55,10 +56,12 @@ pub fn start_fft_processing(
                     all_channels_results[channel_index] = spectrum;
                 }
 
+                // Update the plot after FFT processing
                 if let Ok(mut spectrum) = spectrum_app.lock() {
                     spectrum.update_partials(all_channels_results);
                 }
 
+                // Process FFT every 100ms
                 sleep(Duration::from_millis(100));
             }));
 
