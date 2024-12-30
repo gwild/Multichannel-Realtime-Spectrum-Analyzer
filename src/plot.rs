@@ -1,21 +1,18 @@
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
-use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
-// Reminder: Added to implement GUI throttling. Do not modify without permission.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
     pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
 }
 
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
@@ -27,71 +24,56 @@ impl SpectrumApp {
         for (channel, data) in new_partials.into_iter().enumerate() {
             if channel < self.partials.len() {
                 self.partials[channel] = data;
-                // info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
             }
         }
     }
 }
 
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct MyApp {
     pub spectrum: Arc<Mutex<SpectrumApp>>,
     pub fft_config: Arc<Mutex<FFTConfig>>,
     pub buffer_size: Arc<Mutex<usize>>,
-    pub audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
+    pub audio_buffer: Arc<RwLock<CircularBuffer>>,  // Single shared buffer
     colors: Vec<egui::Color32>,
     y_scale: f32,
     alpha: u8,
     bar_width: f32,
-
-    // Throttling: Added to track the last repaint time
-    last_repaint: Instant, // Reminder: This field was added to implement GUI throttling. Do not modify without permission.
-    shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
+    last_repaint: Instant,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl MyApp {
     pub fn new(
         spectrum: Arc<Mutex<SpectrumApp>>,
         fft_config: Arc<Mutex<FFTConfig>>,
         buffer_size: Arc<Mutex<usize>>,
-        audio_buffers: Arc<Vec<Mutex<CircularBuffer>>>,
-        shutdown_flag: Arc<AtomicBool>,  // Accept shutdown flag
+        audio_buffer: Arc<RwLock<CircularBuffer>>,  // Accept single buffer
+        shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
             egui::Color32::from_rgb(255, 165, 0),
             egui::Color32::from_rgb(0, 255, 0),
             egui::Color32::from_rgb(255, 0, 0),
-            egui::Color32::from_rgb(238, 130, 238),
-            egui::Color32::from_rgb(165, 42, 42),
-            egui::Color32::from_rgb(75, 0, 130),
-            egui::Color32::from_rgb(255, 255, 0),
         ];
 
-        // Create the MyApp instance as before (NO alterations/deletions)
         let instance = MyApp {
             spectrum,
             fft_config,
             buffer_size,
-            audio_buffers,
+            audio_buffer,
             colors,
             y_scale: 80.0,
             alpha: 255,
             bar_width: 5.0,
-
-            // Throttling: Initialize the last_repaint timer
-            last_repaint: Instant::now(), // Reminder: Initialization of throttling timer added. Do not modify without permission.
-            shutdown_flag,  // Store shutdown flag
+            last_repaint: Instant::now(),
+            shutdown_flag,
         };
 
-        // FIX IMPLEMENTATION:
-        // After we construct `instance`, we clamp `max_frequency` so the x scale
-        // is correct on startup, if current max_frequency exceeds nyquist_limit.
+        // Clamp max_frequency at startup based on buffer size
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
             let nyquist_limit = (*buffer_s as f32 / 2.0).min(20000.0);
-
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
                 cfg.max_frequency = nyquist_limit;
@@ -99,119 +81,59 @@ impl MyApp {
             }
         }
 
-        // Return the newly created instance with the fix
         instance
     }
 }
-
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
-// Implementing eframe::App for MyApp
-
 impl eframe::App for MyApp {
     fn on_close_event(&mut self) -> bool {
         info!("Closing GUI window...");
-        self.shutdown_flag.store(true, Ordering::Relaxed);  // Set shutdown flag to stop processing threads
-        true // Allow the window to close
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        true
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Throttling: Limit repaint to at most 10 times per second (every 100 ms)
         let now = Instant::now();
         if now.duration_since(self.last_repaint) >= Duration::from_millis(100) {
             ctx.request_repaint();
             self.last_repaint = now;
         }
-
-        // Force continuous updates every 100 ms
         ctx.request_repaint_after(Duration::from_millis(100));
-
         ctx.set_visuals(egui::Visuals::dark());
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
-            // 1) Sliders for min freq, max freq, db threshold
+            // FFT Configuration Sliders
             {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
                     ui.label("Min Frequency:");
-                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
+                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0));
                     ui.label("Max Frequency:");
 
                     let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
-                    ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
-
+                    ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit));
                     ui.label("DB Threshold:");
-                    ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0).text("dB"));
+                    ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0));
                 });
             }
 
-            // 2) Buffer size slider (no immediate clamp of max_frequency inside)
-            let mut size_changed = false;
-            {
-                let mut buffer_size = *self.buffer_size.lock().unwrap();
-                let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
-                ui.horizontal(|ui| {
-                    ui.label("Buffer Size:");
-                    if ui
-                        .add(egui::Slider::new(&mut buffer_log_slider, 6..=14).text("Power of 2"))
-                        .changed()
-                    {
-                        buffer_size = 1 << buffer_log_slider;
-                        *self.buffer_size.lock().unwrap() = buffer_size;
-
-                        for buffer in self.audio_buffers.iter() {
-                            let mut buf = buffer.lock().unwrap();
-                            *buf = CircularBuffer::new(buffer_size);
-                        }
-                        size_changed = true;
-                    }
-                    ui.label(format!("{} samples", buffer_size));
-                });
-            }
-
-            // 3) Sliders for Y scale, alpha, bar width
+            // Dynamic Buffer Resizing
+            let mut buffer_size = *self.buffer_size.lock().unwrap();
+            let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
             ui.horizontal(|ui| {
-                ui.label("Y Max:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("dB"));
-                ui.label("Alpha:");
-                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
-                ui.label("Bar Width:");
-                ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+                ui.label("Buffer Size:");
+                if ui.add(egui::Slider::new(&mut buffer_log_slider, 6..=14)).changed() {
+                    buffer_size = 1 << buffer_log_slider;
+                    *self.buffer_size.lock().unwrap() = buffer_size;
+
+                    let mut buf = self.audio_buffer.write().unwrap();
+                    buf.resize(buffer_size);  // Resize buffer dynamically
+                }
+                ui.label(format!("{} samples", buffer_size));
             });
 
-            // 4) Reset button
-            let mut reset_clicked = false;
-            if ui.button("Reset to Defaults").clicked() {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                fft_config.min_frequency = 20.0;
-                fft_config.max_frequency = 2048.0;
-                fft_config.db_threshold = -32.0;
-                self.y_scale = 80.0;
-                self.alpha = 255;
-                self.bar_width = 5.0;
-                let mut buf_size = self.buffer_size.lock().unwrap();
-                *buf_size = 4096;
-                reset_clicked = true;
-
-                for buffer in self.audio_buffers.iter() {
-                    let mut buf = buffer.lock().unwrap();
-                    *buf = CircularBuffer::new(2048);
-                }
-            }
-
-            // 5) After all sliders, handle changes outside the slider blocks
-            if size_changed || reset_clicked {
-                let buffer_size = *self.buffer_size.lock().unwrap();
-                let nyquist_limit = (buffer_size as f32 / 2.0).min(20000.0);
-
-                let mut fft_config = self.fft_config.lock().unwrap();
-                if fft_config.max_frequency > nyquist_limit {
-                    fft_config.max_frequency = nyquist_limit;
-                }
-            }
-
-            // 6) Plot logic
+            // Plot Partials
             let partials = {
                 let spectrum = self.spectrum.lock().unwrap();
                 spectrum.partials.clone()
@@ -220,77 +142,23 @@ impl eframe::App for MyApp {
             let all_bar_charts: Vec<BarChart> = partials
                 .iter()
                 .enumerate()
-                .map(|(channel, channel_partials)| {
-                    let bars: Vec<egui::plot::Bar> = channel_partials
+                .map(|(channel, data)| {
+                    let bars: Vec<_> = data
                         .iter()
-                        .map(|&(freq, amp)| {
-                            egui::plot::Bar::new(freq as f64, amp as f64)
-                                .width(self.bar_width as f64)
-                        })
+                        .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64).width(self.bar_width as f64))
                         .collect();
 
-                    let color = self.colors[channel % self.colors.len()]
-                        .linear_multiply(self.alpha as f32 / 255.0);
-
-                    BarChart::new(bars)
-                        .name(format!("Channel {}", channel + 1))
-                        .color(color)
+                    BarChart::new(bars).color(self.colors[channel % self.colors.len()])
                 })
                 .collect();
 
-            let max_freq = {
-                let fft = self.fft_config.lock().unwrap();
-                fft.max_frequency
-            };
-
             Plot::new("spectrum_plot")
                 .legend(egui::plot::Legend::default())
-                .view_aspect(6.0)
-                .include_x(0.0)
-                .include_x(max_freq as f64)
-                .include_y(0.0)
-                .include_y(self.y_scale)
                 .show(ui, |plot_ui| {
-                    for bar_chart in all_bar_charts {
-                        plot_ui.bar_chart(bar_chart);
+                    for chart in all_bar_charts {
+                        plot_ui.bar_chart(chart);
                     }
                 });
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label("Channel Results:");
-                for (channel, channel_partials) in partials.iter().enumerate() {
-                    let formatted_partials: Vec<String> = channel_partials
-                        .iter()
-                        .map(|&(freq, amp)| format!("({:.2}, {:.0})", freq, amp))
-                        .collect();
-                    ui.label(format!(
-                        "Channel {}: [{}]",
-                        channel + 1,
-                        formatted_partials.join(", ")
-                    ));
-                }
-            });
         });
     }
 }
-
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
-pub fn run_native(
-    app_name: &str,
-    native_options: NativeOptions,
-    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,  // Expect Box<MyApp>
-) -> Result<(), eframe::Error> {
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-
-    eframe::run_native(
-        app_name,
-        native_options,
-        Box::new(move |cc| {
-            let mut app = app_creator(cc);
-            app.shutdown_flag = shutdown_flag.clone();  // Directly assign to MyApp
-            app as Box<dyn eframe::App>
-        }),
-    )
-}
-
-// Total line count: 259
