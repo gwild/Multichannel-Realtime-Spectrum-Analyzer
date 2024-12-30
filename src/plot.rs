@@ -40,7 +40,6 @@ pub struct MyApp {
     last_repaint: Instant,
     shutdown_flag: Arc<AtomicBool>,
 }
-
 impl MyApp {
     pub fn new(
         spectrum: Arc<Mutex<SpectrumApp>>,
@@ -101,6 +100,7 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
+            // --- FFT Configuration Sliders ---
             {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
@@ -113,7 +113,6 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0));
                 });
             }
-
             let mut buffer_size = *self.buffer_size.lock().unwrap();
             let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
             ui.horizontal(|ui| {
@@ -127,24 +126,53 @@ impl eframe::App for MyApp {
                 ui.label(format!("{} samples", buffer_size));
             });
 
+            // --- Reset to Defaults Button ---
             if ui.button("Reset to Defaults").clicked() {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 fft_config.min_frequency = 20.0;
                 fft_config.max_frequency = 20000.0;
                 fft_config.db_threshold = -32.0;
-                
+
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
 
                 let mut buffer_size = self.buffer_size.lock().unwrap();
                 *buffer_size = 4096;
-
                 let mut buf = self.audio_buffer.write().unwrap();
                 buf.resize(4096);
 
                 info!("Buffer and spectrum reset to default values.");
             }
+            // --- Plotting Partials ---
+            let partials = {
+                let spectrum = self.spectrum.lock().unwrap();
+                spectrum.partials.clone()
+            };
+
+            let all_bar_charts: Vec<BarChart> = partials
+                .iter()
+                .enumerate()
+                .map(|(channel, data)| {
+                    let bars: Vec<_> = data
+                        .iter()
+                        .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64)
+                            .width(self.bar_width as f64))
+                        .collect();
+
+                    BarChart::new(bars)
+                        .name(format!("Channel {}", channel + 1))
+                        .color(self.colors[channel % self.colors.len()])
+                })
+                .collect();
+
+            Plot::new("spectrum_plot")
+                .legend(egui::plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    for chart in all_bar_charts {
+                        plot_ui.bar_chart(chart);
+                    }
+                });
         });
     }
 }
@@ -158,7 +186,7 @@ pub fn run_native(
         native_options,
         Box::new(move |cc| {
             let app: Box<MyApp> = app_creator(cc);
-            app as Box<dyn eframe::App>  // Coerce MyApp to dyn App
+            app as Box<dyn eframe::App>
         }),
     )
 }
