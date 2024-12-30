@@ -1,8 +1,6 @@
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
 use std::sync::{Arc, Mutex, RwLock};
 use eframe::egui;
 use egui::plot::{Plot, BarChart};
-// pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
 use log::info;
@@ -126,43 +124,34 @@ impl eframe::App for MyApp {
                 if ui.add(egui::Slider::new(&mut buffer_log_slider, 6..=14)).changed() {
                     buffer_size = 1 << buffer_log_slider;
                     *self.buffer_size.lock().unwrap() = buffer_size;
-
                     let mut buf = self.audio_buffer.write().unwrap();
-                    buf.resize(buffer_size);  // Resize buffer dynamically
+                    buf.resize(buffer_size);
                 }
                 ui.label(format!("{} samples", buffer_size));
             });
 
-            // Plot Partials
-            let partials = {
-                let spectrum = self.spectrum.lock().unwrap();
-                spectrum.partials.clone()
-            };
+            // Reset Button Logic
+            if ui.button("Reset to Defaults").clicked() {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                fft_config.min_frequency = 20.0;
+                fft_config.max_frequency = 20000.0;
+                fft_config.db_threshold = -32.0;
+                
+                self.y_scale = 80.0;
+                self.alpha = 255;
+                self.bar_width = 5.0;
 
-            let all_bar_charts: Vec<BarChart> = partials
-                .iter()
-                .enumerate()
-                .map(|(channel, data)| {
-                    let bars: Vec<_> = data
-                        .iter()
-                        .map(|&(freq, amp)| egui::plot::Bar::new(freq as f64, amp as f64).width(self.bar_width as f64))
-                        .collect();
+                let mut buffer_size = self.buffer_size.lock().unwrap();
+                *buffer_size = 4096;  // Default buffer size
 
-                    BarChart::new(bars).color(self.colors[channel % self.colors.len()])
-                })
-                .collect();
+                let mut buf = self.audio_buffer.write().unwrap();
+                buf.resize(4096);  // Resize the circular buffer directly
 
-            Plot::new("spectrum_plot")
-                .legend(egui::plot::Legend::default())
-                .show(ui, |plot_ui| {
-                    for chart in all_bar_charts {
-                        plot_ui.bar_chart(chart);
-                    }
-                });
+                info!("Buffer and spectrum reset to default values.");
+            }
         });
     }
 }
-
 pub fn run_native(
     app_name: &str,
     native_options: eframe::NativeOptions,
@@ -172,8 +161,8 @@ pub fn run_native(
         app_name,
         native_options,
         Box::new(move |cc| {
-            let app: Box<MyApp> = app_creator(cc);  // Create the app
-            app as Box<dyn eframe::App>             // Coerce to trait object
+            let app: Box<MyApp> = app_creator(cc);  
+            app as Box<dyn eframe::App>  // Coerce MyApp to dyn App
         }),
     )
 }
