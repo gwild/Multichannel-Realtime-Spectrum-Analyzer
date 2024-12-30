@@ -153,43 +153,28 @@ fn run() -> Result<()> {
     }));
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+let shutdown_flag_for_thread = Arc::clone(&shutdown_flag);  // Clone for thread
+let shutdown_flag_for_gui = Arc::clone(&shutdown_flag);     // Clone for GUI
 
-    std::thread::spawn({
-        let pa_clone = Arc::clone(&pa);
-        let audio_buffer_clone = Arc::clone(&audio_buffer);
-        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
-        move || {
-            if let Ok(mut stream) = build_input_stream(
-                &pa_clone,
-                selected_device_index,
-                selected_device_info.max_input_channels as usize,
-                selected_sample_rate,
-                audio_buffer_clone,
-                shutdown_flag_clone,
-            ) {
-                stream.start().expect("Failed to start audio stream.");
-                while !shutdown_flag.load(Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                stream.stop().expect("Failed to stop stream.");
-                stream.close().expect("Failed to close stream.");
-            }
-        }
-    });
+std::thread::spawn(move || {
+    while !shutdown_flag_for_thread.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+});
 
-    run_native(
-        "Real-Time Spectrum Analyzer",
-        NativeOptions::default(),
-        Box::new(move |_cc| {
-            Box::new(plot::MyApp::new(
-                spectrum_app.clone(),
-                fft_config.clone(),
-                buffer_size.clone(),
-                audio_buffer.clone(),
-                shutdown_flag.clone(),
-            ))
-        }),
-    ).expect("Failed to run native plot");
+plot::run_native(
+    "Real-Time Spectrum Analyzer",
+    NativeOptions::default(),
+    Box::new(move |_cc| {
+        Box::new(plot::MyApp::new(
+            spectrum_app.clone(),
+            fft_config.clone(),
+            buffer_size.clone(),
+            audio_buffer.clone(),
+            shutdown_flag_for_gui,  // Use the cloned version here
+        ))
+    }),
+).expect("Failed to run native plot");
 
     Ok(())
 }
