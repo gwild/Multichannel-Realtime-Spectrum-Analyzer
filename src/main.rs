@@ -16,9 +16,6 @@ use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
 use std::env;
-use eframe::run_native;
-
-
 use fft_analysis::FFTConfig;
 
 const MAX_BUFFER_SIZE: usize = 4096;
