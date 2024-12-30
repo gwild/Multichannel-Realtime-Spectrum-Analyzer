@@ -6,9 +6,10 @@
 // This section is protected. No modifications to imports, logic, or structure without permission.
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};  // Add this line
-use anyhow::{anyhow, Result};
 use portaudio as pa;
 use log::{info, error};
+
+use portaudio::stream::InputCallbackArgs;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
