@@ -1,7 +1,7 @@
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 // Reminder: The following imports are protected. Any modification requires explicit permission.
 use rustfft::{FftPlanner, num_complex::Complex};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, Mutex};
 use std::thread::{self, sleep};
 use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -22,8 +22,8 @@ pub struct FFTConfig {
 #[allow(dead_code)]
 /// Spawns a thread to continuously process FFT data in the background.
 pub fn start_fft_processing(
-    buffer_clone_fft: Arc<Vec<Mutex<CircularBuffer>>>,
-    fft_config_fft: Arc<Mutex<FFTConfig>>,
+    audio_buffer: Arc<RwLock<CircularBuffer>>,  // Single buffer for all channels
+    fft_config: Arc<Mutex<FFTConfig>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
     sample_rate: u32,
@@ -32,14 +32,16 @@ pub fn start_fft_processing(
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
             let result = catch_unwind(AssertUnwindSafe(|| {
+                let buffer_clone = {
+                    let buffer = audio_buffer.read().unwrap();
+                    buffer.clone_data()
+                };
+
                 let mut all_channels_results =
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
                 for (channel_index, channel) in selected_channels.iter().enumerate() {
-                    let buffer_data = {
-                        let buffer = buffer_clone_fft[channel_index].lock().unwrap();
-                        buffer.get().to_vec()
-                    };
+                    let buffer_data = extract_channel_data(&buffer_clone, channel_index, selected_channels.len());
 
                     let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
                     if sum == 0.0 {
@@ -47,7 +49,7 @@ pub fn start_fft_processing(
                         continue;
                     }
 
-                    let config = fft_config_fft.lock().unwrap();
+                    let config = fft_config.lock().unwrap();
                     let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
 
                     all_channels_results[channel_index] = spectrum;
@@ -66,6 +68,15 @@ pub fn start_fft_processing(
         }
         info!("FFT processing thread shutting down.");
     });
+}
+/// Extracts data for a specific channel from the interleaved buffer.
+fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
+    buffer
+        .iter()
+        .skip(channel)  // Start at the correct channel offset
+        .step_by(num_channels)  // Pick every Nth sample (de-interleaving)
+        .copied()
+        .collect()
 }
 
 /// Computes the frequency spectrum from the audio buffer.
@@ -114,25 +125,12 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
     magnitudes.retain(|&(freq, _)| freq >= config.min_frequency && freq <= config.max_frequency);
     magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    let mut filtered = Vec::new();
-    let mut last_frequency = -1.0;
-
-    for &(frequency, amplitude_db) in &magnitudes {
-        if frequency - last_frequency >= config.min_frequency && amplitude_db >= config.db_threshold
-        {
-            let rounded_frequency = (frequency * 100.0).round() / 100.0;
-            let rounded_amplitude = (amplitude_db * 100.0).round() / 100.0;
-            filtered.push((rounded_frequency, rounded_amplitude));
-            last_frequency = frequency;
-        }
+    while magnitudes.len() < NUM_PARTIALS {
+        magnitudes.push((0.0, 0.0));
     }
 
-    while filtered.len() < NUM_PARTIALS {
-        filtered.push((0.0, 0.0));
-    }
-
-    filtered.truncate(NUM_PARTIALS);
-    filtered
+    magnitudes.truncate(NUM_PARTIALS);
+    magnitudes
 }
 
 /// Applies Blackman-Harris windowing to the audio buffer.
@@ -154,5 +152,3 @@ fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-
-// Total line count: 171
