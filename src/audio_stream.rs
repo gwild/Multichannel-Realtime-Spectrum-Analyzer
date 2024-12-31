@@ -7,9 +7,10 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use portaudio as pa;
-use log::{info, error, warn};
+use log::{info, error};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -50,61 +51,39 @@ impl CircularBuffer {
     /// * `values` - A slice of interleaved audio samples.
     pub fn push_batch(&mut self, values: &[f32]) {
         let batch_size = values.len();
-        info!("Pushing batch of {} samples to buffer (capacity: {})", batch_size, self.buffer.len());
-        
         if batch_size == 0 {
-            warn!("Attempted to push empty batch to buffer");
             return;
         }
 
-        // Log first few values being pushed
-        info!("First few values in batch: {:?}", &values[..values.len().min(5)]);
-        
-        // Calculate how many complete frames we're pushing
+        // Calculate complete frames
         let frames = batch_size / self.channels;
         if frames == 0 {
-            warn!("Batch size {} is smaller than number of channels {}", batch_size, self.channels);
             return;
         }
 
-        let old_head = self.head;
-        let mut any_non_zero = false;
-
-        // Push frame by frame to maintain channel interleaving
-        for frame in 0..frames {
-            for channel in 0..self.channels {
-                let buffer_index = ((self.head + frame) % self.size) * self.channels + channel;
-                let value_index = frame * self.channels + channel;
-                if value_index < batch_size {
-                    let value = values[value_index];
-                    self.buffer[buffer_index] = value;
-                    if value != 0.0 {
-                        any_non_zero = true;
-                    }
+        // Optimize for common case where we're writing less than buffer size
+        if frames <= self.size {
+            // Copy frame by frame to maintain channel interleaving
+            for frame in 0..frames {
+                let src_offset = frame * self.channels;
+                let dst_offset = ((self.head + frame) % self.size) * self.channels;
+                for ch in 0..self.channels {
+                    self.buffer[dst_offset + ch] = values[src_offset + ch];
+                }
+            }
+        } else {
+            // If batch is larger than buffer, only keep most recent frames
+            let start_frame = frames - self.size;
+            for frame in 0..self.size {
+                let src_offset = (start_frame + frame) * self.channels;
+                let dst_offset = ((self.head + frame) % self.size) * self.channels;
+                for ch in 0..self.channels {
+                    self.buffer[dst_offset + ch] = values[src_offset + ch];
                 }
             }
         }
-        
-        // Update head position by number of complete frames
+
         self.head = (self.head + frames) % self.size;
-        
-        // Log detailed buffer state
-        let non_zero = self.buffer.iter().filter(|&&x| x != 0.0).count();
-        info!(
-            "Buffer update - Old head: {}, New head: {}, Frames written: {}, Any non-zero: {}, Total non-zero: {}", 
-            old_head, self.head, frames, any_non_zero, non_zero
-        );
-        
-        if non_zero > 0 {
-            info!(
-                "Buffer sample check - First few: {:?}, Around head: {:?}", 
-                self.buffer.iter().take(6).collect::<Vec<_>>(),
-                self.buffer.iter()
-                    .skip(self.head * self.channels)
-                    .take(6)
-                    .collect::<Vec<_>>()
-            );
-        }
     }
 
     /// Clones the contents of the buffer.
@@ -113,16 +92,13 @@ impl CircularBuffer {
     ///
     /// A clone of the entire buffer, maintaining the interleaved structure.
     pub fn clone_data(&self) -> Vec<f32> {
-        // Reorder the data to start from head
         let mut result = Vec::with_capacity(self.buffer.len());
         
-        // Copy from head to end
+        // Copy data starting from head, maintaining channel alignment
         for frame in 0..self.size {
-            let frame_index = (self.head + frame) % self.size;
-            for channel in 0..self.channels {
-                let index = frame_index * self.channels + channel;
-                result.push(self.buffer[index]);
-            }
+            let src_frame = (self.head + frame) % self.size;
+            let src_offset = src_frame * self.channels;
+            result.extend_from_slice(&self.buffer[src_offset..src_offset + self.channels]);
         }
         
         result
@@ -186,7 +162,7 @@ pub fn build_input_stream(
     device_index: pa::DeviceIndex,
     device_channels: usize,
     selected_channels: Vec<usize>,
-    sample_rate: f64,
+    sample_rate: f32,
     audio_buffer: Arc<RwLock<CircularBuffer>>,
     shutdown_flag: Arc<AtomicBool>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
@@ -201,8 +177,14 @@ pub fn build_input_stream(
     );
     
     // Use device's default latency and a moderate buffer size
-    let latency = device_info.default_low_input_latency;
-    let frames_per_buffer = 512; // Moderate buffer size
+    let frames_per_buffer = match sample_rate as u32 {
+        48000 => 512u32,  // Good balance for 48kHz
+        44100 => 441u32,  // Optimal for 44.1kHz
+        96000 => 1024u32, // Larger buffer for higher rates
+        _ => (sample_rate / 100.0) as u32  // Adaptive for other rates
+    };
+
+    let latency = device_info.default_low_input_latency.min(0.005); // Cap at 5ms
     
     let input_params = pa::StreamParameters::<f32>::new(
         device_index,
@@ -212,21 +194,21 @@ pub fn build_input_stream(
     );
     
     // Detailed format check
-    match pa.is_input_format_supported(input_params, sample_rate) {
+    match pa.is_input_format_supported(input_params, sample_rate as f64) {
         Ok(_) => info!("Input format is supported - SR: {}, Channels: {}", sample_rate, device_channels),
         Err(e) => {
             error!("Input format not supported: {}", e);
             // Try default sample rate as fallback
             let default_sr = device_info.default_sample_rate;
             info!("Trying default sample rate: {}", default_sr);
-            if pa.is_input_format_supported(input_params, default_sr).is_ok() {
+            if pa.is_input_format_supported(input_params, default_sr as f64).is_ok() {
                 info!("Default sample rate is supported, but requested rate isn't");
             }
             return Err(anyhow!("Unsupported input format: {}", e));
         }
     }
     
-    let settings = pa::InputStreamSettings::new(input_params, sample_rate, frames_per_buffer);
+    let settings = pa::InputStreamSettings::new(input_params, sample_rate as f64, frames_per_buffer);
     info!("Stream settings - SR: {}, Latency: {}, Buffer: {}", sample_rate, latency, frames_per_buffer);
 
     let callback_count = Arc::new(AtomicUsize::new(0));
@@ -237,7 +219,7 @@ pub fn build_input_stream(
         move |args: InputCallbackArgs<f32>| {
             let count = callback_count_clone.fetch_add(1, Ordering::SeqCst);
             
-            if shutdown_flag.load(Ordering::Relaxed) {
+            if shutdown_flag.load(Ordering::SeqCst) {
                 info!("Shutdown flag detected in callback after {} calls", count);
                 return pa::Complete;
             }
@@ -284,30 +266,36 @@ pub fn build_input_stream(
     Ok(stream)
 }
 
-fn process_input_samples(input: &[f32], num_channels: usize, selected_channels: &[usize]) -> Vec<f32> {
-    let frames = input.len() / num_channels;
+pub fn process_input_samples(input: &[f32], device_channels: usize, selected_channels: &[usize]) -> Vec<f32> {
+    let frames = input.len() / device_channels;
     let mut processed = Vec::with_capacity(frames * selected_channels.len());
     
-    info!(
-        "Processing - Frames: {}, Device channels: {}, Selected channels: {:?}",
-        frames, num_channels, selected_channels
-    );
-
     // Validate channel selection
     if let Some(&max_channel) = selected_channels.iter().max() {
-        if max_channel >= num_channels {
-            error!("Channel selection out of range: {} >= {}", max_channel, num_channels);
+        if max_channel >= device_channels {
+            error!("Channel selection out of range: {} >= {}", max_channel, device_channels);
             return Vec::new();
         }
     }
 
-    // Extract selected channels frame by frame
+    // Process all frames at once to maintain time alignment
     for frame in 0..frames {
-        let frame_offset = frame * num_channels;
+        let frame_offset = frame * device_channels;
+        // Keep selected channels time-aligned by processing them together
         for &channel in selected_channels {
-            let sample = input[frame_offset + channel];
-            processed.push(sample);
+            processed.push(input[frame_offset + channel]);
         }
+    }
+
+    // Log some statistics periodically
+    if frames > 0 && frames % 100 == 0 {
+        let non_zero = processed.iter().filter(|&&x| x != 0.0).count();
+        info!(
+            "Processed {} frames, {} channels, {} non-zero samples",
+            frames,
+            selected_channels.len(),
+            non_zero
+        );
     }
 
     processed
@@ -325,6 +313,8 @@ fn process_input_samples(input: &[f32], num_channels: usize, selected_channels: 
 /// * `sample_rate` - Audio stream sample rate.
 /// * `buffer_size` - Mutex-protected buffer size for dynamic resizing.
 /// * `device_index` - The index of the selected audio input device.
+/// * `shutdown_flag` - Atomic flag to indicate stream shutdown.
+/// * `stream_ready` - Atomic flag to indicate stream readiness.
 pub fn start_sampling_thread(
     running: Arc<AtomicBool>,
     main_buffer: Arc<RwLock<CircularBuffer>>,
@@ -332,6 +322,8 @@ pub fn start_sampling_thread(
     sample_rate: f64,
     _buffer_size: Arc<Mutex<usize>>,
     device_index: pa::DeviceIndex,
+    shutdown_flag: Arc<AtomicBool>,
+    stream_ready: Arc<AtomicBool>,
 ) {
     let pa = pa::PortAudio::new().expect("Failed to initialize PortAudio");
     info!("PortAudio initialized for sampling thread.");
@@ -347,9 +339,9 @@ pub fn start_sampling_thread(
         device_index,
         device_channels,
         selected_channels.clone(),
-        sample_rate,
+        sample_rate as f32,
         Arc::clone(&main_buffer),
-        Arc::clone(&running),
+        Arc::clone(&shutdown_flag),
     );
 
     match stream_result {
@@ -358,24 +350,51 @@ pub fn start_sampling_thread(
             match stream.start() {
                 Ok(_) => {
                     info!("Audio stream started successfully");
+                    running.store(true, Ordering::SeqCst);
                     
-                    // Keep the stream alive until shutdown is requested
-                    while running.load(Ordering::SeqCst) {
+                    // Wait for first batch of data
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    
+                    // Signal that stream is ready
+                    stream_ready.store(true, Ordering::SeqCst);
+                    info!("Audio stream ready for FFT processing");
+                    
+                    // Keep checking stream health until shutdown
+                    while !shutdown_flag.load(Ordering::SeqCst) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         
-                        // Only check stream status occasionally
+                        // Check if stream is still active
                         if let Ok(is_active) = stream.is_active() {
                             if !is_active {
                                 error!("Stream became inactive, attempting restart...");
+                                running.store(false, Ordering::SeqCst);  // Mark as not running
+                                
                                 if let Err(e) = stream.start() {
                                     error!("Failed to restart stream: {}", e);
-                                    break;
+                                    // Keep trying to restart until shutdown
+                                    continue;
                                 }
+                                running.store(true, Ordering::SeqCst);  // Mark as running again
+                            }
+                        }
+
+                        // Check if stream is stopped
+                        if let Ok(is_stopped) = stream.is_stopped() {
+                            if is_stopped && !shutdown_flag.load(Ordering::SeqCst) {
+                                info!("Stream stopped unexpectedly, attempting restart...");
+                                running.store(false, Ordering::SeqCst);
+                                
+                                if let Err(e) = stream.start() {
+                                    error!("Failed to restart stream: {}", e);
+                                    continue;
+                                }
+                                running.store(true, Ordering::SeqCst);
                             }
                         }
                     }
                     
-                    info!("Shutdown requested, stopping audio stream...");
+                    info!("Shutdown requested, cleaning up stream...");
+                    running.store(false, Ordering::SeqCst);
                     if let Err(e) = stream.stop() {
                         error!("Error stopping stream: {}", e);
                     }
@@ -385,4 +404,24 @@ pub fn start_sampling_thread(
         },
         Err(e) => error!("Failed to build input stream: {}", e),
     }
+}
+
+pub fn calculate_optimal_buffer_size(sample_rate: f32) -> usize {
+    // Convert MIN_FREQ and MAX_FREQ from f64 to f32 for calculations
+    let min_freq = MIN_FREQ as f32;
+    let max_freq = MAX_FREQ as f32;
+    
+    let min_samples = (sample_rate / min_freq) as usize;
+    let max_samples = (sample_rate / max_freq * 4.0) as usize;
+    
+    let initial_size = ((min_samples + max_samples) / 2)
+        .next_power_of_two()
+        .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
+    
+    info!(
+        "Calculated buffer size - Min: {}, Max: {}, Selected: {}, SR: {}",
+        min_samples, max_samples, initial_size, sample_rate
+    );
+    
+    initial_size
 }

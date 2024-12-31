@@ -14,10 +14,10 @@ pub const NUM_PARTIALS: usize = 12;
 
 /// Configuration struct for FFT settings.
 pub struct FFTConfig {
-    pub min_frequency: f32,
-    pub max_frequency: f32,
-    pub db_threshold: f32,
-    pub num_channels: usize,  // Add channel count to config
+    pub min_frequency: f64,
+    pub max_frequency: f64,
+    pub db_threshold: f64,
+    pub num_channels: usize,
 }
 
 
@@ -90,7 +90,8 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    let linear_threshold = 10.0_f32.powf(config.db_threshold / 20.0);
+    // Convert db_threshold from f64 to f32 for FFT processing
+    let linear_threshold = 10.0_f32.powf((config.db_threshold as f32) / 20.0);
     let filtered_buffer: Vec<f32> = buffer
         .iter()
         .cloned()
@@ -127,7 +128,9 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
         })
         .collect();
 
-    magnitudes.retain(|&(freq, _)| freq >= config.min_frequency && freq <= config.max_frequency);
+    magnitudes.retain(|&(freq, _)| {
+        freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
+    });
     magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     while magnitudes.len() < NUM_PARTIALS {

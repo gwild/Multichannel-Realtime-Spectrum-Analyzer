@@ -1,6 +1,7 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
+mod utils;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -17,16 +18,22 @@ use log::{info, error, warn};
 use env_logger;
 use std::env;
 use fft_analysis::FFTConfig;
-
-const MAX_BUFFER_SIZE: usize = 4096;
+use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
 
 fn main() {
-    env::set_var("RUST_LOG", "info");
-    env_logger::init();
-    info!("Application starting...");
+    // Only set up logging if --enable-logs flag is present
+    if std::env::args().any(|arg| arg == "--enable-logs") {
+        env::set_var("RUST_LOG", "info");
+        env_logger::init();
+        info!("Application starting...");
+    }
 
     if let Err(e) = run() {
-        error!("Application encountered an error: {:?}", e);
+        if std::env::args().any(|arg| arg == "--enable-logs") {
+            error!("Application encountered an error: {:?}", e);
+        } else {
+            eprintln!("Error: {:?}", e);
+        }
         std::process::exit(1);
     }
 }
@@ -133,47 +140,58 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
-    let buffer_size = Arc::new(Mutex::new(MAX_BUFFER_SIZE));
+    let buffer_size = Arc::new(Mutex::new(calculate_optimal_buffer_size(selected_sample_rate)));
     let audio_buffer = Arc::new(RwLock::new(CircularBuffer::new(
         *buffer_size.lock().unwrap(),
         selected_channels.len()
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let fft_config = Arc::new(Mutex::new(FFTConfig {
-        min_frequency: 20.0,
-        max_frequency: 2048.0,
+        min_frequency: MIN_FREQ,
+        max_frequency: MAX_FREQ,
         db_threshold: -32.0,
         num_channels: selected_channels.len(),
     }));
 
+    let running = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let audio_thread_running = Arc::clone(&shutdown_flag);
+    let stream_ready = Arc::new(AtomicBool::new(false));
 
     let audio_buffer_clone = Arc::clone(&audio_buffer);
     let selected_channels_clone = selected_channels.clone();
     let buffer_size_clone = Arc::clone(&buffer_size);
+    let shutdown_flag_audio = Arc::clone(&shutdown_flag);
+    let stream_ready_audio = Arc::clone(&stream_ready);
 
     // Start audio thread
     info!("Starting audio sampling thread...");
     let audio_thread = std::thread::spawn(move || {
         start_sampling_thread(
-            audio_thread_running,
+            running,
             audio_buffer_clone,
             selected_channels_clone,
             selected_sample_rate,
             buffer_size_clone,
             selected_device_index,
+            shutdown_flag_audio,
+            stream_ready_audio,
         );
     });
 
-    // Start FFT processing thread
+    // Start FFT processing thread only after stream is ready
+    info!("Waiting for audio stream to initialize...");
+    let stream_ready_fft = Arc::clone(&stream_ready);
+    while !stream_ready_fft.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     info!("Starting FFT processing...");
     let fft_thread = std::thread::spawn({
         let audio_buffer = Arc::clone(&audio_buffer);
         let fft_config = Arc::clone(&fft_config);
         let spectrum_app = Arc::clone(&spectrum_app);
         let selected_channels = selected_channels.clone();
-        let shutdown_flag = Arc::clone(&shutdown_flag);
+        let shutdown_flag_fft = Arc::clone(&shutdown_flag);
         move || {
             fft_analysis::start_fft_processing(
                 audio_buffer,
@@ -181,7 +199,7 @@ fn run() -> Result<()> {
                 spectrum_app,
                 selected_channels,
                 selected_sample_rate as u32,
-                shutdown_flag,
+                shutdown_flag_fft,
             );
         }
     });
@@ -197,7 +215,7 @@ fn run() -> Result<()> {
     );
 
     let native_options = NativeOptions {
-        initial_window_size: Some(egui::vec2(800.0, 600.0)),
+        initial_window_size: Some(egui::vec2(1024.0, 420.0)),
         vsync: true,
         ..Default::default()
     };
@@ -210,10 +228,11 @@ fn run() -> Result<()> {
         error!("GUI error: {}", e);
     }
 
-    // Set shutdown flag and wait for threads
+    // Set shutdown flag to stop processing threads
     info!("Setting shutdown flag...");
     shutdown_flag.store(true, Ordering::SeqCst);
 
+    // Wait for threads to finish
     if let Ok(_) = audio_thread.join() {
         info!("Audio thread terminated successfully");
     } else {
@@ -262,7 +281,7 @@ fn reset_audio_devices(pa: &Arc<pa::PortAudio>) -> Result<()> {
 fn ensure_audio_device_ready(pa: &pa::PortAudio, device_index: pa::DeviceIndex) -> bool {
     let params = pa::StreamParameters::<f32>::new(device_index, 1, true, 0.0);
     if let Ok(mut stream) = pa.open_non_blocking_stream(
-        pa::InputStreamSettings::new(params, 48000.0, 512),
+        pa::InputStreamSettings::new(params, 48000.0f64, 512),
         |_args| pa::Continue,
     ) {
         stream.close().is_ok()
@@ -282,7 +301,7 @@ fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels:
     
     // Create a blocking stream for testing
     let mut stream = pa.open_blocking_stream(
-        pa::InputStreamSettings::new(input_params, 44100.0, 1024)
+        pa::InputStreamSettings::new(input_params, 44100.0f64, 1024)
     )?;
     
     stream.start()?;

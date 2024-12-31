@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size};
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -91,7 +92,7 @@ impl MyApp {
         // is correct on startup, if current max_frequency exceeds nyquist_limit.
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
-            let nyquist_limit = (*buffer_s as f32 / 2.0).min(20000.0);
+            let nyquist_limit = (*buffer_s as f64 / 2.0).min(20000.0);
 
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
@@ -103,6 +104,27 @@ impl MyApp {
         // Return the newly created instance with the fix
         instance
     }
+
+    pub fn update_buffer_size(&mut self, new_size: usize) {
+        let validated_size = new_size
+            .next_power_of_two()  // Ensure power of 2 for FFT
+            .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
+        
+        if validated_size != new_size {
+            info!(
+                "Adjusted requested buffer size from {} to {} (power of 2 between {} and {})",
+                new_size, validated_size, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE
+            );
+        }
+        
+        if let Ok(mut size) = self.buffer_size.lock() {
+            *size = validated_size;
+        }
+        
+        if let Ok(mut buffer) = self.audio_buffer.write() {
+            buffer.resize(validated_size);
+        }
+    }
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -111,7 +133,7 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn on_close_event(&mut self) -> bool {
         info!("Closing GUI window...");
-        self.shutdown_flag.store(true, Ordering::Relaxed);  // Set shutdown flag to stop processing threads
+        self.shutdown_flag.store(true, Ordering::SeqCst);  // Changed back to true for shutdown
         true // Allow the window to close
     }
 
@@ -137,9 +159,10 @@ impl eframe::App for MyApp {
                 ui.horizontal(|ui| {
                     ui.label("Min Frequency:");
                     ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
+                    
                     ui.label("Max Frequency:");
-
-                    let nyquist_limit = (*self.buffer_size.lock().unwrap() as f32 / 2.0).min(20000.0);
+                    let buffer_size = *self.buffer_size.lock().unwrap();
+                    let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
                     ui.label("DB Threshold:");
@@ -148,26 +171,22 @@ impl eframe::App for MyApp {
             }
 
             // 2) Buffer size slider (no immediate clamp of max_frequency inside)
-            let mut size_changed = false;
-            {
-                let mut buffer_size = *self.buffer_size.lock().unwrap();
-                let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
-                ui.horizontal(|ui| {
-                    ui.label("Buffer Size:");
-                    if ui
-                        .add(egui::Slider::new(&mut buffer_log_slider, 6..=14).text("Power of 2"))
-                        .changed()
-                    {
-                        buffer_size = 1 << buffer_log_slider;
-                        *self.buffer_size.lock().unwrap() = buffer_size;
-
-                        let mut buf = self.audio_buffer.write().unwrap();
-                        buf.resize(buffer_size);
-                        size_changed = true;
-                    }
-                    ui.label(format!("{} samples", buffer_size));
-                });
-            }
+            let size_changed = false;
+            let buffer_size = *self.buffer_size.lock().unwrap();
+            let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
+            ui.horizontal(|ui| {
+                ui.label("Buffer Size:");
+                let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
+                let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
+                if ui
+                    .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power).text("Power of 2"))
+                    .changed()
+                {
+                    let new_size = 1 << buffer_log_slider;
+                    self.update_buffer_size(new_size);
+                }
+                ui.label(format!("{} samples", buffer_size));
+            });
 
             // 3) Sliders for Y scale, alpha, bar width
             ui.horizontal(|ui| {
@@ -184,8 +203,8 @@ impl eframe::App for MyApp {
             if ui.button("Reset to Defaults").clicked() {
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
-                    fft_config.min_frequency = 20.0;
-                    fft_config.max_frequency = 2048.0;
+                    fft_config.min_frequency = MIN_FREQ;
+                    fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -32.0;
                 }
                 
@@ -193,16 +212,10 @@ impl eframe::App for MyApp {
                 self.alpha = 255;
                 self.bar_width = 5.0;
                 
-                // Update buffer size
-                {
-                    let mut buf_size = self.buffer_size.lock().unwrap();
-                    *buf_size = 4096;
-                }
-                
-                // Resize existing buffer instead of creating new one
-                if let Ok(mut buf) = self.audio_buffer.write() {
-                    buf.resize(4096);
-                }
+                // Calculate optimal size based on current sample rate
+                let sample_rate = 48000.0f64;
+                let optimal_size = calculate_optimal_buffer_size(sample_rate);
+                self.update_buffer_size(optimal_size);
                 
                 reset_clicked = true;
             }
@@ -210,7 +223,7 @@ impl eframe::App for MyApp {
             // 5) After all sliders, handle changes outside the slider blocks
             if size_changed || reset_clicked {
                 let buffer_size = *self.buffer_size.lock().unwrap();
-                let nyquist_limit = (buffer_size as f32 / 2.0).min(20000.0);
+                let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
 
                 let mut fft_config = self.fft_config.lock().unwrap();
                 if fft_config.max_frequency > nyquist_limit {
