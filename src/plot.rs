@@ -182,25 +182,29 @@ impl eframe::App for MyApp {
             // 4) Reset button
             let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                fft_config.min_frequency = 20.0;
-                fft_config.max_frequency = 2048.0;
-                fft_config.db_threshold = -32.0;
+                {
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    fft_config.min_frequency = 20.0;
+                    fft_config.max_frequency = 2048.0;
+                    fft_config.db_threshold = -32.0;
+                }
+                
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
                 
-                let mut buf_size = self.buffer_size.lock().unwrap();
-                *buf_size = 4096;
-                reset_clicked = true;
-            
-                let mut buf = self.audio_buffer.write().unwrap();
+                // Update buffer size
+                {
+                    let mut buf_size = self.buffer_size.lock().unwrap();
+                    *buf_size = 4096;
+                }
                 
-                // Corrected: Initialize CircularBuffer with correct size and channel count
-                let channels = fft_config_guard.num_channels;  // Directly access the field
-
-
-                *buf = CircularBuffer::new(2048, channels);  // Pass buffer size and channel count dynamically
+                // Resize existing buffer instead of creating new one
+                if let Ok(mut buf) = self.audio_buffer.write() {
+                    buf.resize(4096);
+                }
+                
+                reset_clicked = true;
             }
 
             // 5) After all sliders, handle changes outside the slider blocks

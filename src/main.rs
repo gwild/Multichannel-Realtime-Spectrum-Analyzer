@@ -11,7 +11,7 @@ use std::sync::{
     RwLock,
     atomic::{AtomicBool, Ordering}
 };
-use audio_stream::{CircularBuffer, build_input_stream};
+use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
@@ -21,14 +21,9 @@ use fft_analysis::FFTConfig;
 const MAX_BUFFER_SIZE: usize = 4096;
 
 fn main() {
-    {
-        let args: Vec<String> = env::args().collect();
-        if !args.iter().any(|arg| arg == "--enable-logs") {
-            env::set_var("RUST_LOG", "off");
-        }
-    }
-
+    env::set_var("RUST_LOG", "info");
     env_logger::init();
+    info!("Application starting...");
 
     if let Err(e) = run() {
         error!("Application encountered an error: {:?}", e);
@@ -117,6 +112,7 @@ fn run() -> Result<()> {
         return Err(anyhow!("Invalid sample rate index."));
     }
     let selected_sample_rate = supported_sample_rates[sample_rate_index];
+    info!("Selected sample rate: {} Hz", selected_sample_rate);
 
     println!(
         "Available channels: 0 to {}",
@@ -140,43 +136,81 @@ fn run() -> Result<()> {
     let buffer_size = Arc::new(Mutex::new(MAX_BUFFER_SIZE));
     let audio_buffer = Arc::new(RwLock::new(CircularBuffer::new(
         *buffer_size.lock().unwrap(),
-        selected_device_info.max_input_channels as usize,
+        selected_channels.len()
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: 20.0,
         max_frequency: 2048.0,
         db_threshold: -32.0,
-        num_channels: selected_channels.len(),  // Set to number of selected channels
+        num_channels: selected_channels.len(),
     }));
 
-
     let shutdown_flag = Arc::new(AtomicBool::new(false));
-let shutdown_flag_for_thread = Arc::clone(&shutdown_flag);  // Clone for thread
-let shutdown_flag_for_gui = Arc::clone(&shutdown_flag);     // Clone for GUI
+    let audio_thread_running = Arc::clone(&shutdown_flag);
 
-std::thread::spawn(move || {
-    while !shutdown_flag_for_thread.load(Ordering::Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-});
+    let audio_buffer_clone = Arc::clone(&audio_buffer);
+    let selected_channels_clone = selected_channels.clone();
+    let buffer_size_clone = Arc::clone(&buffer_size);
 
-plot::run_native(
-    "Real-Time Spectrum Analyzer",
-    NativeOptions::default(),
-    Box::new(move |_cc| {
-        Box::new(plot::MyApp::new(
+    // Start audio thread
+    info!("Starting audio sampling thread...");
+    let audio_thread = std::thread::spawn(move || {
+        start_sampling_thread(
+            audio_thread_running,
+            audio_buffer_clone,
+            selected_channels_clone,
+            selected_sample_rate,
+            buffer_size_clone,
+            selected_device_index,
+        );
+    });
+
+    // Start FFT processing
+    info!("Starting FFT processing...");
+    fft_analysis::start_fft_processing(
+        Arc::clone(&audio_buffer),
+        Arc::clone(&fft_config),
+        Arc::clone(&spectrum_app),
+        selected_channels.clone(),
+        selected_sample_rate as u32,
+        Arc::clone(&shutdown_flag),
+    );
+
+    // Start GUI in a separate scope to handle its errors
+    info!("Starting GUI...");
+    {
+        let app = plot::MyApp::new(
             spectrum_app.clone(),
             fft_config.clone(),
             buffer_size.clone(),
             audio_buffer.clone(),
-            shutdown_flag_for_gui,  // Use the cloned version here
-        ))
-    }),
-).expect("Failed to run native plot");
+            shutdown_flag.clone(),
+        );
+
+        let native_options = NativeOptions::default();
+        if let Err(e) = eframe::run_native(
+            "Real-Time Spectrum Analyzer",
+            native_options,
+            Box::new(|_cc| Box::new(app)),
+        ) {
+            error!("GUI error: {}", e);
+        }
+    }
+
+    // Set shutdown flag and wait for audio thread
+    info!("Setting shutdown flag...");
+    shutdown_flag.store(true, Ordering::SeqCst);
+    
+    if let Ok(_) = audio_thread.join() {
+        info!("Audio thread terminated successfully");
+    } else {
+        warn!("Audio thread may not have terminated cleanly");
+    }
 
     Ok(())
 }
+
 fn get_supported_sample_rates(
     device_index: pa::DeviceIndex,
     num_channels: i32,
@@ -216,5 +250,45 @@ fn ensure_audio_device_ready(pa: &pa::PortAudio, device_index: pa::DeviceIndex) 
         stream.close().is_ok()
     } else {
         false
+    }
+}
+
+fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels: i32) -> Result<bool> {
+    info!("Testing audio input for device...");
+    
+    let latency = pa.device_info(device_index)?.default_low_input_latency;
+    let input_params = pa::StreamParameters::new(device_index, channels, true, latency);
+    
+    // Create a test buffer
+    let mut test_buffer = vec![0.0f32; 1024 * channels as usize];
+    
+    // Create a blocking stream for testing
+    let mut stream = pa.open_blocking_stream(
+        pa::InputStreamSettings::new(input_params, 44100.0, 1024)
+    )?;
+    
+    stream.start()?;
+    info!("Reading test audio data...");
+    
+    // Try to read some data
+    match stream.read(1024) {
+        Ok(data) => {
+            test_buffer.copy_from_slice(data);
+            let non_zero = test_buffer.iter().filter(|&&x| x != 0.0).count();
+            info!("Test read - Buffer size: {}, Non-zero samples: {}", test_buffer.len(), non_zero);
+            if non_zero > 0 {
+                info!("First few non-zero samples: {:?}", 
+                    test_buffer.iter()
+                        .filter(|&&x| x != 0.0)
+                        .take(5)
+                        .collect::<Vec<_>>());
+            }
+            stream.stop()?;
+            Ok(non_zero > 0)
+        },
+        Err(e) => {
+            stream.stop()?;
+            Err(anyhow!("Failed to read audio data: {}", e))
+        }
     }
 }
