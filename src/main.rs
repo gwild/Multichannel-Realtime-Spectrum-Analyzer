@@ -166,46 +166,64 @@ fn run() -> Result<()> {
         );
     });
 
-    // Start FFT processing
+    // Start FFT processing thread
     info!("Starting FFT processing...");
-    fft_analysis::start_fft_processing(
-        Arc::clone(&audio_buffer),
-        Arc::clone(&fft_config),
-        Arc::clone(&spectrum_app),
-        selected_channels.clone(),
-        selected_sample_rate as u32,
-        Arc::clone(&shutdown_flag),
+    let fft_thread = std::thread::spawn({
+        let audio_buffer = Arc::clone(&audio_buffer);
+        let fft_config = Arc::clone(&fft_config);
+        let spectrum_app = Arc::clone(&spectrum_app);
+        let selected_channels = selected_channels.clone();
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        move || {
+            fft_analysis::start_fft_processing(
+                audio_buffer,
+                fft_config,
+                spectrum_app,
+                selected_channels,
+                selected_sample_rate as u32,
+                shutdown_flag,
+            );
+        }
+    });
+
+    // Start GUI
+    info!("Starting GUI...");
+    let app = plot::MyApp::new(
+        spectrum_app.clone(),
+        fft_config.clone(),
+        buffer_size.clone(),
+        audio_buffer.clone(),
+        shutdown_flag.clone(),
     );
 
-    // Start GUI in a separate scope to handle its errors
-    info!("Starting GUI...");
-    {
-        let app = plot::MyApp::new(
-            spectrum_app.clone(),
-            fft_config.clone(),
-            buffer_size.clone(),
-            audio_buffer.clone(),
-            shutdown_flag.clone(),
-        );
+    let native_options = NativeOptions {
+        initial_window_size: Some(egui::vec2(800.0, 600.0)),
+        vsync: true,
+        ..Default::default()
+    };
 
-        let native_options = NativeOptions::default();
-        if let Err(e) = eframe::run_native(
-            "Real-Time Spectrum Analyzer",
-            native_options,
-            Box::new(|_cc| Box::new(app)),
-        ) {
-            error!("GUI error: {}", e);
-        }
+    if let Err(e) = eframe::run_native(
+        "Real-Time Spectrum Analyzer",
+        native_options,
+        Box::new(|_cc| Box::new(app)),
+    ) {
+        error!("GUI error: {}", e);
     }
 
-    // Set shutdown flag and wait for audio thread
+    // Set shutdown flag and wait for threads
     info!("Setting shutdown flag...");
     shutdown_flag.store(true, Ordering::SeqCst);
-    
+
     if let Ok(_) = audio_thread.join() {
         info!("Audio thread terminated successfully");
     } else {
         warn!("Audio thread may not have terminated cleanly");
+    }
+
+    if let Ok(_) = fft_thread.join() {
+        info!("FFT thread terminated successfully");
+    } else {
+        warn!("FFT thread may not have terminated cleanly");
     }
 
     Ok(())

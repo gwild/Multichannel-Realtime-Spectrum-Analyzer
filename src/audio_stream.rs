@@ -192,7 +192,6 @@ pub fn build_input_stream(
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     
-    // Add detailed device info logging
     info!(
         "Device details - Name: {}, Max channels: {}, Default SR: {}, Default latency: {}",
         device_info.name,
@@ -201,8 +200,9 @@ pub fn build_input_stream(
         device_info.default_low_input_latency
     );
     
+    // Use device's default latency and a moderate buffer size
     let latency = device_info.default_low_input_latency;
-    let frames_per_buffer = 1024;
+    let frames_per_buffer = 512; // Moderate buffer size
     
     let input_params = pa::StreamParameters::<f32>::new(
         device_index,
@@ -211,11 +211,17 @@ pub fn build_input_stream(
         latency
     );
     
-    // Verify format support
+    // Detailed format check
     match pa.is_input_format_supported(input_params, sample_rate) {
-        Ok(_) => info!("Input format is supported"),
+        Ok(_) => info!("Input format is supported - SR: {}, Channels: {}", sample_rate, device_channels),
         Err(e) => {
             error!("Input format not supported: {}", e);
+            // Try default sample rate as fallback
+            let default_sr = device_info.default_sample_rate;
+            info!("Trying default sample rate: {}", default_sr);
+            if pa.is_input_format_supported(input_params, default_sr).is_ok() {
+                info!("Default sample rate is supported, but requested rate isn't");
+            }
             return Err(anyhow!("Unsupported input format: {}", e));
         }
     }
@@ -236,32 +242,21 @@ pub fn build_input_stream(
                 return pa::Complete;
             }
 
-            // Detailed input analysis
-            let non_zero_count = args.buffer.iter().filter(|&&x| x != 0.0).count();
-            let max_value = args.buffer.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
-            let min_value = args.buffer.iter().fold(0.0f32, |min, &x| if x != 0.0 { min.min(x.abs()) } else { min });
-            
-            info!(
-                "Callback #{} - Frames: {}, Buffer: {} samples, Non-zero: {}, Range: {:.6} to {:.6}",
-                count,
-                args.buffer.len() / device_channels,
-                args.buffer.len(),
-                non_zero_count,
-                min_value,
-                max_value
-            );
-
-            if non_zero_count > 0 {
+            // Log every 50th callback to track activity
+            if count % 50 == 0 {
+                let max_value = args.buffer.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
                 info!(
-                    "First non-zero frame: {:?}",
-                    args.buffer.iter()
-                        .enumerate()
-                        .filter(|(_, &x)| x != 0.0)
-                        .take(device_channels)
-                        .collect::<Vec<_>>()
+                    "Callback #{} - Buffer: {} samples, Max amplitude: {:.6}, Time: {:?}",
+                    count,
+                    args.buffer.len(),
+                    max_value,
+                    args.time
                 );
             }
 
+            let non_zero_count = args.buffer.iter().filter(|&&x| x != 0.0).count();
+            
+            // Process all data, not just non-zero
             let processed_samples = process_input_samples(
                 args.buffer,
                 device_channels,
@@ -270,6 +265,16 @@ pub fn build_input_stream(
 
             if let Ok(mut buffer) = audio_buffer.write() {
                 buffer.push_batch(&processed_samples);
+            }
+
+            if non_zero_count > 0 {
+                info!(
+                    "Audio data - Callback #{}, Non-zero: {}/{}, First few: {:?}",
+                    count,
+                    non_zero_count,
+                    args.buffer.len(),
+                    args.buffer.iter().take(4).collect::<Vec<_>>()
+                );
             }
 
             pa::Continue
@@ -337,7 +342,7 @@ pub fn start_sampling_thread(
     info!("Initializing main audio stream...");
     
     // Create and start the stream
-    match build_input_stream(
+    let stream_result = build_input_stream(
         &pa,
         device_index,
         device_channels,
@@ -345,32 +350,32 @@ pub fn start_sampling_thread(
         sample_rate,
         Arc::clone(&main_buffer),
         Arc::clone(&running),
-    ) {
+    );
+
+    match stream_result {
         Ok(mut stream) => {
             info!("Successfully built input stream");
             match stream.start() {
                 Ok(_) => {
                     info!("Audio stream started successfully");
                     
-                    // Main monitoring loop
+                    // Keep the stream alive until shutdown is requested
                     while running.load(Ordering::SeqCst) {
-                        if let Ok(buffer) = main_buffer.read() {
-                            let data = buffer.clone_data();
-                            let non_zero = data.iter().filter(|&&x| x != 0.0).count();
-                            if non_zero > 0 {
-                                info!(
-                                    "Buffer state - Size: {}, Non-zero: {}, Max value: {:.6}",
-                                    data.len(),
-                                    non_zero,
-                                    data.iter().fold(0.0f32, |max, &x| max.max(x.abs()))
-                                );
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        
+                        // Only check stream status occasionally
+                        if let Ok(is_active) = stream.is_active() {
+                            if !is_active {
+                                error!("Stream became inactive, attempting restart...");
+                                if let Err(e) = stream.start() {
+                                    error!("Failed to restart stream: {}", e);
+                                    break;
+                                }
                             }
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                     
-                    // Clean shutdown
-                    info!("Stopping audio stream...");
+                    info!("Shutdown requested, stopping audio stream...");
                     if let Err(e) = stream.stop() {
                         error!("Error stopping stream: {}", e);
                     }
