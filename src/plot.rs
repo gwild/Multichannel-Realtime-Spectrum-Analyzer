@@ -205,7 +205,7 @@ impl eframe::App for MyApp {
                     let mut fft_config = self.fft_config.lock().unwrap();
                     fft_config.min_frequency = MIN_FREQ;
                     fft_config.max_frequency = MAX_FREQ;
-                    fft_config.db_threshold = -16.0;
+                    fft_config.db_threshold = -24.0;
                 }
                 
                 self.y_scale = 80.0;

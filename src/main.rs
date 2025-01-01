@@ -149,7 +149,7 @@ fn run() -> Result<()> {
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: MIN_FREQ,
         max_frequency: MAX_FREQ,
-        db_threshold: -16.0,
+        db_threshold: -24.0,
         num_channels: selected_channels.len(),
     }));
 
