@@ -2,7 +2,7 @@
 // Reminder: The following imports are protected. Any modification requires explicit permission.
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, RwLock, Mutex};
-use std::thread::{self, sleep};
+use std::thread;
 use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
@@ -19,6 +19,7 @@ pub struct FFTConfig {
     pub db_threshold: f64,
     pub num_channels: usize,
     pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
+    pub frames_per_buffer: u32,  // Add frames per buffer setting
 }
 
 /// Pre-computed Blackman-Harris window coefficients
@@ -76,7 +77,7 @@ pub fn start_fft_processing(
                 let mut all_channels_results = 
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-                for (channel_index, channel) in selected_channels.iter().enumerate() {
+                for (channel_index, _channel) in selected_channels.iter().enumerate() {
                     let buffer_data = extract_channel_data(&buffer_clone, channel_index, selected_channels.len());
 
                     let config = fft_config.lock().unwrap();

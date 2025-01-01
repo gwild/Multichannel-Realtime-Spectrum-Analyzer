@@ -152,6 +152,7 @@ fn run() -> Result<()> {
         db_threshold: -24.0,
         num_channels: selected_channels.len(),
         averaging_factor: 0.8,
+        frames_per_buffer: 512,
     }));
 
     let running = Arc::new(AtomicBool::new(false));

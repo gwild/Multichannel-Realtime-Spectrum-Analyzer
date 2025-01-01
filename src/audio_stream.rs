@@ -268,7 +268,7 @@ pub fn build_input_stream(
                 );
             }
 
-            let non_zero_count = args.buffer.iter().filter(|&&x| x != 0.0).count();
+            let _non_zero_count = args.buffer.iter().filter(|&&x| x != 0.0).count();
             
             // Process all data, not just non-zero
             let processed_samples = process_input_samples(

@@ -153,7 +153,10 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
-            // 1) Sliders for min freq, max freq, db threshold
+            // Before all controls
+            let mut size_changed = false;  // Single declaration for size_changed
+
+            // 1) First row of sliders
             {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
@@ -170,23 +173,60 @@ impl eframe::App for MyApp {
                 });
             }
 
-            // 2) Buffer size slider (no immediate clamp of max_frequency inside)
-            let size_changed = false;
-            let buffer_size = *self.buffer_size.lock().unwrap();
-            let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
-            ui.horizontal(|ui| {
-                ui.label("Buffer Size:");
-                let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
-                let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
-                if ui
-                    .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power).text("Power of 2"))
-                    .changed()
-                {
-                    let new_size = 1 << buffer_log_slider;
-                    self.update_buffer_size(new_size);
+            // 2) Second row with frames, buffer size, and averaging
+            {
+                ui.horizontal(|ui| {
+                    // Frames/Buffer slider
+                    {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        ui.label("Frames/Buffer:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.frames_per_buffer, 64..=2048)
+                                .text("frames")
+                                .logarithmic(true)
+                        );
+                    }
+
+                    // Buffer size slider
+                    {
+                        let buffer_size = *self.buffer_size.lock().unwrap();
+                        let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
+                        ui.label("Buffer Size:");
+                        let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
+                        let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
+                        if ui
+                            .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power).text("Power of 2"))
+                            .changed()
+                        {
+                            let new_size = 1 << buffer_log_slider;
+                            self.update_buffer_size(new_size);
+                            size_changed = true;  // Using the outer size_changed
+                        }
+                        ui.label(format!("{} samples", buffer_size));
+                    }
+
+                    // FFT Averaging slider
+                    {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        ui.label("FFT Averaging:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.averaging_factor, 0.0..=0.99)
+                                .text("α")
+                                .logarithmic(true)
+                        );
+                    }
+                });
+
+                // Handle max frequency adjustment if buffer size changed
+                if size_changed {
+                    let buffer_size = *self.buffer_size.lock().unwrap();
+                    let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    if fft_config.max_frequency > nyquist_limit {
+                        fft_config.max_frequency = nyquist_limit;
+                    }
                 }
-                ui.label(format!("{} samples", buffer_size));
-            });
+            }
 
             // 3) Sliders for Y scale, alpha, bar width
             ui.horizontal(|ui| {
@@ -206,6 +246,8 @@ impl eframe::App for MyApp {
                     fft_config.min_frequency = MIN_FREQ;
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
+                    fft_config.averaging_factor = 0.8;
+                    fft_config.frames_per_buffer = 512;  // Default frames per buffer
                 }
                 
                 self.y_scale = 80.0;
@@ -224,7 +266,7 @@ impl eframe::App for MyApp {
             if size_changed || reset_clicked {
                 let buffer_size = *self.buffer_size.lock().unwrap();
                 let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
-
+                
                 let mut fft_config = self.fft_config.lock().unwrap();
                 if fft_config.max_frequency > nyquist_limit {
                     fft_config.max_frequency = nyquist_limit;
