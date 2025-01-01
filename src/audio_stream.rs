@@ -214,24 +214,35 @@ pub fn build_input_stream(
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     
-    info!(
-        "Device details - Name: {}, Max channels: {}, Default SR: {}, Default latency: {}",
-        device_info.name,
-        device_info.max_input_channels,
-        device_info.default_sample_rate,
-        device_info.default_low_input_latency
-    );
+    error!("Building stream for device: {} with {} channels at {} Hz",
+        device_info.name, device_channels, sample_rate);
+
+    // Add Linux-specific debug info
+    #[cfg(target_os = "linux")]
+    {
+        error!("Linux audio config - Default latency: {}, Suggested latency: {}",
+            device_info.default_low_input_latency,
+            device_info.default_high_input_latency);
+    }
     
-    // Use device's default latency and a moderate buffer size
-    let frames_per_buffer = match sample_rate as u32 {
-        48000 => 512u32,  // Good balance for 48kHz
-        44100 => 441u32,  // Optimal for 44.1kHz
-        96000 => 1024u32, // Larger buffer for higher rates
-        _ => (sample_rate / 100.0) as u32  // Adaptive for other rates
+    // Adjust frames_per_buffer for Linux
+    let frames_per_buffer = if cfg!(target_os = "linux") {
+        1024u32  // Larger buffer for Linux stability
+    } else {
+        match sample_rate as u32 {
+            48000 => 512u32,
+            44100 => 441u32,
+            96000 => 1024u32,
+            _ => (sample_rate / 100.0) as u32
+        }
     };
 
-    let latency = device_info.default_low_input_latency.min(0.005); // Cap at 5ms
-    
+    let latency = if cfg!(target_os = "linux") {
+        device_info.default_high_input_latency  // Use higher latency on Linux
+    } else {
+        device_info.default_low_input_latency.min(0.005)
+    };
+
     let input_params = pa::StreamParameters::<f32>::new(
         device_index,
         device_channels as i32,
@@ -258,22 +269,24 @@ pub fn build_input_stream(
     info!("Stream settings - SR: {}, Latency: {}, Buffer: {}", sample_rate, latency, frames_per_buffer);
 
     let callback_count = Arc::new(AtomicUsize::new(0));
-    let callback_count_clone: Arc<AtomicUsize> = Arc::clone(&callback_count);
+    let callback_count_clone = Arc::clone(&callback_count);
+    let last_callback_time = Arc::new(Mutex::new(Instant::now()));
+    let last_callback_time_clone = Arc::clone(&last_callback_time);
 
     let stream = pa.open_non_blocking_stream(
         settings,
         move |args: InputCallbackArgs<f32>| {
             let count = callback_count_clone.fetch_add(1, Ordering::SeqCst);
             
-            if shutdown_flag.load(Ordering::SeqCst) {
-                info!("Shutdown flag detected in callback after {} calls", count);
-                return pa::Complete;
+            // Update last callback time
+            if let Ok(mut last_time) = last_callback_time_clone.lock() {
+                *last_time = Instant::now();
             }
 
-            // Log every 50th callback to track activity
+            // Log callback timing issues
             if count % 50 == 0 {
                 let max_value = args.buffer.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
-                info!(
+                error!(
                     "Callback #{} - Buffer: {} samples, Max amplitude: {:.6}, Time: {:?}",
                     count,
                     args.buffer.len(),
@@ -312,6 +325,7 @@ pub fn build_input_stream(
         },
     )?;
 
+    error!("Stream built successfully with {} frames per buffer", frames_per_buffer);
     Ok(stream)
 }
 
