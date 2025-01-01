@@ -247,7 +247,13 @@ impl eframe::App for MyApp {
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
                     fft_config.averaging_factor = 0.8;
-                    fft_config.frames_per_buffer = 512;  // Default frames per buffer
+                    
+                    // Platform-specific default frames per buffer
+                    fft_config.frames_per_buffer = if cfg!(target_os = "linux") {
+                        1024  // Larger buffer for Linux stability
+                    } else {
+                        512   // Default for other platforms
+                    };
                 }
                 
                 self.y_scale = 80.0;

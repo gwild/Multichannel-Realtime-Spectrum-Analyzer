@@ -14,6 +14,7 @@ use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use crate::fft_analysis::FFTConfig;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -23,6 +24,7 @@ use std::time::Instant;
 /// This buffer allows for continuous writing and reading of interleaved audio samples
 /// across multiple channels, maintaining a fixed size by overwriting the oldest data
 /// when new samples arrive.
+#[allow(dead_code)]
 pub struct CircularBuffer {
     buffer: Vec<f32>,
     head: usize,
@@ -164,14 +166,17 @@ impl CircularBuffer {
         self.needs_restart.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn clear_restart_flag(&self) {
         self.needs_restart.store(false, Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
     pub fn needs_reinit(&self) -> bool {
         self.force_reinit.load(Ordering::SeqCst)
     }
 
+    #[allow(dead_code)]
     pub fn clear_reinit_flag(&self) {
         self.force_reinit.store(false, Ordering::SeqCst);
     }
@@ -199,6 +204,7 @@ impl CircularBuffer {
 /// * `sample_rate` - The sampling rate for the audio stream.
 /// * `audio_buffer` - Shared circular buffer for storing interleaved audio samples.
 /// * `shutdown_flag` - Atomic flag to indicate stream shutdown.
+/// * `fft_config` - Shared mutex-protected FFTConfig for stream configuration.
 ///
 /// # Returns
 ///
@@ -211,6 +217,7 @@ pub fn build_input_stream(
     sample_rate: f32,
     audio_buffer: Arc<RwLock<CircularBuffer>>,
     _shutdown_flag: Arc<AtomicBool>,
+    fft_config: Arc<Mutex<FFTConfig>>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     
@@ -225,7 +232,7 @@ pub fn build_input_stream(
             device_info.default_high_input_latency);
     }
     
-    // Adjust frames_per_buffer for Linux
+    // Get frames_per_buffer from FFTConfig if available
     let frames_per_buffer = if cfg!(target_os = "linux") {
         1024u32  // Larger buffer for Linux stability
     } else {
@@ -236,6 +243,14 @@ pub fn build_input_stream(
             _ => (sample_rate / 100.0) as u32
         }
     };
+
+    // Update FFTConfig to match actual frames per buffer
+    if let Ok(buffer) = audio_buffer.read() {
+        if let Ok(mut fft_config) = fft_config.lock() {
+            fft_config.frames_per_buffer = frames_per_buffer;
+            info!("Updated FFTConfig frames_per_buffer to match stream: {}", frames_per_buffer);
+        }
+    }
 
     let latency = if cfg!(target_os = "linux") {
         device_info.default_high_input_latency  // Use higher latency on Linux
@@ -378,6 +393,7 @@ pub fn process_input_samples(input: &[f32], device_channels: usize, selected_cha
 /// * `device_index` - The index of the selected audio input device.
 /// * `shutdown_flag` - Atomic flag to indicate stream shutdown.
 /// * `stream_ready` - Atomic flag to indicate stream readiness.
+/// * `fft_config` - Shared mutex-protected FFTConfig for stream configuration.
 pub fn start_sampling_thread(
     running: Arc<AtomicBool>,
     main_buffer: Arc<RwLock<CircularBuffer>>,
@@ -387,6 +403,7 @@ pub fn start_sampling_thread(
     device_index: pa::DeviceIndex,
     shutdown_flag: Arc<AtomicBool>,
     stream_ready: Arc<AtomicBool>,
+    fft_config: Arc<Mutex<FFTConfig>>,
 ) {
     const RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
@@ -421,6 +438,7 @@ pub fn start_sampling_thread(
             sample_rate as f32,
             Arc::clone(&main_buffer),
             Arc::clone(&shutdown_flag),
+            Arc::clone(&fft_config),
         );
 
         match stream_result {
@@ -550,6 +568,7 @@ pub fn start_sampling_thread(
     running.store(false, Ordering::SeqCst);
 }
 
+#[allow(dead_code)]
 pub fn calculate_optimal_buffer_size(sample_rate: f32) -> usize {
     // Convert MIN_FREQ and MAX_FREQ from f64 to f32 for calculations
     let min_freq = MIN_FREQ as f32;

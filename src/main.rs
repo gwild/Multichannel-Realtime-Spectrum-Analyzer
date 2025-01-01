@@ -149,13 +149,24 @@ fn run() -> Result<()> {
         selected_channels.len()
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
+    let frames_per_buffer = if cfg!(target_os = "linux") {
+        1024u32  // Larger buffer for Linux stability
+    } else {
+        match selected_sample_rate as u32 {
+            48000 => 512u32,
+            44100 => 441u32,
+            96000 => 1024u32,
+            _ => (selected_sample_rate / 100.0) as u32
+        }
+    };
+
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: MIN_FREQ,
         max_frequency: MAX_FREQ,
         db_threshold: -24.0,
         num_channels: selected_channels.len(),
         averaging_factor: 0.8,
-        frames_per_buffer: 512,
+        frames_per_buffer,  // Use the calculated value
     }));
 
     let running = Arc::new(AtomicBool::new(false));
@@ -170,6 +181,7 @@ fn run() -> Result<()> {
 
     // Start audio thread
     info!("Starting audio sampling thread...");
+    let fft_config_clone = Arc::clone(&fft_config);
     let audio_thread = std::thread::spawn(move || {
         start_sampling_thread(
             running,
@@ -180,6 +192,7 @@ fn run() -> Result<()> {
             selected_device_index,
             shutdown_flag_audio,
             stream_ready_audio,
+            fft_config_clone,
         );
     });
 
