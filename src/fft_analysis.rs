@@ -18,6 +18,7 @@ pub struct FFTConfig {
     pub max_frequency: f64,
     pub db_threshold: f64,
     pub num_channels: usize,
+    pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
 }
 
 /// Pre-computed Blackman-Harris window coefficients
@@ -55,48 +56,46 @@ impl BlackmanHarris {
 
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
-    audio_buffer: Arc<RwLock<CircularBuffer>>,  // Single buffer for all channels
+    audio_buffer: Arc<RwLock<CircularBuffer>>,
     fft_config: Arc<Mutex<FFTConfig>>,
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     selected_channels: Vec<usize>,
     sample_rate: u32,
-    shutdown_flag: Arc<AtomicBool>,  // Accept shutdown flag
+    shutdown_flag: Arc<AtomicBool>,
 ) {
+    let mut prev_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
+
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                // Clone the circular buffer for processing
                 let buffer_clone = {
                     let buffer = audio_buffer.read().unwrap();
                     buffer.clone_data()
                 };
 
-                let mut all_channels_results =
+                let mut all_channels_results = 
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-                // Process each channel separately by de-interleaving the buffer
                 for (channel_index, channel) in selected_channels.iter().enumerate() {
                     let buffer_data = extract_channel_data(&buffer_clone, channel_index, selected_channels.len());
 
-                    let sum: f32 = buffer_data.iter().map(|&x| x.abs()).sum();
-                    if sum == 0.0 {
-                        warn!("Buffer for channel {} is empty, skipping FFT.", channel);
-                        continue;
-                    }
-
                     let config = fft_config.lock().unwrap();
-                    let spectrum = compute_spectrum(&buffer_data, sample_rate, &*config);
+                    let spectrum = compute_spectrum(
+                        &buffer_data, 
+                        sample_rate, 
+                        &*config,
+                        Some(&prev_results[channel_index])
+                    );
 
-                    all_channels_results[channel_index] = spectrum;
+                    all_channels_results[channel_index] = spectrum.clone();
+                    prev_results[channel_index] = spectrum;
                 }
 
-                // Update the plot after FFT processing
                 if let Ok(mut spectrum) = spectrum_app.lock() {
                     spectrum.update_partials(all_channels_results);
                 }
 
-                // Process FFT every 100ms
-                sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(100));
             }));
 
             if let Err(e) = result {
@@ -117,7 +116,12 @@ fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> 
 }
 
 /// Computes the frequency spectrum from the audio buffer.
-pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) -> Vec<(f32, f32)> {
+pub fn compute_spectrum(
+    buffer: &[f32], 
+    sample_rate: u32, 
+    config: &FFTConfig,
+    prev_magnitudes: Option<&[(f32, f32)]>
+) -> Vec<(f32, f32)> {
     if buffer.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
@@ -172,5 +176,19 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
     }
 
     magnitudes.truncate(NUM_PARTIALS);
-    magnitudes
+
+    let mut smoothed_magnitudes = Vec::with_capacity(NUM_PARTIALS);
+    for (i, &(freq, amp)) in magnitudes.iter().enumerate() {
+        let prev_amp = prev_magnitudes
+            .and_then(|prev| prev.get(i))
+            .map(|&(_, a)| a)
+            .unwrap_or(amp);
+            
+        let smoothed_amp = config.averaging_factor * prev_amp + 
+            (1.0 - config.averaging_factor) * amp;
+            
+        smoothed_magnitudes.push((freq, smoothed_amp));
+    }
+
+    smoothed_magnitudes
 }

@@ -151,6 +151,7 @@ fn run() -> Result<()> {
         max_frequency: MAX_FREQ,
         db_threshold: -24.0,
         num_channels: selected_channels.len(),
+        averaging_factor: 0.8,
     }));
 
     let running = Arc::new(AtomicBool::new(false));
