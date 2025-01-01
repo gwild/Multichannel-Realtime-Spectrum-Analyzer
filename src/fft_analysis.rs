@@ -20,6 +20,38 @@ pub struct FFTConfig {
     pub num_channels: usize,
 }
 
+/// Pre-computed Blackman-Harris window coefficients
+struct BlackmanHarris {
+    coefficients: Vec<f32>,
+}
+
+impl BlackmanHarris {
+    fn new(size: usize) -> Self {
+        let alpha0 = 0.35875;
+        let alpha1 = 0.48829;
+        let alpha2 = 0.14128;
+        let alpha3 = 0.01168;
+        
+        let coefficients = (0..size)
+            .map(|i| {
+                let x = i as f32 / (size - 1) as f32;
+                alpha0
+                    - alpha1 * (2.0 * std::f32::consts::PI * x).cos()
+                    + alpha2 * (4.0 * std::f32::consts::PI * x).cos()
+                    - alpha3 * (6.0 * std::f32::consts::PI * x).cos()
+            })
+            .collect();
+            
+        BlackmanHarris { coefficients }
+    }
+    
+    fn apply(&self, buffer: &[f32]) -> Vec<f32> {
+        buffer.iter()
+            .zip(self.coefficients.iter())
+            .map(|(&sample, &coef)| sample * coef)
+            .collect()
+    }
+}
 
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
@@ -102,7 +134,9 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    let windowed_buffer: Vec<f32> = apply_blackman_harris(&filtered_buffer);
+    // Create window once for this buffer size
+    let window = BlackmanHarris::new(filtered_buffer.len());
+    let windowed_buffer = window.apply(&filtered_buffer);
 
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(windowed_buffer.len());
@@ -139,24 +173,4 @@ pub fn compute_spectrum(buffer: &[f32], sample_rate: u32, config: &FFTConfig) ->
 
     magnitudes.truncate(NUM_PARTIALS);
     magnitudes
-}
-
-/// Applies Blackman-Harris windowing to the audio buffer.
-fn apply_blackman_harris(buffer: &[f32]) -> Vec<f32> {
-    let n = buffer.len();
-    buffer
-        .iter()
-        .enumerate()
-        .map(|(i, &sample)| {
-            let alpha0 = 0.35875;
-            let alpha1 = 0.48829;
-            let alpha2 = 0.14128;
-            let alpha3 = 0.01168;
-            let factor = alpha0
-                - alpha1 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos()
-                + alpha2 * (4.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos()
-                - alpha3 * (6.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
-            sample * factor
-        })
-        .collect()
 }

@@ -11,6 +11,8 @@ use log::{info, error};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
+use std::thread;
+use std::time::Duration;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -25,6 +27,7 @@ pub struct CircularBuffer {
     head: usize,
     size: usize,
     channels: usize,
+    needs_restart: Arc<AtomicBool>,
 }
 
 impl CircularBuffer {
@@ -41,6 +44,7 @@ impl CircularBuffer {
             head: 0,
             size,
             channels,
+            needs_restart: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -110,7 +114,7 @@ impl CircularBuffer {
     ///
     /// * `new_size` - The new maximum number of frames the buffer can hold.
     pub fn resize(&mut self, new_size: usize) {
-        info!("Resizing buffer from {} to {} frames ({} channels)", 
+        info!("Buffer resize requested - Current: {}, New: {} frames ({} channels)", 
             self.size, new_size, self.channels);
         
         // Create new buffer
@@ -130,10 +134,22 @@ impl CircularBuffer {
         self.head = 0;  // Reset head since we've reordered the data
         self.size = new_size;
         
+        // Signal that stream needs restart
+        self.needs_restart.store(true, Ordering::SeqCst);
+        info!("Stream restart requested due to buffer resize");
+        
         // Log buffer state after resize
         let non_zero = self.buffer.iter().filter(|&&x| x != 0.0).count();
         info!("Buffer after resize - Size: {}, Channels: {}, Non-zero samples: {}", 
             self.size, self.channels, non_zero);
+    }
+
+    pub fn needs_restart(&self) -> bool {
+        self.needs_restart.load(Ordering::SeqCst)
+    }
+
+    pub fn clear_restart_flag(&self) {
+        self.needs_restart.store(false, Ordering::SeqCst);
     }
 }
 
@@ -325,85 +341,139 @@ pub fn start_sampling_thread(
     shutdown_flag: Arc<AtomicBool>,
     stream_ready: Arc<AtomicBool>,
 ) {
-    let pa = pa::PortAudio::new().expect("Failed to initialize PortAudio");
-    info!("PortAudio initialized for sampling thread.");
+    let mut restart_attempts = 0;
+    const MAX_RESTART_ATTEMPTS: u32 = 3;
+    const RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
-    let device_info = pa.device_info(device_index).unwrap();
-    let device_channels = device_info.max_input_channels as usize;
-    
-    info!("Initializing main audio stream...");
-    
-    // Create and start the stream
-    let stream_result = build_input_stream(
-        &pa,
-        device_index,
-        device_channels,
-        selected_channels.clone(),
-        sample_rate as f32,
-        Arc::clone(&main_buffer),
-        Arc::clone(&shutdown_flag),
-    );
+    while !shutdown_flag.load(Ordering::SeqCst) {
+        let pa = match pa::PortAudio::new() {
+            Ok(pa) => pa,
+            Err(e) => {
+                error!("Failed to initialize PortAudio: {}", e);
+                thread::sleep(RESTART_COOLDOWN);
+                continue;
+            }
+        };
+        
+        info!("PortAudio initialized for sampling thread.");
 
-    match stream_result {
-        Ok(mut stream) => {
-            info!("Successfully built input stream");
-            match stream.start() {
-                Ok(_) => {
-                    info!("Audio stream started successfully");
-                    running.store(true, Ordering::SeqCst);
-                    
-                    // Wait for first batch of data
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    
-                    // Signal that stream is ready
-                    stream_ready.store(true, Ordering::SeqCst);
-                    info!("Audio stream ready for FFT processing");
-                    
-                    // Keep checking stream health until shutdown
-                    while !shutdown_flag.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Get device info and channels
+        let device_info = match pa.device_info(device_index) {
+            Ok(info) => info,
+            Err(e) => {
+                error!("Failed to get device info: {}", e);
+                thread::sleep(RESTART_COOLDOWN);
+                continue;
+            }
+        };
+        let device_channels = device_info.max_input_channels as usize;
+
+        let stream_result = build_input_stream(
+            &pa,
+            device_index,
+            device_channels,
+            selected_channels.clone(),
+            sample_rate as f32,
+            Arc::clone(&main_buffer),
+            Arc::clone(&shutdown_flag),
+        );
+
+        match stream_result {
+            Ok(mut stream) => {
+                info!("Successfully built input stream");
+                match stream.start() {
+                    Ok(_) => {
+                        info!("Audio stream started successfully");
+                        running.store(true, Ordering::SeqCst);
+                        restart_attempts = 0; // Reset attempts on successful start
                         
-                        // Check if stream is still active
-                        if let Ok(is_active) = stream.is_active() {
-                            if !is_active {
-                                error!("Stream became inactive, attempting restart...");
-                                running.store(false, Ordering::SeqCst);  // Mark as not running
-                                
-                                if let Err(e) = stream.start() {
-                                    error!("Failed to restart stream: {}", e);
-                                    // Keep trying to restart until shutdown
+                        // Wait for first batch of data
+                        thread::sleep(Duration::from_millis(500));
+                        stream_ready.store(true, Ordering::SeqCst);
+                        info!("Audio stream ready for FFT processing");
+                        
+                        // Monitor stream health
+                        while !shutdown_flag.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(100));
+                            
+                            // Check if buffer was resized
+                            if let Ok(buffer) = main_buffer.read() {
+                                if buffer.needs_restart() {
+                                    info!("Processing buffer resize restart request");
+                                    running.store(false, Ordering::SeqCst);
+                                    info!("Stopping stream for resize-triggered restart...");
+                                    
+                                    if let Err(e) = stream.stop().and_then(|_| {
+                                        info!("Stream stopped, attempting restart...");
+                                        stream.start()
+                                    }) {
+                                        error!("Failed to restart stream after resize: {}", e);
+                                        break; // Break to reinitialize
+                                    }
+                                    
+                                    info!("Stream successfully restarted after resize");
+                                    buffer.clear_restart_flag();
+                                    running.store(true, Ordering::SeqCst);
                                     continue;
                                 }
-                                running.store(true, Ordering::SeqCst);  // Mark as running again
                             }
-                        }
+                            
+                            let needs_restart = match (stream.is_active(), stream.is_stopped()) {
+                                (Ok(false), _) => {
+                                    error!("Stream became inactive");
+                                    true
+                                },
+                                (_, Ok(true)) => {
+                                    error!("Stream stopped unexpectedly");
+                                    true
+                                },
+                                (Err(e), _) | (_, Err(e)) => {
+                                    error!("Error checking stream status: {}", e);
+                                    true
+                                },
+                                _ => false,
+                            };
 
-                        // Check if stream is stopped
-                        if let Ok(is_stopped) = stream.is_stopped() {
-                            if is_stopped && !shutdown_flag.load(Ordering::SeqCst) {
-                                info!("Stream stopped unexpectedly, attempting restart...");
+                            if needs_restart {
                                 running.store(false, Ordering::SeqCst);
+                                restart_attempts += 1;
                                 
-                                if let Err(e) = stream.start() {
+                                if restart_attempts > MAX_RESTART_ATTEMPTS {
+                                    error!("Max restart attempts reached, reinitializing audio system");
+                                    break; // Break inner loop to reinitialize PortAudio
+                                }
+
+                                info!("Attempting stream restart ({}/{})", restart_attempts, MAX_RESTART_ATTEMPTS);
+                                if let Err(e) = stream.stop().and_then(|_| stream.start()) {
                                     error!("Failed to restart stream: {}", e);
-                                    continue;
+                                    break; // Break to reinitialize
                                 }
                                 running.store(true, Ordering::SeqCst);
                             }
                         }
+                    },
+                    Err(e) => {
+                        error!("Failed to start stream: {}", e);
+                        thread::sleep(RESTART_COOLDOWN);
                     }
-                    
-                    info!("Shutdown requested, cleaning up stream...");
-                    running.store(false, Ordering::SeqCst);
-                    if let Err(e) = stream.stop() {
-                        error!("Error stopping stream: {}", e);
-                    }
-                },
-                Err(e) => error!("Failed to start stream: {}", e),
+                }
+            },
+            Err(e) => {
+                error!("Failed to build input stream: {}", e);
+                thread::sleep(RESTART_COOLDOWN);
             }
-        },
-        Err(e) => error!("Failed to build input stream: {}", e),
+        }
+
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Cool down before attempting full reinit
+        thread::sleep(RESTART_COOLDOWN);
     }
+    
+    info!("Audio sampling thread shutting down");
+    running.store(false, Ordering::SeqCst);
 }
 
 pub fn calculate_optimal_buffer_size(sample_rate: f32) -> usize {
