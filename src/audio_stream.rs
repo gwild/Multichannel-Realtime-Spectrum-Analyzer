@@ -28,6 +28,7 @@ pub struct CircularBuffer {
     size: usize,
     channels: usize,
     needs_restart: Arc<AtomicBool>,
+    force_reinit: Arc<AtomicBool>,
 }
 
 impl CircularBuffer {
@@ -45,6 +46,7 @@ impl CircularBuffer {
             size,
             channels,
             needs_restart: Arc::new(AtomicBool::new(false)),
+            force_reinit: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -134,7 +136,13 @@ impl CircularBuffer {
         self.head = 0;  // Reset head since we've reordered the data
         self.size = new_size;
         
-        // Signal that stream needs restart
+        // On Linux, force a complete reinit
+        #[cfg(target_os = "linux")]
+        {
+            info!("Linux detected, forcing complete stream reinitialization");
+            self.force_reinit.store(true, Ordering::SeqCst);
+        }
+        
         self.needs_restart.store(true, Ordering::SeqCst);
         info!("Stream restart requested due to buffer resize");
         
@@ -150,6 +158,14 @@ impl CircularBuffer {
 
     pub fn clear_restart_flag(&self) {
         self.needs_restart.store(false, Ordering::SeqCst);
+    }
+
+    pub fn needs_reinit(&self) -> bool {
+        self.force_reinit.load(Ordering::SeqCst)
+    }
+
+    pub fn clear_reinit_flag(&self) {
+        self.force_reinit.store(false, Ordering::SeqCst);
     }
 }
 
@@ -265,6 +281,8 @@ pub fn build_input_stream(
                 buffer.push_batch(&processed_samples);
             }
 
+            // Comment out verbose callback logging
+            /*
             if non_zero_count > 0 {
                 info!(
                     "Audio data - Callback #{}, Non-zero: {}/{}, First few: {:?}",
@@ -274,6 +292,7 @@ pub fn build_input_stream(
                     args.buffer.iter().take(4).collect::<Vec<_>>()
                 );
             }
+            */
 
             pa::Continue
         },
@@ -401,19 +420,37 @@ pub fn start_sampling_thread(
                                 if buffer.needs_restart() {
                                     info!("Processing buffer resize restart request");
                                     running.store(false, Ordering::SeqCst);
-                                    info!("Stopping stream for resize-triggered restart...");
                                     
-                                    if let Err(e) = stream.stop().and_then(|_| {
-                                        info!("Stream stopped, attempting restart...");
-                                        stream.start()
-                                    }) {
-                                        error!("Failed to restart stream after resize: {}", e);
-                                        break; // Break to reinitialize
+                                    if buffer.needs_reinit() {
+                                        info!("Full reinitialization requested");
+                                        buffer.clear_restart_flag();
+                                        buffer.clear_reinit_flag();
+                                        break;  // Break to outer loop for complete reinit
                                     }
-                                    
-                                    info!("Stream successfully restarted after resize");
-                                    buffer.clear_restart_flag();
-                                    running.store(true, Ordering::SeqCst);
+
+                                    // First try to stop the stream
+                                    if let Err(e) = stream.stop() {
+                                        error!("Failed to stop stream cleanly: {}", e);
+                                        // On Linux, we might need to force a complete reinit
+                                        break; // Break to outer loop for full reinit
+                                    }
+
+                                    // Give the system time to release resources
+                                    thread::sleep(Duration::from_millis(100));
+
+                                    info!("Stream stopped, attempting restart...");
+                                    match stream.start() {
+                                        Ok(_) => {
+                                            info!("Stream successfully restarted after resize");
+                                            buffer.clear_restart_flag();
+                                            running.store(true, Ordering::SeqCst);
+                                        },
+                                        Err(e) => {
+                                            error!("Failed to restart stream: {}", e);
+                                            // On Linux, break to outer loop for full reinit
+                                            break;
+                                        }
+                                    }
                                     continue;
                                 }
                             }
