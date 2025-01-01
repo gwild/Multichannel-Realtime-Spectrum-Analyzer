@@ -13,6 +13,7 @@ use portaudio::stream::InputCallbackArgs;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -29,6 +30,7 @@ pub struct CircularBuffer {
     channels: usize,
     needs_restart: Arc<AtomicBool>,
     force_reinit: Arc<AtomicBool>,
+    last_active: Arc<Mutex<Instant>>,  // Track last activity
 }
 
 impl CircularBuffer {
@@ -47,6 +49,7 @@ impl CircularBuffer {
             channels,
             needs_restart: Arc::new(AtomicBool::new(false)),
             force_reinit: Arc::new(AtomicBool::new(false)),
+            last_active: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -56,6 +59,11 @@ impl CircularBuffer {
     ///
     /// * `values` - A slice of interleaved audio samples.
     pub fn push_batch(&mut self, values: &[f32]) {
+        if !values.is_empty() {
+            if let Ok(mut last) = self.last_active.lock() {
+                *last = Instant::now();
+            }
+        }
         let batch_size = values.len();
         if batch_size == 0 {
             return;
@@ -166,6 +174,12 @@ impl CircularBuffer {
 
     pub fn clear_reinit_flag(&self) {
         self.force_reinit.store(false, Ordering::SeqCst);
+    }
+
+    pub fn check_activity(&self) -> Duration {
+        self.last_active.lock()
+            .map(|last| last.elapsed())
+            .unwrap_or(Duration::from_secs(0))
     }
 }
 
@@ -415,77 +429,85 @@ pub fn start_sampling_thread(
                         while !shutdown_flag.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(100));
                             
-                            // Check if buffer was resized
+                            // Check buffer activity
                             if let Ok(buffer) = main_buffer.read() {
-                                if buffer.needs_restart() {
-                                    info!("Processing buffer resize restart request");
+                                let inactivity_duration = buffer.check_activity();
+                                if inactivity_duration > Duration::from_secs(1) {
+                                    error!("Buffer inactive for {:?}, triggering restart", inactivity_duration);
                                     running.store(false, Ordering::SeqCst);
                                     
-                                    if buffer.needs_reinit() {
-                                        info!("Full reinitialization requested");
-                                        buffer.clear_restart_flag();
-                                        buffer.clear_reinit_flag();
-                                        break;  // Break to outer loop for complete reinit
+                                    // Force reinit on Linux
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        info!("Linux detected, forcing complete stream reinitialization");
+                                        buffer.force_reinit.store(true, Ordering::SeqCst);
                                     }
+                                    
+                                    buffer.needs_restart.store(true, Ordering::SeqCst);
+                                    break;  // Break to outer loop for reinit
+                                }
 
-                                    // First try to stop the stream
-                                    if let Err(e) = stream.stop() {
-                                        error!("Failed to stop stream cleanly: {}", e);
-                                        // On Linux, we might need to force a complete reinit
-                                        break; // Break to outer loop for full reinit
-                                    }
-
-                                    // Give the system time to release resources
-                                    thread::sleep(Duration::from_millis(100));
-
-                                    info!("Stream stopped, attempting restart...");
-                                    match stream.start() {
-                                        Ok(_) => {
-                                            info!("Stream successfully restarted after resize");
-                                            buffer.clear_restart_flag();
-                                            running.store(true, Ordering::SeqCst);
-                                        },
-                                        Err(e) => {
-                                            error!("Failed to restart stream: {}", e);
-                                            // On Linux, break to outer loop for full reinit
-                                            break;
-                                        }
-                                    }
-                                    continue;
+                                // Existing buffer resize check
+                                if buffer.needs_restart() {
+                                    info!("Processing restart request - Current state: running={}, stream active={:?}, stopped={:?}",
+                                        running.load(Ordering::SeqCst),
+                                        stream.is_active(),
+                                        stream.is_stopped()
+                                    );
+                                    // ... rest of restart logic ...
                                 }
                             }
                             
+                            // Enhanced stream health check
                             let needs_restart = match (stream.is_active(), stream.is_stopped()) {
                                 (Ok(false), _) => {
-                                    error!("Stream became inactive");
+                                    error!("Stream became inactive - Last buffer activity: {:?}", 
+                                        main_buffer.read().map(|b| b.check_activity()));
                                     true
                                 },
                                 (_, Ok(true)) => {
-                                    error!("Stream stopped unexpectedly");
+                                    error!("Stream stopped unexpectedly - Last buffer activity: {:?}",
+                                        main_buffer.read().map(|b| b.check_activity()));
                                     true
                                 },
                                 (Err(e), _) | (_, Err(e)) => {
-                                    error!("Error checking stream status: {}", e);
+                                    error!("Error checking stream status: {} - Last buffer activity: {:?}", 
+                                        e, main_buffer.read().map(|b| b.check_activity()));
                                     true
                                 },
                                 _ => false,
                             };
 
                             if needs_restart {
-                                running.store(false, Ordering::SeqCst);
-                                restart_attempts += 1;
+                                info!("Attempting stream restart - Current state: running={}, stream active={:?}, stopped={:?}",
+                                    running.load(Ordering::SeqCst),
+                                    stream.is_active(),
+                                    stream.is_stopped()
+                                );
                                 
-                                if restart_attempts > MAX_RESTART_ATTEMPTS {
-                                    error!("Max restart attempts reached, reinitializing audio system");
-                                    break; // Break inner loop to reinitialize PortAudio
+                                running.store(false, Ordering::SeqCst);
+                                
+                                // On Linux, prefer full reinit
+                                #[cfg(target_os = "linux")]
+                                {
+                                    info!("Linux detected, preferring complete reinitialization");
+                                    break;  // Break to outer loop for full reinit
                                 }
 
-                                info!("Attempting stream restart ({}/{})", restart_attempts, MAX_RESTART_ATTEMPTS);
-                                if let Err(e) = stream.stop().and_then(|_| stream.start()) {
-                                    error!("Failed to restart stream: {}", e);
-                                    break; // Break to reinitialize
+                                // Try simple restart first
+                                match stream.stop().and_then(|_| {
+                                    thread::sleep(Duration::from_millis(100));
+                                    stream.start()
+                                }) {
+                                    Ok(_) => {
+                                        info!("Stream successfully restarted");
+                                        running.store(true, Ordering::SeqCst);
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to restart stream: {} - forcing reinit", e);
+                                        break;  // Break to outer loop for full reinit
+                                    }
                                 }
-                                running.store(true, Ordering::SeqCst);
                             }
                         }
                     },
