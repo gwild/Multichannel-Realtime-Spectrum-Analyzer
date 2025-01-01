@@ -210,17 +210,17 @@ pub fn build_input_stream(
     selected_channels: Vec<usize>,
     sample_rate: f32,
     audio_buffer: Arc<RwLock<CircularBuffer>>,
-    shutdown_flag: Arc<AtomicBool>,
+    _shutdown_flag: Arc<AtomicBool>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     
-    error!("Building stream for device: {} with {} channels at {} Hz",
+    info!("Building stream for device: {} with {} channels at {} Hz",
         device_info.name, device_channels, sample_rate);
 
     // Add Linux-specific debug info
     #[cfg(target_os = "linux")]
     {
-        error!("Linux audio config - Default latency: {}, Suggested latency: {}",
+        info!("Linux audio config - Default latency: {}, Suggested latency: {}",
             device_info.default_low_input_latency,
             device_info.default_high_input_latency);
     }
@@ -286,7 +286,7 @@ pub fn build_input_stream(
             // Log callback timing issues
             if count % 50 == 0 {
                 let max_value = args.buffer.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
-                error!(
+                info!(
                     "Callback #{} - Buffer: {} samples, Max amplitude: {:.6}, Time: {:?}",
                     count,
                     args.buffer.len(),
@@ -325,7 +325,7 @@ pub fn build_input_stream(
         },
     )?;
 
-    error!("Stream built successfully with {} frames per buffer", frames_per_buffer);
+    info!("Stream built successfully with {} frames per buffer", frames_per_buffer);
     Ok(stream)
 }
 
@@ -388,8 +388,6 @@ pub fn start_sampling_thread(
     shutdown_flag: Arc<AtomicBool>,
     stream_ready: Arc<AtomicBool>,
 ) {
-    let mut restart_attempts = 0;
-    const MAX_RESTART_ATTEMPTS: u32 = 3;
     const RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
     while !shutdown_flag.load(Ordering::SeqCst) {
@@ -432,7 +430,6 @@ pub fn start_sampling_thread(
                     Ok(_) => {
                         info!("Audio stream started successfully");
                         running.store(true, Ordering::SeqCst);
-                        restart_attempts = 0; // Reset attempts on successful start
                         
                         // Wait for first batch of data
                         thread::sleep(Duration::from_millis(500));
@@ -508,18 +505,22 @@ pub fn start_sampling_thread(
                                     break;  // Break to outer loop for full reinit
                                 }
 
-                                // Try simple restart first
-                                match stream.stop().and_then(|_| {
-                                    thread::sleep(Duration::from_millis(100));
-                                    stream.start()
-                                }) {
-                                    Ok(_) => {
-                                        info!("Stream successfully restarted");
-                                        running.store(true, Ordering::SeqCst);
-                                    },
-                                    Err(e) => {
-                                        error!("Failed to restart stream: {} - forcing reinit", e);
-                                        break;  // Break to outer loop for full reinit
+                                // Non-Linux platforms try simple restart
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    // Try simple restart first
+                                    match stream.stop().and_then(|_| {
+                                        thread::sleep(Duration::from_millis(100));
+                                        stream.start()
+                                    }) {
+                                        Ok(_) => {
+                                            info!("Stream successfully restarted");
+                                            running.store(true, Ordering::SeqCst);
+                                        },
+                                        Err(e) => {
+                                            error!("Failed to restart stream: {} - forcing reinit", e);
+                                            break;  // Break to outer loop for full reinit
+                                        }
                                     }
                                 }
                             }
