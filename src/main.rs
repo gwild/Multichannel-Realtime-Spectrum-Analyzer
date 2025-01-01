@@ -23,7 +23,10 @@ use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
 fn main() {
     // Only set up logging if --enable-logs flag is present
     if std::env::args().any(|arg| arg == "--enable-logs") {
-        env::set_var("RUST_LOG", "info");
+        // Only set RUST_LOG if it's not already set
+        if std::env::var("RUST_LOG").is_err() {
+            env::set_var("RUST_LOG", "info");
+        }
         env_logger::init();
         info!("Application starting...");
     }
