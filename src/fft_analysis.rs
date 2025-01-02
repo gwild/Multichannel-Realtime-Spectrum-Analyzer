@@ -139,13 +139,18 @@ pub fn compute_spectrum(
     magnitudes.retain(|&(freq, _)| {
         freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
     });
-    magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort by amplitude descending
 
-    // Ensure we have exactly NUM_PARTIALS entries
+    // First sort by amplitude to get top NUM_PARTIALS
+    magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort by amplitude descending
+    magnitudes.truncate(NUM_PARTIALS);  // Keep top NUM_PARTIALS amplitudes
+
+    // Then sort these by frequency
+    magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap()); // Sort by frequency ascending
+
+    // Pad with zeros if needed
     while magnitudes.len() < NUM_PARTIALS {
         magnitudes.push((0.0, 0.0));
     }
-    magnitudes.truncate(NUM_PARTIALS);
 
     // Apply smoothing
     let mut smoothed_magnitudes = Vec::with_capacity(NUM_PARTIALS);
