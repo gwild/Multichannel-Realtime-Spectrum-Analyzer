@@ -48,7 +48,7 @@ pub fn start_pitch_detection(
             // Ensure hop size is never larger than buffer size
             let hop_size = frames_per_buffer.min(buffer_size);
             Pitch::new(
-                PitchMode::Yinfft,  // Try different mode
+                PitchMode::Yinfft,  // Back to Yinfft which was working
                 buffer_size,
                 hop_size,
                 sample_rate,

@@ -293,7 +293,7 @@ impl eframe::App for MyApp {
                 .map(|(channel, channel_partials)| {
                     let bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(_, amp)| amp > 0.0)  // Only filter zeros for the bar chart
+                        .filter(|&&(freq, amp)| freq > 0.0 && amp > 0.0)  // Filter both zero frequencies and amplitudes
                         .map(|&(freq, amp)| {
                             egui::plot::Bar::new(freq as f64, amp as f64)
                                 .width(self.bar_width as f64)
