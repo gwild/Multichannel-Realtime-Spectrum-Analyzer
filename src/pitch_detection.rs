@@ -46,18 +46,23 @@ pub fn start_pitch_detection(
         .iter()
         .map(|_| {
             // Use platform-specific settings that are known to work
-            let (win_size, hop_size) = if cfg!(target_os = "linux") {
-                (2048, 1024)  // Fixed sizes for Linux
+            if cfg!(target_os = "linux") {
+                // Use YIN algorithm for Linux with dynamic sizes
+                Pitch::new(
+                    PitchMode::Yin,  // YIN mode for Linux
+                    buffer_size,
+                    frames_per_buffer.min(buffer_size),
+                    sample_rate,
+                ).expect("Failed to create pitch detector")
             } else {
-                (buffer_size, frames_per_buffer.min(buffer_size))  // Dynamic sizes for OSX
-            };
-
-            Pitch::new(
-                PitchMode::Yinfft,
-                win_size,
-                hop_size,
-                sample_rate,
-            ).expect("Failed to create pitch detector")
+                // Keep Yinfft for OSX where it's working
+                Pitch::new(
+                    PitchMode::Yinfft,
+                    buffer_size,
+                    frames_per_buffer.min(buffer_size),
+                    sample_rate,
+                ).expect("Failed to create pitch detector")
+            }
         })
         .collect();
 
@@ -71,28 +76,32 @@ pub fn start_pitch_detection(
                     frames_per_buffer = config.frames_per_buffer as usize;
                 }
                 
-                // Use platform-specific settings that are known to work
-                let (win_size, hop_size) = if cfg!(target_os = "linux") {
-                    (2048, 1024)  // Fixed sizes for Linux
-                } else {
-                    (buffer_size, frames_per_buffer.min(buffer_size))  // Dynamic sizes for OSX
-                };
-                
                 // Recreate detectors with new buffer size
                 detectors = selected_channels
                     .iter()
                     .map(|_| {
-                        Pitch::new(
-                            PitchMode::Yinfft,
-                            win_size,
-                            hop_size,
-                            sample_rate,
-                        ).expect("Failed to create pitch detector")
+                        if cfg!(target_os = "linux") {
+                            // Use YIN algorithm for Linux with dynamic sizes
+                            Pitch::new(
+                                PitchMode::Yin,  // YIN mode for Linux
+                                buffer_size,
+                                frames_per_buffer.min(buffer_size),
+                                sample_rate,
+                            ).expect("Failed to create pitch detector")
+                        } else {
+                            // Keep Yinfft for OSX where it's working
+                            Pitch::new(
+                                PitchMode::Yinfft,
+                                buffer_size,
+                                frames_per_buffer.min(buffer_size),
+                                sample_rate,
+                            ).expect("Failed to create pitch detector")
+                        }
                     })
                     .collect();
                 
-                info!("Pitch detectors recreated with window size: {}, hop size: {}", 
-                    win_size, hop_size);
+                info!("Pitch detectors recreated with buffer size: {}, hop size: {}", 
+                    buffer_size, frames_per_buffer.min(buffer_size));
             }
         }
 
