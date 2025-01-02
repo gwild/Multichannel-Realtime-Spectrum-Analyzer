@@ -133,20 +133,15 @@ pub fn start_pitch_detection(
             if max_amplitude > amplitude_threshold {
                 if let Ok(frequency) = detectors[i].do_result(&channel_data) {
                     let raw_confidence = detectors[i].get_confidence();
+                    let confidence = raw_confidence.abs().min(1.0);
                     
-                    // Only update if we have a valid frequency and confidence
-                    if frequency > 0.0 && raw_confidence > 0.0 {
-                        // Scale confidence to be between 0 and 1
-                        let confidence = (raw_confidence * 2.0).min(1.0);
-                        
-                        info!(
-                            "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
-                            i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
-                        );
-                        
-                        new_frequencies[i] = frequency;
-                        new_confidences[i] = confidence;
-                    }
+                    info!(
+                        "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
+                        i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
+                    );
+                    
+                    new_frequencies[i] = frequency;
+                    new_confidences[i] = confidence;
                 }
             }
         }
