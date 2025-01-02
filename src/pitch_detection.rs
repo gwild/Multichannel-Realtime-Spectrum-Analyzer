@@ -29,7 +29,17 @@ pub fn start_pitch_detection(
     shutdown_flag: Arc<AtomicBool>,
     fft_config: Arc<Mutex<FFTConfig>>,
 ) {
-    info!("Starting pitch detection thread");
+    // Get initial buffer size and frames per buffer
+    let mut buffer_size = audio_buffer.read()
+        .map(|buffer| buffer.clone_data().len() / selected_channels.len())
+        .unwrap_or(4096);
+    
+    let mut frames_per_buffer = fft_config.lock()
+        .map(|config| config.frames_per_buffer as usize)
+        .unwrap_or(1024);
+
+    info!("Starting pitch detection thread with buffer size: {}, hop size: {}", 
+        buffer_size, frames_per_buffer);
 
     // Create a pitch detector for each channel
     let mut detectors: Vec<Pitch> = selected_channels
@@ -37,14 +47,41 @@ pub fn start_pitch_detection(
         .map(|_| {
             Pitch::new(
                 PitchMode::Yinfft,
-                4096,
-                1024,
+                buffer_size,
+                frames_per_buffer,
                 sample_rate,
             ).expect("Failed to create pitch detector")
         })
         .collect();
 
     while !shutdown_flag.load(Ordering::SeqCst) {
+        // Check if buffer size has changed
+        if let Ok(buffer) = audio_buffer.read() {
+            let new_buffer_size = buffer.clone_data().len() / selected_channels.len();
+            if new_buffer_size != buffer_size {
+                buffer_size = new_buffer_size;
+                if let Ok(config) = fft_config.lock() {
+                    frames_per_buffer = config.frames_per_buffer as usize;
+                }
+                
+                // Recreate detectors with new buffer size
+                detectors = selected_channels
+                    .iter()
+                    .map(|_| {
+                        Pitch::new(
+                            PitchMode::Yinfft,
+                            buffer_size,
+                            frames_per_buffer,
+                            sample_rate,
+                        ).expect("Failed to create pitch detector")
+                    })
+                    .collect();
+                
+                info!("Pitch detectors recreated with new buffer size: {}, hop size: {}", 
+                    buffer_size, frames_per_buffer);
+            }
+        }
+
         // Get current threshold from FFT config
         let db_threshold = fft_config.lock()
             .map(|config| config.db_threshold)
@@ -54,14 +91,15 @@ pub fn start_pitch_detection(
         let amplitude_threshold = 10.0f32.powf((db_threshold as f32) / 20.0);
 
         // Get a clone of the current audio data
-        let audio_data = if let Ok(buffer) = audio_buffer.read() {
-            buffer.clone_data()
-        } else {
-            thread::sleep(Duration::from_millis(10));
-            continue;
+        let audio_data = match audio_buffer.read() {
+            Ok(buffer) => buffer.clone_data(),
+            Err(_) => {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         };
 
-        if audio_data.is_empty() {
+        if audio_data.is_empty() || audio_data.len() < buffer_size * selected_channels.len() {
             thread::sleep(Duration::from_millis(10));
             continue;
         }
@@ -73,7 +111,8 @@ pub fn start_pitch_detection(
         for (i, &channel) in selected_channels.iter().enumerate() {
             let channel_data: Vec<f32> = audio_data
                 .chunks(selected_channels.len())
-                .map(|chunk| chunk[channel])
+                .take(buffer_size)
+                .map(|chunk| chunk.get(channel).copied().unwrap_or(0.0))
                 .collect();
 
             // Check if signal is above threshold
@@ -95,7 +134,6 @@ pub fn start_pitch_detection(
                     new_confidences[i] = confidence;
                 }
             } else {
-                // If below threshold, set confidence to 0
                 new_frequencies[i] = 0.0;
                 new_confidences[i] = 0.0;
             }
@@ -107,7 +145,6 @@ pub fn start_pitch_detection(
             results.confidences = new_confidences;
         }
 
-        // Don't hog the CPU
         thread::sleep(Duration::from_millis(10));
     }
 
