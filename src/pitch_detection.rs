@@ -45,10 +45,12 @@ pub fn start_pitch_detection(
     let mut detectors: Vec<Pitch> = selected_channels
         .iter()
         .map(|_| {
+            // Ensure hop size is never larger than buffer size
+            let hop_size = frames_per_buffer.min(buffer_size);
             Pitch::new(
-                PitchMode::Yinfft,
+                PitchMode::Yinfft,  // Try different mode
                 buffer_size,
-                frames_per_buffer,
+                hop_size,
                 sample_rate,
             ).expect("Failed to create pitch detector")
         })
@@ -64,6 +66,9 @@ pub fn start_pitch_detection(
                     frames_per_buffer = config.frames_per_buffer as usize;
                 }
                 
+                // Ensure hop size is never larger than buffer size
+                let hop_size = frames_per_buffer.min(buffer_size);
+                
                 // Recreate detectors with new buffer size
                 detectors = selected_channels
                     .iter()
@@ -71,14 +76,14 @@ pub fn start_pitch_detection(
                         Pitch::new(
                             PitchMode::Yinfft,
                             buffer_size,
-                            frames_per_buffer,
+                            hop_size,
                             sample_rate,
                         ).expect("Failed to create pitch detector")
                     })
                     .collect();
                 
                 info!("Pitch detectors recreated with new buffer size: {}, hop size: {}", 
-                    buffer_size, frames_per_buffer);
+                    buffer_size, hop_size);
             }
         }
 
