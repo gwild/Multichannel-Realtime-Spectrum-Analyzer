@@ -245,7 +245,7 @@ pub fn build_input_stream(
     };
 
     // Update FFTConfig to match actual frames per buffer
-    if let Ok(buffer) = audio_buffer.read() {
+    if let Ok(_) = audio_buffer.read() {
         if let Ok(mut fft_config) = fft_config.lock() {
             fft_config.frames_per_buffer = frames_per_buffer;
             info!("Updated FFTConfig frames_per_buffer to match stream: {}", frames_per_buffer);

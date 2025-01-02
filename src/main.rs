@@ -2,6 +2,7 @@ mod audio_stream;
 mod fft_analysis;
 mod plot;
 mod utils;
+mod pitch_detection;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -19,6 +20,7 @@ use env_logger;
 use std::env;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
+use crate::pitch_detection::{PitchResults, start_pitch_detection};
 
 fn main() {
     // Only set up logging if --enable-logs flag is present
@@ -222,6 +224,26 @@ fn run() -> Result<()> {
         }
     });
 
+    let pitch_results = Arc::new(Mutex::new(PitchResults::new(selected_channels.len())));
+
+    // Start pitch detection thread
+    info!("Starting pitch detection thread...");
+    let pitch_thread = std::thread::spawn({
+        let audio_buffer = Arc::clone(&audio_buffer);
+        let pitch_results = Arc::clone(&pitch_results);
+        let selected_channels = selected_channels.clone();
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        move || {
+            start_pitch_detection(
+                audio_buffer,
+                pitch_results,
+                selected_sample_rate as u32,
+                selected_channels,
+                shutdown_flag,
+            );
+        }
+    });
+
     // Start GUI
     info!("Starting GUI...");
     let app = plot::MyApp::new(
@@ -230,6 +252,7 @@ fn run() -> Result<()> {
         buffer_size.clone(),
         audio_buffer.clone(),
         shutdown_flag.clone(),
+        pitch_results.clone(),
     );
 
     let native_options = NativeOptions {
@@ -261,6 +284,12 @@ fn run() -> Result<()> {
         info!("FFT thread terminated successfully");
     } else {
         warn!("FFT thread may not have terminated cleanly");
+    }
+
+    if let Ok(_) = pitch_thread.join() {
+        info!("Pitch detection thread terminated successfully");
+    } else {
+        warn!("Pitch detection thread may not have terminated cleanly");
     }
 
     Ok(())

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size};
+use crate::pitch_detection::PitchResults;
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -50,6 +51,7 @@ pub struct MyApp {
     // Throttling: Added to track the last repaint time
     last_repaint: Instant, // Reminder: This field was added to implement GUI throttling. Do not modify without permission.
     shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
+    pub pitch_results: Arc<Mutex<PitchResults>>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -59,7 +61,8 @@ impl MyApp {
         fft_config: Arc<Mutex<FFTConfig>>,
         buffer_size: Arc<Mutex<usize>>,
         audio_buffer: Arc<RwLock<CircularBuffer>>,
-        shutdown_flag: Arc<AtomicBool>,  // Accept shutdown flag
+        shutdown_flag: Arc<AtomicBool>,
+        pitch_results: Arc<Mutex<PitchResults>>,
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -72,20 +75,19 @@ impl MyApp {
             egui::Color32::from_rgb(255, 255, 0),
         ];
 
-        // Create the MyApp instance as before (NO alterations/deletions)
         let instance = MyApp {
             spectrum,
             fft_config,
             buffer_size,
-            audio_buffer,  // Correct field name
+            audio_buffer,
             colors,
             y_scale: 80.0,
             alpha: 255,
             bar_width: 5.0,
             last_repaint: Instant::now(),
             shutdown_flag,
+            pitch_results,
         };
-
 
         // FIX IMPLEMENTATION:
         // After we construct `instance`, we clamp `max_frequency` so the x scale
@@ -338,6 +340,22 @@ impl eframe::App for MyApp {
                     ));
                 }
             });
+
+            // Add pitch information display
+            ui.separator();
+            ui.label("Channel Pitch Information");
+
+            if let Ok(pitch_data) = self.pitch_results.lock() {
+                for (i, (freq, conf)) in pitch_data.frequencies.iter()
+                    .zip(pitch_data.confidences.iter())
+                    .enumerate()
+                {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Channel {}: {:.1} Hz (Confidence: {:.1}%)", 
+                            i, freq, conf * 100.0));
+                    });
+                }
+            }
         });
     }
 }
