@@ -120,27 +120,49 @@ pub fn start_pitch_detection(
                 .map(|&x| x.abs())
                 .fold(0.0f32, f32::max);
 
+            info!(
+                "Channel {} signal level: amplitude={:.6}, threshold={:.6}",
+                i + 1, max_amplitude, amplitude_threshold
+            );
+
             if max_amplitude > amplitude_threshold {
                 if let Ok(frequency) = detectors[i].do_result(&channel_data) {
                     let raw_confidence = detectors[i].get_confidence();
                     let amplitude_factor = (max_amplitude / amplitude_threshold).min(1.0);
                     let confidence = raw_confidence.abs().min(1.0) * amplitude_factor;
                     
-                    // Only update values if we have meaningful confidence
-                    if confidence > 0.1 {  // Adjust this threshold as needed
+                    info!(
+                        "Channel {} raw detection: freq={:.1} Hz, raw_conf={:.3}, amp_factor={:.3}, final_conf={:.3}",
+                        i + 1, frequency, raw_confidence, amplitude_factor, confidence
+                    );
+
+                    // Lowered confidence threshold and widened frequency range
+                    if confidence > 0.01 && frequency > 10.0 && frequency < 20000.0 {
                         info!(
-                            "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
+                            "Channel {}: Accepted pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
                             i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
                         );
                         
                         new_frequencies[i] = frequency;
                         new_confidences[i] = confidence;
+                    } else {
+                        info!(
+                            "Channel {}: Rejected pitch {:.1} Hz due to confidence={:.3} or frequency bounds",
+                            i + 1, frequency, confidence
+                        );
                     }
-                    // If confidence is too low, keep previous values by not updating
+                } else {
+                    info!(
+                        "Channel {}: Pitch detection failed despite amplitude {:.6} above threshold {:.6}",
+                        i + 1, max_amplitude, amplitude_threshold
+                    );
                 }
-                // If pitch detection fails, keep previous values by not updating
+            } else {
+                info!(
+                    "Channel {}: Signal below threshold (amp={:.6}, threshold={:.6})",
+                    i + 1, max_amplitude, amplitude_threshold
+                );
             }
-            // If amplitude is below threshold, keep previous values by not updating
         }
 
         // Update results
