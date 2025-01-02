@@ -258,7 +258,7 @@ fn run() -> Result<()> {
     );
 
     let native_options = NativeOptions {
-        initial_window_size: Some(egui::vec2(1024.0, 420.0)),
+        initial_window_size: Some(egui::vec2(1024.0, 500.0)),
         vsync: true,
         ..Default::default()
     };
