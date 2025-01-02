@@ -352,7 +352,9 @@ impl eframe::App for MyApp {
                 {
                     ui.horizontal(|ui| {
                         ui.label(format!("Channel {}: {:.1} Hz (Confidence: {:.1}%)", 
-                            i, freq, conf * 100.0));
+                            i + 1, 
+                            freq, 
+                            conf * 100.0));
                     });
                 }
             }
@@ -361,10 +363,11 @@ impl eframe::App for MyApp {
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
+#[allow(dead_code)]
 pub fn run_native(
     app_name: &str,
     native_options: NativeOptions,
-    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,  // Expect Box<MyApp>
+    app_creator: Box<dyn FnOnce(&eframe::CreationContext<'_>) -> Box<MyApp>>,
 ) -> Result<(), eframe::Error> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 

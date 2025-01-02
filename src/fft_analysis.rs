@@ -17,6 +17,7 @@ pub struct FFTConfig {
     pub min_frequency: f64,
     pub max_frequency: f64,
     pub db_threshold: f64,
+    #[allow(dead_code)]
     pub num_channels: usize,
     pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
     pub frames_per_buffer: u32,  // Add frames per buffer setting

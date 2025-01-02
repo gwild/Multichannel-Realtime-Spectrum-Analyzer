@@ -233,6 +233,7 @@ fn run() -> Result<()> {
         let pitch_results = Arc::clone(&pitch_results);
         let selected_channels = selected_channels.clone();
         let shutdown_flag = Arc::clone(&shutdown_flag);
+        let fft_config = Arc::clone(&fft_config);
         move || {
             start_pitch_detection(
                 audio_buffer,
@@ -240,6 +241,7 @@ fn run() -> Result<()> {
                 selected_sample_rate as u32,
                 selected_channels,
                 shutdown_flag,
+                fft_config,
             );
         }
     });
@@ -337,6 +339,7 @@ fn ensure_audio_device_ready(pa: &pa::PortAudio, device_index: pa::DeviceIndex) 
     }
 }
 
+#[allow(dead_code)]
 fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels: i32) -> Result<bool> {
     info!("Testing audio input for device...");
     
