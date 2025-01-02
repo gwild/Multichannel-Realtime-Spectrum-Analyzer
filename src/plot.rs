@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size};
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES};
 use crate::pitch_detection::PitchResults;
 
 
@@ -108,8 +108,10 @@ impl MyApp {
     }
 
     pub fn update_buffer_size(&mut self, new_size: usize) {
+        // Ensure minimum size of 512 and power of 2
         let validated_size = new_size
-            .next_power_of_two()  // Ensure power of 2 for FFT
+            .next_power_of_two()
+            .max(512)  // Enforce minimum of 512
             .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
         
         if validated_size != new_size {
@@ -182,11 +184,26 @@ impl eframe::App for MyApp {
                     {
                         let mut fft_config = self.fft_config.lock().unwrap();
                         ui.label("Frames/Buffer:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.frames_per_buffer, 64..=2048)
-                                .text("frames")
-                                .logarithmic(true)
-                        );
+                        let mut frames = fft_config.frames_per_buffer;
+                        ui.horizontal(|ui| {
+                            let mut index = FRAME_SIZES.iter()
+                                .position(|&x| x == frames)
+                                .unwrap_or(0);
+                            
+                            ui.add(egui::Slider::new(&mut index, 0..=6)
+                                .custom_formatter(|n, _| {
+                                    format!("{}", FRAME_SIZES[n as usize])
+                                }));
+                            
+                            // Ensure frame size doesn't exceed buffer size
+                            let buffer_size = *self.buffer_size.lock().unwrap();
+                            frames = FRAME_SIZES[index].min(buffer_size as u32);
+                        });
+                        
+                        if frames != fft_config.frames_per_buffer {
+                            fft_config.frames_per_buffer = frames;
+                            size_changed = true;
+                        }
                     }
 
                     // Buffer size slider
@@ -197,14 +214,17 @@ impl eframe::App for MyApp {
                         let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
                         let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
                         if ui
-                            .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power).text("Power of 2"))
+                            .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power)
+                                .custom_formatter(|n, _| {
+                                    format!("{}", 1_usize << (n as usize))
+                                }))
                             .changed()
                         {
                             let new_size = 1 << buffer_log_slider;
                             self.update_buffer_size(new_size);
-                            size_changed = true;  // Using the outer size_changed
+                            size_changed = true;
                         }
-                        ui.label(format!("{} samples", buffer_size));
+                        ui.label("samples");
                     }
 
                     // FFT Averaging slider

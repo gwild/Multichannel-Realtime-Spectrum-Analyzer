@@ -5,7 +5,7 @@ use std::time::Duration;
 use aubio_rs::{Pitch, PitchMode};
 use log::info;
 use crate::audio_stream::CircularBuffer;
-use crate::fft_analysis::FFTConfig;
+use crate::fft_analysis::{FFTConfig, filter_buffer};
 
 pub struct PitchResults {
     pub frequencies: Vec<f32>,
@@ -110,9 +110,6 @@ pub fn start_pitch_detection(
             .map(|config| config.db_threshold)
             .unwrap_or(-24.0);
         
-        // Convert dB threshold to linear amplitude
-        let amplitude_threshold = 10.0f32.powf((db_threshold as f32) / 20.0);
-
         // Get a clone of the current audio data
         let audio_data = match audio_buffer.read() {
             Ok(buffer) => buffer.clone_data(),
@@ -138,29 +135,33 @@ pub fn start_pitch_detection(
                 .map(|chunk| chunk.get(channel).copied().unwrap_or(0.0))
                 .collect();
 
-            // Check if signal is above threshold
-            let max_amplitude = channel_data.iter()
-                .map(|&x| x.abs())
-                .fold(0.0f32, f32::max);
+            // Apply the same filtering as FFT
+            let filtered_data = filter_buffer(&channel_data, db_threshold);
+            if filtered_data.is_empty() {
+                continue;
+            }
 
-            info!(
-                "Channel {} signal level: amplitude={:.6}, threshold={:.6}",
-                i + 1, max_amplitude, amplitude_threshold
-            );
+            // Ensure we use the correct buffer size for pitch detection
+            let analysis_buffer = if filtered_data.len() >= frames_per_buffer {
+                filtered_data[filtered_data.len() - frames_per_buffer..].to_vec()
+            } else {
+                let mut padded = vec![0.0; frames_per_buffer];
+                padded[frames_per_buffer - filtered_data.len()..].copy_from_slice(&filtered_data);
+                padded
+            };
 
-            if max_amplitude > amplitude_threshold {
-                if let Ok(frequency) = detectors[i].do_result(&channel_data) {
-                    let raw_confidence = detectors[i].get_confidence();
-                    let confidence = raw_confidence.abs().min(1.0);
-                    
-                    info!(
-                        "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
-                        i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
-                    );
-                    
-                    new_frequencies[i] = frequency;
-                    new_confidences[i] = confidence;
-                }
+            // Check if signal is above threshold and perform pitch detection
+            if let Ok(frequency) = detectors[i].do_result(&analysis_buffer) {
+                let raw_confidence = detectors[i].get_confidence();
+                let confidence = raw_confidence.abs().min(1.0);
+                
+                info!(
+                    "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, threshold: {:.3})",
+                    i + 1, frequency, confidence, raw_confidence, db_threshold
+                );
+                
+                new_frequencies[i] = frequency;
+                new_confidences[i] = confidence;
             }
         }
 

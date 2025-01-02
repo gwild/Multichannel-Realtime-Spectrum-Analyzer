@@ -156,9 +156,15 @@ fn run() -> Result<()> {
     } else {
         match selected_sample_rate as u32 {
             48000 => 512u32,
-            44100 => 441u32,
+            44100 => 512u32,
             96000 => 1024u32,
-            _ => (selected_sample_rate / 100.0) as u32
+            _ => {
+                let mut base_size = 512u32;  // Start with minimum
+                while base_size * 2 <= (selected_sample_rate / 50.0) as u32 {
+                    base_size *= 2;
+                }
+                base_size
+            }
         }
     };
 

@@ -1,6 +1,5 @@
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 // Reminder: The following imports are protected. Any modification requires explicit permission.
-use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, RwLock, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +8,7 @@ use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
+use aubio_rs::FFT;
 
 pub const NUM_PARTIALS: usize = 12;
 
@@ -21,39 +21,6 @@ pub struct FFTConfig {
     pub num_channels: usize,
     pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
     pub frames_per_buffer: u32,  // Add frames per buffer setting
-}
-
-/// Pre-computed Blackman-Harris window coefficients
-struct BlackmanHarris {
-    coefficients: Vec<f32>,
-}
-
-impl BlackmanHarris {
-    fn new(size: usize) -> Self {
-        let alpha0 = 0.35875;
-        let alpha1 = 0.48829;
-        let alpha2 = 0.14128;
-        let alpha3 = 0.01168;
-        
-        let coefficients = (0..size)
-            .map(|i| {
-                let x = i as f32 / (size - 1) as f32;
-                alpha0
-                    - alpha1 * (2.0 * std::f32::consts::PI * x).cos()
-                    + alpha2 * (4.0 * std::f32::consts::PI * x).cos()
-                    - alpha3 * (6.0 * std::f32::consts::PI * x).cos()
-            })
-            .collect();
-            
-        BlackmanHarris { coefficients }
-    }
-    
-    fn apply(&self, buffer: &[f32]) -> Vec<f32> {
-        buffer.iter()
-            .zip(self.coefficients.iter())
-            .map(|(&sample, &coef)| sample * coef)
-            .collect()
-    }
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -128,37 +95,37 @@ pub fn compute_spectrum(
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    // Convert db_threshold from f64 to f32 for FFT processing
-    let linear_threshold = 10.0_f32.powf((config.db_threshold as f32) / 20.0);
-    let filtered_buffer: Vec<f32> = buffer
-        .iter()
-        .cloned()
-        .filter(|&sample| sample.abs() >= linear_threshold)
-        .collect();
-
+    // Use the common filtering function
+    let filtered_buffer = filter_buffer(buffer, config.db_threshold);
     if filtered_buffer.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    // Create window once for this buffer size
-    let window = BlackmanHarris::new(filtered_buffer.len());
-    let windowed_buffer = window.apply(&filtered_buffer);
+    // Ensure FFT size is a power of 2 and at least 512
+    let win_size = {
+        let base_size = (config.frames_per_buffer as usize)
+            .next_power_of_two();
+        base_size.max(512)
+    };
 
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(windowed_buffer.len());
+    let analysis_buffer = if filtered_buffer.len() >= win_size {
+        filtered_buffer[filtered_buffer.len() - win_size..].to_vec()
+    } else {
+        let mut padded = vec![0.0; win_size];
+        padded[win_size - filtered_buffer.len()..].copy_from_slice(&filtered_buffer);
+        padded
+    };
 
-    let mut complex_buffer: Vec<Complex<f32>> = windowed_buffer
-        .iter()
-        .map(|&x| Complex { re: x, im: 0.0 })
-        .collect();
-    fft.process(&mut complex_buffer);
+    let mut fft = FFT::new(win_size).expect("Failed to create FFT");
+    let mut spectrum = vec![0.0; win_size + 2];
+    fft.do_(&analysis_buffer, &mut spectrum)
+        .expect("FFT computation failed");
 
-    let mut magnitudes: Vec<_> = complex_buffer
-        .iter()
-        .enumerate()
-        .map(|(i, &value)| {
-            let frequency = (i as f32) * (sample_rate as f32) / (windowed_buffer.len() as f32);
-            let amplitude = value.norm();
+    // Get magnitudes from FFT output (only use first half due to Nyquist)
+    let mut magnitudes: Vec<_> = (0..win_size/2)
+        .map(|i| {
+            let frequency = (i as f32) * (sample_rate as f32) / (win_size as f32);
+            let amplitude = (spectrum[i*2].powi(2) + spectrum[i*2+1].powi(2)).sqrt();  // Complex magnitude
             let amplitude_db = if amplitude > 0.0 {
                 20.0 * amplitude.log10()
             } else {
@@ -168,17 +135,19 @@ pub fn compute_spectrum(
         })
         .collect();
 
+    // Filter frequencies based on config
     magnitudes.retain(|&(freq, _)| {
         freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
     });
-    magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort by amplitude descending
 
+    // Ensure we have exactly NUM_PARTIALS entries
     while magnitudes.len() < NUM_PARTIALS {
         magnitudes.push((0.0, 0.0));
     }
-
     magnitudes.truncate(NUM_PARTIALS);
 
+    // Apply smoothing
     let mut smoothed_magnitudes = Vec::with_capacity(NUM_PARTIALS);
     for (i, &(freq, amp)) in magnitudes.iter().enumerate() {
         let prev_amp = prev_magnitudes
@@ -193,4 +162,14 @@ pub fn compute_spectrum(
     }
 
     smoothed_magnitudes
+}
+
+/// Filters audio buffer based on amplitude threshold
+pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
+    let linear_threshold = 10.0_f32.powf((db_threshold as f32) / 20.0);
+    buffer
+        .iter()
+        .cloned()
+        .filter(|&sample| sample.abs() >= linear_threshold)
+        .collect()
 }
