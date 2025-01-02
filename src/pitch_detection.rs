@@ -45,11 +45,16 @@ pub fn start_pitch_detection(
     let mut detectors: Vec<Pitch> = selected_channels
         .iter()
         .map(|_| {
-            // Ensure hop size is never larger than buffer size
-            let hop_size = frames_per_buffer.min(buffer_size);
+            // Use platform-specific settings that are known to work
+            let (win_size, hop_size) = if cfg!(target_os = "linux") {
+                (2048, 1024)  // Fixed sizes for Linux
+            } else {
+                (buffer_size, frames_per_buffer.min(buffer_size))  // Dynamic sizes for OSX
+            };
+
             Pitch::new(
-                PitchMode::Yinfft,  // Back to Yinfft which was working
-                buffer_size,
+                PitchMode::Yinfft,
+                win_size,
                 hop_size,
                 sample_rate,
             ).expect("Failed to create pitch detector")
@@ -66,8 +71,12 @@ pub fn start_pitch_detection(
                     frames_per_buffer = config.frames_per_buffer as usize;
                 }
                 
-                // Ensure hop size is never larger than buffer size
-                let hop_size = frames_per_buffer.min(buffer_size);
+                // Use platform-specific settings that are known to work
+                let (win_size, hop_size) = if cfg!(target_os = "linux") {
+                    (2048, 1024)  // Fixed sizes for Linux
+                } else {
+                    (buffer_size, frames_per_buffer.min(buffer_size))  // Dynamic sizes for OSX
+                };
                 
                 // Recreate detectors with new buffer size
                 detectors = selected_channels
@@ -75,15 +84,15 @@ pub fn start_pitch_detection(
                     .map(|_| {
                         Pitch::new(
                             PitchMode::Yinfft,
-                            buffer_size,
+                            win_size,
                             hop_size,
                             sample_rate,
                         ).expect("Failed to create pitch detector")
                     })
                     .collect();
                 
-                info!("Pitch detectors recreated with new buffer size: {}, hop size: {}", 
-                    buffer_size, hop_size);
+                info!("Pitch detectors recreated with window size: {}, hop size: {}", 
+                    win_size, hop_size);
             }
         }
 
