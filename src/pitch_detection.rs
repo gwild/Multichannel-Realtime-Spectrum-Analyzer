@@ -133,40 +133,16 @@ pub fn start_pitch_detection(
             if max_amplitude > amplitude_threshold {
                 if let Ok(frequency) = detectors[i].do_result(&channel_data) {
                     let raw_confidence = detectors[i].get_confidence();
-                    let amplitude_factor = (max_amplitude / amplitude_threshold).min(1.0);
-                    let confidence = raw_confidence.abs().min(1.0) * amplitude_factor;
+                    let confidence = raw_confidence.abs().min(1.0);
                     
                     info!(
-                        "Channel {} raw detection: freq={:.1} Hz, raw_conf={:.3}, amp_factor={:.3}, final_conf={:.3}",
-                        i + 1, frequency, raw_confidence, amplitude_factor, confidence
+                        "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
+                        i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
                     );
-
-                    // Lowered confidence threshold and widened frequency range
-                    if confidence > 0.01 && frequency > 10.0 && frequency < 20000.0 {
-                        info!(
-                            "Channel {}: Accepted pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, amp: {:.3}, threshold: {:.3})",
-                            i + 1, frequency, confidence, raw_confidence, max_amplitude, amplitude_threshold
-                        );
-                        
-                        new_frequencies[i] = frequency;
-                        new_confidences[i] = confidence;
-                    } else {
-                        info!(
-                            "Channel {}: Rejected pitch {:.1} Hz due to confidence={:.3} or frequency bounds",
-                            i + 1, frequency, confidence
-                        );
-                    }
-                } else {
-                    info!(
-                        "Channel {}: Pitch detection failed despite amplitude {:.6} above threshold {:.6}",
-                        i + 1, max_amplitude, amplitude_threshold
-                    );
+                    
+                    new_frequencies[i] = frequency;
+                    new_confidences[i] = confidence;
                 }
-            } else {
-                info!(
-                    "Channel {}: Signal below threshold (amp={:.6}, threshold={:.6})",
-                    i + 1, max_amplitude, amplitude_threshold
-                );
             }
         }
 
