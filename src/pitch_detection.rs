@@ -10,6 +10,7 @@ use crate::fft_analysis::{FFTConfig, filter_buffer};
 pub struct PitchResults {
     pub frequencies: Vec<f32>,
     pub confidences: Vec<f32>,
+    prev_frequencies: Vec<f32>,
 }
 
 impl PitchResults {
@@ -17,6 +18,7 @@ impl PitchResults {
         PitchResults {
             frequencies: vec![0.0; num_channels],
             confidences: vec![0.0; num_channels],
+            prev_frequencies: vec![0.0; num_channels],
         }
     }
 }
@@ -45,21 +47,18 @@ pub fn start_pitch_detection(
     let mut detectors: Vec<Pitch> = selected_channels
         .iter()
         .map(|_| {
-            // Use platform-specific settings that are known to work
             if cfg!(target_os = "linux") {
-                // Use YIN algorithm for Linux with dynamic sizes
                 Pitch::new(
-                    PitchMode::Yin,  // YIN mode for Linux
+                    PitchMode::Yin,
                     buffer_size,
-                    frames_per_buffer.min(buffer_size),
+                    frames_per_buffer,
                     sample_rate,
                 ).expect("Failed to create pitch detector")
             } else {
-                // Keep Yinfft for OSX where it's working
                 Pitch::new(
                     PitchMode::Yinfft,
                     buffer_size,
-                    frames_per_buffer.min(buffer_size),
+                    frames_per_buffer,
                     sample_rate,
                 ).expect("Failed to create pitch detector")
             }
@@ -85,7 +84,7 @@ pub fn start_pitch_detection(
                             Pitch::new(
                                 PitchMode::Yin,  // YIN mode for Linux
                                 buffer_size,
-                                frames_per_buffer.min(buffer_size),
+                                frames_per_buffer,
                                 sample_rate,
                             ).expect("Failed to create pitch detector")
                         } else {
@@ -93,7 +92,7 @@ pub fn start_pitch_detection(
                             Pitch::new(
                                 PitchMode::Yinfft,
                                 buffer_size,
-                                frames_per_buffer.min(buffer_size),
+                                frames_per_buffer,
                                 sample_rate,
                             ).expect("Failed to create pitch detector")
                         }
@@ -101,7 +100,7 @@ pub fn start_pitch_detection(
                     .collect();
                 
                 info!("Pitch detectors recreated with buffer size: {}, hop size: {}", 
-                    buffer_size, frames_per_buffer.min(buffer_size));
+                    buffer_size, frames_per_buffer);
             }
         }
 
@@ -155,13 +154,20 @@ pub fn start_pitch_detection(
                 let raw_confidence = detectors[i].get_confidence();
                 let confidence = raw_confidence.abs().min(1.0);
                 
-                info!(
-                    "Channel {}: Detected pitch {:.1} Hz with confidence {:.3} (raw: {:.3}, threshold: {:.3})",
-                    i + 1, frequency, confidence, raw_confidence, db_threshold
-                );
-                
-                new_frequencies[i] = frequency;
-                new_confidences[i] = confidence;
+                // Only update if confidence is good enough
+                if confidence > 0.7 {
+                    let avg_factor = fft_config.lock().unwrap().averaging_factor;
+                    let smoothed_freq = if pitch_results.lock().unwrap().prev_frequencies[i] > 0.0 {
+                        avg_factor * pitch_results.lock().unwrap().prev_frequencies[i] + 
+                        (1.0 - avg_factor) * frequency
+                    } else {
+                        frequency
+                    };
+                    
+                    new_frequencies[i] = smoothed_freq;
+                    new_confidences[i] = confidence;
+                    pitch_results.lock().unwrap().prev_frequencies[i] = smoothed_freq;
+                }
             }
         }
 

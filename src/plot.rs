@@ -111,7 +111,7 @@ impl MyApp {
         // Ensure minimum size of 512 and power of 2
         let validated_size = new_size
             .next_power_of_two()
-            .max(512)  // Enforce minimum of 512
+            .max(512)
             .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
         
         if validated_size != new_size {
@@ -119,6 +119,19 @@ impl MyApp {
                 "Adjusted requested buffer size from {} to {} (power of 2 between {} and {})",
                 new_size, validated_size, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE
             );
+        }
+        
+        // Update frame size if necessary
+        if let Ok(mut fft_config) = self.fft_config.lock() {
+            if fft_config.frames_per_buffer as usize > validated_size {
+                let new_frames = FRAME_SIZES.iter()
+                    .rev()
+                    .find(|&&x| x as usize <= validated_size)
+                    .copied()
+                    .unwrap_or(FRAME_SIZES[0]);
+                fft_config.frames_per_buffer = new_frames;
+                info!("Adjusted frames per buffer to {} due to buffer size change", new_frames);
+            }
         }
         
         if let Ok(mut size) = self.buffer_size.lock() {
@@ -186,18 +199,24 @@ impl eframe::App for MyApp {
                         ui.label("Frames/Buffer:");
                         let mut frames = fft_config.frames_per_buffer;
                         ui.horizontal(|ui| {
+                            // Get maximum allowed frame size based on buffer size
+                            let buffer_size = *self.buffer_size.lock().unwrap();
+                            let max_frame_index = FRAME_SIZES.iter()
+                                .position(|&x| x > buffer_size as u32)
+                                .unwrap_or(FRAME_SIZES.len())
+                                .saturating_sub(1);
+
                             let mut index = FRAME_SIZES.iter()
                                 .position(|&x| x == frames)
-                                .unwrap_or(0);
+                                .unwrap_or(0)
+                                .min(max_frame_index);
                             
-                            ui.add(egui::Slider::new(&mut index, 0..=6)
+                            ui.add(egui::Slider::new(&mut index, 0..=max_frame_index)
                                 .custom_formatter(|n, _| {
                                     format!("{}", FRAME_SIZES[n as usize])
                                 }));
                             
-                            // Ensure frame size doesn't exceed buffer size
-                            let buffer_size = *self.buffer_size.lock().unwrap();
-                            frames = FRAME_SIZES[index].min(buffer_size as u32);
+                            frames = FRAME_SIZES[index];
                         });
                         
                         if frames != fft_config.frames_per_buffer {
