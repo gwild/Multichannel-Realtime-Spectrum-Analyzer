@@ -21,6 +21,8 @@ pub struct FFTConfig {
     pub num_channels: usize,
     pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
     pub frames_per_buffer: u32,  // Add frames per buffer setting
+    pub crosstalk_threshold: f32,  // Add crosstalk threshold (0.0 to 1.0)
+    pub crosstalk_reduction: f32,  // Add reduction factor (0.0 to 1.0)
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -42,15 +44,19 @@ pub fn start_fft_processing(
                     buffer.clone_data()
                 };
 
+                // First deinterleave into separate channel buffers
+                let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
+                    .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
+                    .collect();
+
                 let mut all_channels_results = 
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-                for (channel_index, _channel) in selected_channels.iter().enumerate() {
-                    let buffer_data = extract_channel_data(&buffer_clone, channel_index, selected_channels.len());
-
-                    let config = fft_config.lock().unwrap();
+                let config = fft_config.lock().unwrap();
+                for (channel_index, _) in selected_channels.iter().enumerate() {
                     let spectrum = compute_spectrum(
-                        &buffer_data, 
+                        &channel_buffers,  // Pass all channel data
+                        channel_index,     // Specify which channel to process
                         sample_rate, 
                         &*config,
                         Some(&prev_results[channel_index])
@@ -86,17 +92,26 @@ fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> 
 
 /// Computes the frequency spectrum from the audio buffer.
 pub fn compute_spectrum(
-    buffer: &[f32], 
+    all_channel_data: &[Vec<f32>],  // Change input to include all channels
+    channel_index: usize,
     sample_rate: u32, 
     config: &FFTConfig,
     prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
-    if buffer.is_empty() {
+    // Apply crosstalk filtering first
+    let filtered_channels = filter_crosstalk(
+        all_channel_data,
+        config.crosstalk_threshold,
+        config.crosstalk_reduction
+    );
+
+    let channel_data = &filtered_channels[channel_index];
+    if channel_data.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
     // Use the common filtering function
-    let filtered_buffer = filter_buffer(buffer, config.db_threshold);
+    let filtered_buffer = filter_buffer(channel_data, config.db_threshold);
     if filtered_buffer.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
@@ -184,4 +199,47 @@ pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
         .cloned()
         .filter(|&sample| sample.abs() >= linear_threshold)
         .collect()
+}
+
+/// Reduces crosstalk between channels
+fn filter_crosstalk(
+    channel_data: &[Vec<f32>],
+    threshold: f32,
+    reduction: f32
+) -> Vec<Vec<f32>> {
+    if channel_data.is_empty() {
+        return Vec::new();
+    }
+
+    let num_channels = channel_data.len();
+    let samples_per_channel = channel_data[0].len();
+    let mut filtered = vec![vec![0.0; samples_per_channel]; num_channels];
+
+    for sample_idx in 0..samples_per_channel {
+        // Get all channel values for this sample
+        let sample_values: Vec<f32> = channel_data.iter()
+            .map(|channel| channel[sample_idx])
+            .collect();
+
+        // Process each channel
+        for (ch_idx, channel) in channel_data.iter().enumerate() {
+            let main_signal = channel[sample_idx];
+            let mut crosstalk = 0.0;
+
+            // Calculate crosstalk from other channels
+            for (other_idx, &other_val) in sample_values.iter().enumerate() {
+                if other_idx != ch_idx {
+                    let ratio = (other_val / main_signal).abs();
+                    if ratio > threshold {
+                        crosstalk += other_val * reduction;
+                    }
+                }
+            }
+
+            // Subtract crosstalk from main signal
+            filtered[ch_idx][sample_idx] = main_signal - crosstalk;
+        }
+    }
+
+    filtered
 }

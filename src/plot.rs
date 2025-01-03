@@ -398,6 +398,21 @@ impl eframe::App for MyApp {
                     });
                 }
             }
+
+            // Add crosstalk controls
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.label("Crosstalk Threshold:");
+                ui.add(
+                    egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
+                        .text("ratio")
+                );
+                ui.label("Reduction:");
+                ui.add(
+                    egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
+                        .text("factor")
+                );
+            });
         });
     }
 }

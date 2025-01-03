@@ -174,7 +174,9 @@ fn run() -> Result<()> {
         db_threshold: -24.0,
         num_channels: selected_channels.len(),
         averaging_factor: 0.9,
-        frames_per_buffer,  // Use the calculated value
+        frames_per_buffer,
+        crosstalk_threshold: 0.3,  // Default threshold
+        crosstalk_reduction: 0.5,   // Default reduction
     }));
 
     let running = Arc::new(AtomicBool::new(false));
