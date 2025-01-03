@@ -232,7 +232,7 @@ impl eframe::App for MyApp {
                         let mut fft_config = self.fft_config.lock().unwrap();
                         ui.label("FFT Averaging:");
                         ui.add(
-                            egui::Slider::new(&mut fft_config.averaging_factor, 0.0..=0.99)
+                            egui::Slider::new(&mut fft_config.averaging_factor, 0.5..=0.99)
                                 .text("α")
                                 .logarithmic(true)
                         );
