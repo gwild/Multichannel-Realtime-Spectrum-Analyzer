@@ -6,6 +6,7 @@ use aubio_rs::{Pitch, PitchMode};
 use log::info;
 use crate::audio_stream::CircularBuffer;
 use crate::fft_analysis::{FFTConfig, filter_buffer};
+use crate::plot::SpectrumApp;
 
 pub struct PitchResults {
     pub frequencies: Vec<f32>,
@@ -23,6 +24,33 @@ impl PitchResults {
     }
 }
 
+fn is_valid_harmonic_relationship(frequency: f32, partials: &[(f32, f32)]) -> bool {
+    if partials.is_empty() {
+        return true;  // No partials to validate against
+    }
+
+    // Sort partials by amplitude to get strongest ones
+    let mut strong_partials = partials.to_vec();
+    strong_partials.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // Check if frequency matches harmonic series of strongest partials
+    for &(partial_freq, _) in strong_partials.iter().take(3) {  // Check against top 3 partials
+        // Check if frequency is a harmonic or sub-harmonic
+        for n in 1..=8 {  // Check up to 8th harmonic
+            let harmonic = partial_freq * n as f32;
+            let sub_harmonic = partial_freq / n as f32;
+            
+            // Allow 3% tolerance for frequency matching
+            if (frequency - harmonic).abs() < harmonic * 0.03 ||
+               (frequency - sub_harmonic).abs() < sub_harmonic * 0.03 {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
 pub fn start_pitch_detection(
     audio_buffer: Arc<RwLock<CircularBuffer>>,
     pitch_results: Arc<Mutex<PitchResults>>,
@@ -30,6 +58,7 @@ pub fn start_pitch_detection(
     selected_channels: Vec<usize>,
     shutdown_flag: Arc<AtomicBool>,
     fft_config: Arc<Mutex<FFTConfig>>,
+    spectrum_app: Arc<Mutex<SpectrumApp>>,
 ) {
     // Get initial buffer size and frames per buffer
     let mut buffer_size = audio_buffer.read()
@@ -154,8 +183,21 @@ pub fn start_pitch_detection(
                 let raw_confidence = detectors[i].get_confidence();
                 let confidence = raw_confidence.abs().min(1.0);
                 
-                // Only update if confidence is good enough
-                if confidence > 0.7 {
+                // Get current FFT partials for validation
+                let fft_partials = spectrum_app.lock()
+                    .map(|app| app.partials[i].clone())
+                    .unwrap_or_default();
+
+                // Get frequency range from config
+                let (min_freq, max_freq) = fft_config.lock()
+                    .map(|config| (config.min_frequency as f32, config.max_frequency as f32))
+                    .unwrap_or((20.0, 2000.0));
+
+                // Only update if confidence is good enough and frequency matches harmonics
+                if confidence > 0.85 && 
+                   frequency >= min_freq && 
+                   frequency <= max_freq &&
+                   is_valid_harmonic_relationship(frequency, &fft_partials) {
                     let avg_factor = fft_config.lock().unwrap().averaging_factor;
                     let smoothed_freq = if pitch_results.lock().unwrap().prev_frequencies[i] > 0.0 {
                         avg_factor * pitch_results.lock().unwrap().prev_frequencies[i] + 
@@ -167,6 +209,12 @@ pub fn start_pitch_detection(
                     new_frequencies[i] = smoothed_freq;
                     new_confidences[i] = confidence;
                     pitch_results.lock().unwrap().prev_frequencies[i] = smoothed_freq;
+                } else {
+                    // Keep previous values if confidence is low
+                    if let Ok(results) = pitch_results.lock() {
+                        new_frequencies[i] = results.prev_frequencies[i];
+                        new_confidences[i] = 0.0;  // Indicate low confidence
+                    }
                 }
             }
         }

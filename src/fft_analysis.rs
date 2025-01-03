@@ -144,6 +144,11 @@ pub fn compute_spectrum(
 
     // First sort by amplitude to get top NUM_PARTIALS
     magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort by amplitude descending
+    
+    // Only keep strong partials (above -60dB from max)
+    if let Some(max_amp) = magnitudes.first().map(|&(_, amp)| amp) {
+        magnitudes.retain(|&(_, amp)| amp > max_amp - 60.0);
+    }
     magnitudes.truncate(NUM_PARTIALS);  // Keep top NUM_PARTIALS amplitudes
 
     // Then sort these by frequency

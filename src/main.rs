@@ -240,6 +240,7 @@ fn run() -> Result<()> {
         let selected_channels = selected_channels.clone();
         let shutdown_flag = Arc::clone(&shutdown_flag);
         let fft_config = Arc::clone(&fft_config);
+        let spectrum_app = Arc::clone(&spectrum_app);
         move || {
             start_pitch_detection(
                 audio_buffer,
@@ -248,6 +249,7 @@ fn run() -> Result<()> {
                 selected_channels,
                 shutdown_flag,
                 fft_config,
+                spectrum_app,
             );
         }
     });
