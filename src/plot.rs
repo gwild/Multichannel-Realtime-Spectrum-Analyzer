@@ -288,6 +288,8 @@ impl eframe::App for MyApp {
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
                     fft_config.averaging_factor = 0.8;
+                    fft_config.crosstalk_threshold = 0.3;  // Add default crosstalk threshold
+                    fft_config.crosstalk_reduction = 0.5;  // Add default crosstalk reduction
                     
                     // Platform-specific default frames per buffer
                     fft_config.frames_per_buffer = if cfg!(target_os = "linux") {

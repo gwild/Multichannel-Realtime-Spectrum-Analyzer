@@ -24,15 +24,16 @@ impl PitchResults {
     }
 }
 
-fn is_valid_harmonic_relationship(frequency: f32, partials: &[(f32, f32)]) -> bool {
+fn is_valid_harmonic_relationship(frequency: f32, partials: &[(f32, f32)]) -> (bool, f32) {
     if partials.is_empty() {
-        return true;  // No partials to validate against
+        return (true, 1.0);  // No partials to validate against
     }
 
     // Sort partials by amplitude to get strongest ones
     let mut strong_partials = partials.to_vec();
     strong_partials.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
+    let mut best_match: f32 = 0.0;
     // Check if frequency matches harmonic series of strongest partials
     for &(partial_freq, _) in strong_partials.iter().take(3) {  // Check against top 3 partials
         // Check if frequency is a harmonic or sub-harmonic
@@ -40,15 +41,18 @@ fn is_valid_harmonic_relationship(frequency: f32, partials: &[(f32, f32)]) -> bo
             let harmonic = partial_freq * n as f32;
             let sub_harmonic = partial_freq / n as f32;
             
-            // Allow 3% tolerance for frequency matching
-            if (frequency - harmonic).abs() < harmonic * 0.03 ||
-               (frequency - sub_harmonic).abs() < sub_harmonic * 0.03 {
-                return true;
-            }
+            // Calculate how close we are to a harmonic
+            let harmonic_error = ((frequency - harmonic).abs() / harmonic).min(
+                (frequency - sub_harmonic).abs() / sub_harmonic
+            );
+            
+            // Convert error to confidence (1.0 = perfect match, 0.0 = far off)
+            let match_confidence = (1.0 - (harmonic_error / 0.03)).max(0.0);
+            best_match = best_match.max(match_confidence);
         }
     }
     
-    false
+    (best_match > 0.0, best_match)
 }
 
 pub fn start_pitch_detection(
@@ -193,11 +197,15 @@ pub fn start_pitch_detection(
                     .map(|config| (config.min_frequency as f32, config.max_frequency as f32))
                     .unwrap_or((20.0, 2000.0));
 
+                // Check harmonic relationship and combine confidences
+                let (is_harmonic, harmonic_confidence) = is_valid_harmonic_relationship(frequency, &fft_partials);
+                let combined_confidence = confidence * harmonic_confidence;
+
                 // Only update if confidence is good enough and frequency matches harmonics
-                if confidence > 0.85 && 
+                if combined_confidence > 0.5 && 
                    frequency >= min_freq && 
                    frequency <= max_freq &&
-                   is_valid_harmonic_relationship(frequency, &fft_partials) {
+                   is_harmonic {
                     let avg_factor = fft_config.lock().unwrap().averaging_factor;
                     let smoothed_freq = if pitch_results.lock().unwrap().prev_frequencies[i] > 0.0 {
                         avg_factor * pitch_results.lock().unwrap().prev_frequencies[i] + 
@@ -207,7 +215,7 @@ pub fn start_pitch_detection(
                     };
                     
                     new_frequencies[i] = smoothed_freq;
-                    new_confidences[i] = confidence;
+                    new_confidences[i] = combined_confidence;
                     pitch_results.lock().unwrap().prev_frequencies[i] = smoothed_freq;
                 } else {
                     // Keep previous values if confidence is low
