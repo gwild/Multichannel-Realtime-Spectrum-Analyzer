@@ -23,39 +23,6 @@ pub struct FFTConfig {
     pub frames_per_buffer: u32,  // Add frames per buffer setting
 }
 
-/// Pre-computed Blackman-Harris window coefficients
-struct BlackmanHarris {
-    coefficients: Vec<f32>,
-}
-
-impl BlackmanHarris {
-    fn new(size: usize) -> Self {
-        let alpha0 = 0.35875;
-        let alpha1 = 0.48829;
-        let alpha2 = 0.14128;
-        let alpha3 = 0.01168;
-        
-        let coefficients = (0..size)
-            .map(|i| {
-                let x = i as f32 / (size - 1) as f32;
-                alpha0
-                    - alpha1 * (2.0 * std::f32::consts::PI * x).cos()
-                    + alpha2 * (4.0 * std::f32::consts::PI * x).cos()
-                    - alpha3 * (6.0 * std::f32::consts::PI * x).cos()
-            })
-            .collect();
-            
-        BlackmanHarris { coefficients }
-    }
-    
-    fn apply(&self, buffer: &[f32]) -> Vec<f32> {
-        buffer.iter()
-            .zip(self.coefficients.iter())
-            .map(|(&sample, &coef)| sample * coef)
-            .collect()
-    }
-}
-
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
     audio_buffer: Arc<RwLock<CircularBuffer>>,
@@ -149,13 +116,11 @@ pub fn compute_spectrum(
         padded
     };
 
-    // Apply Blackman-Harris window
-    let window = BlackmanHarris::new(win_size);
-    let windowed_buffer = window.apply(&analysis_buffer);
-
     let mut fft = FFT::new(win_size).expect("Failed to create FFT");
     let mut spectrum = vec![0.0; win_size + 2];
-    fft.do_(&windowed_buffer, &mut spectrum)
+    
+    // aubio's FFT applies a Hanning window by default
+    fft.do_(&analysis_buffer, &mut spectrum)
         .expect("FFT computation failed");
 
     // Get magnitudes from FFT output (only use first half due to Nyquist)
