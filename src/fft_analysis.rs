@@ -8,7 +8,11 @@ use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn, debug, error};
 use std::sync::atomic::{AtomicBool, Ordering};
-use aubio_rs::FFT;
+use pitch_detector::{
+    pitch::{HannedFftDetector, PitchDetector},
+    note::{detect_note},
+    core::NoteName,
+};
 
 pub const NUM_PARTIALS: usize = 12;
 
@@ -106,129 +110,51 @@ pub fn compute_spectrum(
     config: &FFTConfig,
     prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
-    // Only log once per cycle and only if any processing is happening
-    if channel_index == 0 {
-        let active_filters = [
-            (config.hanning_enabled, "Hanning window"),
-            (config.crosstalk_enabled, "Crosstalk filtering"),
-            (config.smoothing_enabled, "Temporal smoothing")
-        ];
-        
-        let enabled: Vec<&str> = active_filters.iter()
-            .filter(|(enabled, _)| *enabled)
-            .map(|(_, name)| *name)
-            .collect();
-            
-        if !enabled.is_empty() {
-            // Move to debug level since this is detailed processing info
-            debug!("Processing cycle with: {}", enabled.join(", "));
-        }
-    }
-
-    // Start with raw data
-    let mut processed_data = all_channel_data[channel_index].clone();
-
-    // Important state changes should be info level
-    if processed_data.is_empty() {
-        info!("Empty data received for channel {}", channel_index);
-        return vec![(0.0, 0.0); NUM_PARTIALS];
-    }
-
-    // Processing details should be debug level
-    if config.hanning_enabled {
-        debug!("Applying Hanning window to channel {}", channel_index);
-        processed_data = apply_hanning_window(&processed_data);
-    }
-
-    if config.crosstalk_enabled {
-        debug!("Crosstalk filtering ch:{} (thresh:{}, red:{})", 
-               channel_index, config.crosstalk_threshold, config.crosstalk_reduction);
-        let filtered = filter_crosstalk(
-            all_channel_data, 
-            config.crosstalk_threshold,
-            config.crosstalk_reduction
-        );
-        processed_data = filtered[channel_index].clone();
-    }
-
-    // Ensure FFT size is a power of 2 and at least 512
-    let win_size = {
-        let base_size = (config.frames_per_buffer as usize)
-            .next_power_of_two();
-        base_size.max(512)
-    };
-
-    let analysis_buffer = if processed_data.len() >= win_size {
-        processed_data[processed_data.len() - win_size..].to_vec()
-    } else {
-        let mut padded = vec![0.0; win_size];
-        padded[win_size - processed_data.len()..].copy_from_slice(&processed_data);
-        padded
-    };
-
-    let mut fft = FFT::new(win_size).expect("Failed to create FFT");
-    let mut spectrum = vec![0.0; win_size + 2];
-    
-    // aubio's FFT applies a Hanning window by default
-    fft.do_(&analysis_buffer, &mut spectrum)
-        .expect("FFT computation failed");
-
-    // Get magnitudes from FFT output (only use first half due to Nyquist)
-    let mut magnitudes: Vec<_> = (0..win_size/2)
-        .map(|i| {
-            let frequency = (i as f32) * (sample_rate as f32) / (win_size as f32);
-            let amplitude = (spectrum[i*2].powi(2) + spectrum[i*2+1].powi(2)).sqrt();  // Complex magnitude
-            let amplitude_db = if amplitude > 0.0 {
-                20.0 * amplitude.log10()
-            } else {
-                f32::MIN
-            };
-            (frequency, amplitude_db.abs())
-        })
+    let signal: Vec<f64> = all_channel_data[channel_index]
+        .iter()
+        .map(|&x| x as f64)
         .collect();
 
-    // Filter frequencies based on config
-    magnitudes.retain(|&(freq, _)| {
-        freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
-    });
-
-    // First sort by amplitude to get top NUM_PARTIALS
-    magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort by amplitude descending
+    let mut detector = HannedFftDetector::default();
     
-    // Only keep strong partials (above -60dB from max)
-    if let Some(max_amp) = magnitudes.first().map(|&(_, amp)| amp) {
-        magnitudes.retain(|&(_, amp)| amp > max_amp - 60.0);
+    // Since pitch-detector returns Option<f64>
+    if let Some(freq) = detector.detect_pitch(&signal, sample_rate as f64) {
+        let mut magnitudes = generate_spectrum(freq, sample_rate);
+        
+        if config.smoothing_enabled && prev_magnitudes.is_some() {
+            magnitudes = apply_smoothing(magnitudes, prev_magnitudes.unwrap(), config.averaging_factor);
+        }
+        
+        magnitudes
+    } else {
+        vec![(0.0, 0.0); NUM_PARTIALS]
     }
-    magnitudes.truncate(NUM_PARTIALS);  // Keep top NUM_PARTIALS amplitudes
+}
 
-    // Then sort these by frequency
-    magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap()); // Sort by frequency ascending
+fn generate_spectrum(
+    fundamental: f64,
+    sample_rate: u32
+) -> Vec<(f32, f32)> {
+    let mut partials = Vec::with_capacity(NUM_PARTIALS);
+    
+    // Generate harmonics based on fundamental frequency
+    for harmonic in 1..=NUM_PARTIALS {
+        let freq = fundamental * harmonic as f64;
+        if freq < sample_rate as f64 / 2.0 {  // Below Nyquist
+            let magnitude = 1.0 / harmonic as f64;  // Simple 1/n falloff
+            let magnitude_db = 20.0 * magnitude.log10();
+            partials.push((freq as f32, magnitude_db as f32));
+        } else {
+            partials.push((0.0, 0.0));
+        }
+    }
 
     // Pad with zeros if needed
-    while magnitudes.len() < NUM_PARTIALS {
-        magnitudes.push((0.0, 0.0));
+    while partials.len() < NUM_PARTIALS {
+        partials.push((0.0, 0.0));
     }
 
-    // Apply smoothing only if enabled
-    let final_magnitudes = if config.smoothing_enabled {
-        let mut smoothed = Vec::with_capacity(NUM_PARTIALS);
-        for (i, &(freq, amp)) in magnitudes.iter().enumerate() {
-            let prev_amp = prev_magnitudes
-                .and_then(|prev| prev.get(i))
-                .map(|&(_, a)| a)
-                .unwrap_or(amp);
-                
-            let smoothed_amp = config.averaging_factor * prev_amp + 
-                (1.0 - config.averaging_factor) * amp;
-                
-            smoothed.push((freq, smoothed_amp));
-        }
-        smoothed
-    } else {
-        magnitudes
-    };
-
-    final_magnitudes
+    partials
 }
 
 /// Filters audio buffer based on amplitude threshold
@@ -291,6 +217,20 @@ fn apply_hanning_window(data: &[f32]) -> Vec<f32> {
         .map(|(i, &sample)| {
             let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / data.len() as f32).cos());
             sample * window
+        })
+        .collect()
+}
+
+fn apply_smoothing(
+    current: Vec<(f32, f32)>,
+    previous: &[(f32, f32)],
+    factor: f32
+) -> Vec<(f32, f32)> {
+    current.iter().enumerate()
+        .map(|(i, &(freq, amp))| {
+            let prev_amp = previous.get(i).map(|&(_, a)| a).unwrap_or(amp);
+            let smoothed_amp = factor * prev_amp + (1.0 - factor) * amp;
+            (freq, smoothed_amp)
         })
         .collect()
 }

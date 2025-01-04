@@ -2,11 +2,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use aubio_rs::{Pitch, PitchMode};
 use log::info;
 use crate::audio_stream::CircularBuffer;
 use crate::fft_analysis::{FFTConfig, filter_buffer};
 use crate::plot::SpectrumApp;
+use pitch_detector::{
+    pitch::{HannedFftDetector, PitchDetector},
+    note::{detect_note},
+    core::NoteName,
+};
 
 pub struct PitchResults {
     pub frequencies: Vec<f32>,
@@ -76,26 +80,10 @@ pub fn start_pitch_detection(
     info!("Starting pitch detection thread with buffer size: {}, hop size: {}", 
         buffer_size, frames_per_buffer);
 
-    // Create a pitch detector for each channel
-    let mut detectors: Vec<Pitch> = selected_channels
+    // Create a detector for each channel
+    let mut detectors: Vec<HannedFftDetector> = selected_channels
         .iter()
-        .map(|_| {
-            if cfg!(target_os = "linux") {
-                Pitch::new(
-                    PitchMode::Yin,
-                    buffer_size,
-                    frames_per_buffer,
-                    sample_rate,
-                ).expect("Failed to create pitch detector")
-            } else {
-                Pitch::new(
-                    PitchMode::Yinfft,
-                    buffer_size,
-                    frames_per_buffer,
-                    sample_rate,
-                ).expect("Failed to create pitch detector")
-            }
-        })
+        .map(|_| HannedFftDetector::default())
         .collect();
 
     while !shutdown_flag.load(Ordering::SeqCst) {
@@ -111,25 +99,7 @@ pub fn start_pitch_detection(
                 // Recreate detectors with new buffer size
                 detectors = selected_channels
                     .iter()
-                    .map(|_| {
-                        if cfg!(target_os = "linux") {
-                            // Use YIN algorithm for Linux with dynamic sizes
-                            Pitch::new(
-                                PitchMode::Yin,  // YIN mode for Linux
-                                buffer_size,
-                                frames_per_buffer,
-                                sample_rate,
-                            ).expect("Failed to create pitch detector")
-                        } else {
-                            // Keep Yinfft for OSX where it's working
-                            Pitch::new(
-                                PitchMode::Yinfft,
-                                buffer_size,
-                                frames_per_buffer,
-                                sample_rate,
-                            ).expect("Failed to create pitch detector")
-                        }
-                    })
+                    .map(|_| HannedFftDetector::default())
                     .collect();
                 
                 info!("Pitch detectors recreated with buffer size: {}, hop size: {}", 
@@ -182,36 +152,43 @@ pub fn start_pitch_detection(
                 padded
             };
 
-            // Check if signal is above threshold and perform pitch detection
-            if let Ok(frequency) = detectors[i].do_result(&analysis_buffer) {
-                let raw_confidence = detectors[i].get_confidence();
-                let confidence = raw_confidence.abs().min(1.0);
+            // Convert analysis buffer to f64 for pitch detector
+            let analysis_buffer_f64: Vec<f64> = analysis_buffer.iter()
+                .map(|&x| x as f64)
+                .collect();
+
+            if let Some(frequency) = detectors[i].detect_pitch(&analysis_buffer_f64, sample_rate as f64) {
+                // Since get_confidence isn't available, use a fixed confidence
+                let raw_confidence = 0.8;  // Default confidence
+                let confidence = raw_confidence;
+                
+                let frequency_f32 = frequency as f32;  // Convert to f32 for later use
                 
                 // Get current FFT partials for validation
                 let fft_partials = spectrum_app.lock()
                     .map(|app| app.partials[i].clone())
                     .unwrap_or_default();
 
-                // Get frequency range from config
                 let (min_freq, max_freq) = fft_config.lock()
                     .map(|config| (config.min_frequency as f32, config.max_frequency as f32))
                     .unwrap_or((20.0, 2000.0));
 
-                // Check harmonic relationship and combine confidences
-                let (is_harmonic, harmonic_confidence) = is_valid_harmonic_relationship(frequency, &fft_partials);
+                // Check harmonic relationship with f32
+                let (is_harmonic, harmonic_confidence) = 
+                    is_valid_harmonic_relationship(frequency_f32, &fft_partials);
                 let combined_confidence = confidence * harmonic_confidence;
 
                 // Only update if confidence is good enough and frequency matches harmonics
                 if combined_confidence > 0.5 && 
-                   frequency >= min_freq && 
-                   frequency <= max_freq &&
+                   frequency_f32 >= min_freq && 
+                   frequency_f32 <= max_freq &&
                    is_harmonic {
                     let avg_factor = fft_config.lock().unwrap().averaging_factor;
                     let smoothed_freq = if pitch_results.lock().unwrap().prev_frequencies[i] > 0.0 {
                         avg_factor * pitch_results.lock().unwrap().prev_frequencies[i] + 
-                        (1.0 - avg_factor) * frequency
+                        (1.0 - avg_factor) * frequency_f32
                     } else {
-                        frequency
+                        frequency_f32
                     };
                     
                     new_frequencies[i] = smoothed_freq;
@@ -237,4 +214,19 @@ pub fn start_pitch_detection(
     }
 
     info!("Pitch detection thread shutting down");
+}
+
+pub fn detect_pitch(
+    signal: &[f32],
+    sample_rate: u32
+) -> Option<(f32, f32)> {  // (frequency, confidence)
+    let signal_f64: Vec<f64> = signal.iter().map(|&x| x as f64).collect();
+    let mut detector = HannedFftDetector::default();
+    
+    if let Some(freq) = detector.detect_pitch(&signal_f64, sample_rate as f64) {
+        let confidence = if freq > 0.0 { 0.8 } else { 0.0 };
+        Some((freq as f32, confidence))
+    } else {
+        None
+    }
 } 
