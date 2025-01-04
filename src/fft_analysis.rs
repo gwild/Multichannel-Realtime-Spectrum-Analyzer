@@ -6,12 +6,10 @@ use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::{info, warn, debug, error};
+use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use pitch_detector::{
     pitch::{HannedFftDetector, PitchDetector},
-    note::{detect_note},
-    core::NoteName,
 };
 
 pub const NUM_PARTIALS: usize = 12;
@@ -23,14 +21,8 @@ pub struct FFTConfig {
     pub db_threshold: f64,
     #[allow(dead_code)]
     pub num_channels: usize,
-    pub averaging_factor: f32,  // Add averaging factor (0.0 to 1.0)
-    pub frames_per_buffer: u32,  // Add frames per buffer setting
-    pub crosstalk_threshold: f32,  // Add crosstalk threshold (0.0 to 1.0)
-    pub crosstalk_reduction: f32,  // Add reduction factor (0.0 to 1.0)
-    pub crosstalk_enabled: bool,  // Add enable flag for crosstalk filtering
-    pub harmonic_enabled: bool,   // Add enable flag for harmonic filtering
-    pub smoothing_enabled: bool,    // For temporal smoothing
-    pub hanning_enabled: bool,      // For Hanning window
+    pub averaging_factor: f32,
+    pub frames_per_buffer: u32,
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -107,8 +99,8 @@ pub fn compute_spectrum(
     all_channel_data: &[Vec<f32>],
     channel_index: usize,
     sample_rate: u32, 
-    config: &FFTConfig,
-    prev_magnitudes: Option<&[(f32, f32)]>
+    _config: &FFTConfig,
+    _prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
     let signal: Vec<f64> = all_channel_data[channel_index]
         .iter()
@@ -117,15 +109,8 @@ pub fn compute_spectrum(
 
     let mut detector = HannedFftDetector::default();
     
-    // Since pitch-detector returns Option<f64>
     if let Some(freq) = detector.detect_pitch(&signal, sample_rate as f64) {
-        let mut magnitudes = generate_spectrum(freq, sample_rate);
-        
-        if config.smoothing_enabled && prev_magnitudes.is_some() {
-            magnitudes = apply_smoothing(magnitudes, prev_magnitudes.unwrap(), config.averaging_factor);
-        }
-        
-        magnitudes
+        generate_spectrum(freq, sample_rate)
     } else {
         vec![(0.0, 0.0); NUM_PARTIALS]
     }
@@ -159,79 +144,12 @@ fn generate_spectrum(
 }
 
 /// Filters audio buffer based on amplitude threshold
+#[allow(dead_code)]
 pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
     let linear_threshold = 10.0_f32.powf((db_threshold as f32) / 20.0);
     buffer
         .iter()
         .cloned()
         .filter(|&sample| sample.abs() >= linear_threshold)
-        .collect()
-}
-
-/// Reduces crosstalk between channels
-fn filter_crosstalk(
-    channel_data: &[Vec<f32>],
-    threshold: f32,
-    reduction: f32
-) -> Vec<Vec<f32>> {
-    if channel_data.is_empty() {
-        return Vec::new();
-    }
-
-    let num_channels = channel_data.len();
-    let samples_per_channel = channel_data[0].len();
-    let mut filtered = vec![vec![0.0; samples_per_channel]; num_channels];
-
-    for sample_idx in 0..samples_per_channel {
-        // Get all channel values for this sample
-        let sample_values: Vec<f32> = channel_data.iter()
-            .map(|channel| channel[sample_idx])
-            .collect();
-
-        // Process each channel
-        for (ch_idx, channel) in channel_data.iter().enumerate() {
-            let main_signal = channel[sample_idx];
-            let mut crosstalk = 0.0;
-
-            // Calculate crosstalk from other channels
-            for (other_idx, &other_val) in sample_values.iter().enumerate() {
-                if other_idx != ch_idx {
-                    let ratio = (other_val / main_signal).abs();
-                    if ratio > threshold {
-                        crosstalk += other_val * reduction;
-                    }
-                }
-            }
-
-            // Subtract crosstalk from main signal
-            filtered[ch_idx][sample_idx] = main_signal - crosstalk;
-        }
-    }
-
-    filtered
-}
-
-// Add Hanning window function
-fn apply_hanning_window(data: &[f32]) -> Vec<f32> {
-    data.iter()
-        .enumerate()
-        .map(|(i, &sample)| {
-            let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / data.len() as f32).cos());
-            sample * window
-        })
-        .collect()
-}
-
-fn apply_smoothing(
-    current: Vec<(f32, f32)>,
-    previous: &[(f32, f32)],
-    factor: f32
-) -> Vec<(f32, f32)> {
-    current.iter().enumerate()
-        .map(|(i, &(freq, amp))| {
-            let prev_amp = previous.get(i).map(|&(_, a)| a).unwrap_or(amp);
-            let smoothed_amp = factor * prev_amp + (1.0 - factor) * amp;
-            (freq, smoothed_amp)
-        })
         .collect()
 }

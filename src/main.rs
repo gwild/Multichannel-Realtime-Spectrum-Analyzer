@@ -2,7 +2,6 @@ mod audio_stream;
 mod fft_analysis;
 mod plot;
 mod utils;
-mod pitch_detection;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -15,11 +14,10 @@ use std::sync::{
 };
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
-use log::{info, error, warn, debug};
+use log::{info, error, warn};
 use env_logger;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
-use crate::pitch_detection::{PitchResults, start_pitch_detection};
 
 fn main() {
     // Set up proper logging filters
@@ -181,12 +179,6 @@ fn run() -> Result<()> {
         num_channels: selected_channels.len(),
         averaging_factor: 0.9,
         frames_per_buffer,
-        crosstalk_threshold: 0.3,
-        crosstalk_reduction: 0.5,
-        crosstalk_enabled: true,
-        harmonic_enabled: true,
-        smoothing_enabled: true,
-        hanning_enabled: true,
     }));
 
     let running = Arc::new(AtomicBool::new(false));
@@ -242,30 +234,6 @@ fn run() -> Result<()> {
         }
     });
 
-    let pitch_results = Arc::new(Mutex::new(PitchResults::new(selected_channels.len())));
-
-    // Start pitch detection thread
-    info!("Starting pitch detection thread...");
-    let pitch_thread = std::thread::spawn({
-        let audio_buffer = Arc::clone(&audio_buffer);
-        let pitch_results = Arc::clone(&pitch_results);
-        let selected_channels = selected_channels.clone();
-        let shutdown_flag = Arc::clone(&shutdown_flag);
-        let fft_config = Arc::clone(&fft_config);
-        let spectrum_app = Arc::clone(&spectrum_app);
-        move || {
-            start_pitch_detection(
-                audio_buffer,
-                pitch_results,
-                selected_sample_rate as u32,
-                selected_channels,
-                shutdown_flag,
-                fft_config,
-                spectrum_app,
-            );
-        }
-    });
-
     // Start GUI
     info!("Starting GUI...");
     let app = plot::MyApp::new(
@@ -274,11 +242,10 @@ fn run() -> Result<()> {
         buffer_size.clone(),
         audio_buffer.clone(),
         shutdown_flag.clone(),
-        pitch_results.clone(),
     );
 
     let native_options = NativeOptions {
-        initial_window_size: Some(egui::vec2(1024.0, 600.0)),
+        initial_window_size: Some(egui::vec2(1024.0, 420.0)),
         vsync: true,
         ..Default::default()
     };
@@ -306,12 +273,6 @@ fn run() -> Result<()> {
         info!("FFT thread terminated successfully");
     } else {
         warn!("FFT thread may not have terminated cleanly");
-    }
-
-    if let Ok(_) = pitch_thread.join() {
-        info!("Pitch detection thread terminated successfully");
-    } else {
-        warn!("Pitch detection thread may not have terminated cleanly");
     }
 
     Ok(())

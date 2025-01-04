@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES};
-use crate::pitch_detection::PitchResults;
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -51,7 +50,6 @@ pub struct MyApp {
     // Throttling: Added to track the last repaint time
     last_repaint: Instant, // Reminder: This field was added to implement GUI throttling. Do not modify without permission.
     shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
-    pub pitch_results: Arc<Mutex<PitchResults>>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -62,7 +60,6 @@ impl MyApp {
         buffer_size: Arc<Mutex<usize>>,
         audio_buffer: Arc<RwLock<CircularBuffer>>,
         shutdown_flag: Arc<AtomicBool>,
-        pitch_results: Arc<Mutex<PitchResults>>,
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -86,7 +83,6 @@ impl MyApp {
             bar_width: 5.0,
             last_repaint: Instant::now(),
             shutdown_flag,
-            pitch_results,
         };
 
         // FIX IMPLEMENTATION:
@@ -285,7 +281,6 @@ impl eframe::App for MyApp {
             if ui.button("Reset to Defaults").clicked() {
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
-                    // Store old values to check if we really need a restart
                     let old_frames = fft_config.frames_per_buffer;
                     
                     // Reset FFT config
@@ -293,14 +288,6 @@ impl eframe::App for MyApp {
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
                     fft_config.averaging_factor = 0.8;
-                    fft_config.crosstalk_threshold = 0.3;
-                    fft_config.crosstalk_reduction = 0.5;
-                    
-                    // Reset enable flags to defaults
-                    fft_config.crosstalk_enabled = true;
-                    fft_config.harmonic_enabled = true;
-                    fft_config.smoothing_enabled = true;
-                    fft_config.hanning_enabled = true;
                     
                     // Only change frames_per_buffer if platform requires it
                     let new_frames = if cfg!(target_os = "linux") {
@@ -408,81 +395,6 @@ impl eframe::App for MyApp {
                     ));
                 }
             });
-
-            // Add pitch information display
-            ui.separator();
-            ui.label("Channel Pitch Information");
-
-            if let Ok(pitch_data) = self.pitch_results.lock() {
-                for (i, (freq, conf)) in pitch_data.frequencies.iter()
-                    .zip(pitch_data.confidences.iter())
-                    .enumerate()
-                {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Channel {}: {:.1} Hz (Confidence: {:.1}%)", 
-                            i + 1, 
-                            freq, 
-                            conf * 100.0));
-                    });
-                }
-            }
-
-            // Signal Processing Controls
-            ui.separator();
-            ui.heading("Signal Processing");
-
-            // Temporal Smoothing Section
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                ui.checkbox(&mut fft_config.smoothing_enabled, "Enable Temporal Smoothing");
-            });
-            if let Ok(mut fft_config) = self.fft_config.lock() {
-                if fft_config.smoothing_enabled {
-                    ui.horizontal(|ui| {
-                        ui.label("Smoothing Factor:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.averaging_factor, 0.0..=0.99)
-                                .text("factor")
-                        );
-                    });
-                }
-            }
-
-            // Window Function Section
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                ui.checkbox(&mut fft_config.hanning_enabled, "Enable Hanning Window");
-            });
-
-            // Harmonic Filtering Section
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                ui.checkbox(&mut fft_config.harmonic_enabled, "Enable Harmonic Filtering");
-            });
-
-            // Crosstalk Section (existing code)
-            ui.separator();
-            ui.label("Crosstalk Filtering");
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                ui.checkbox(&mut fft_config.crosstalk_enabled, "Enable Crosstalk Filtering");
-            });
-            if let Ok(mut fft_config) = self.fft_config.lock() {
-                if fft_config.crosstalk_enabled {
-                    ui.horizontal(|ui| {
-                        ui.label("Crosstalk Threshold:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
-                                .text("ratio")
-                        );
-                        ui.label("Reduction:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
-                                .text("factor")
-                        );
-                    });
-                }
-            }
         });
     }
 }
