@@ -23,6 +23,10 @@ pub struct FFTConfig {
     pub frames_per_buffer: u32,  // Add frames per buffer setting
     pub crosstalk_threshold: f32,  // Add crosstalk threshold (0.0 to 1.0)
     pub crosstalk_reduction: f32,  // Add reduction factor (0.0 to 1.0)
+    pub crosstalk_enabled: bool,  // Add enable flag for crosstalk filtering
+    pub harmonic_enabled: bool,   // Add enable flag for harmonic filtering
+    pub smoothing_enabled: bool,    // For temporal smoothing
+    pub hanning_enabled: bool,      // For Hanning window
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -92,27 +96,32 @@ fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> 
 
 /// Computes the frequency spectrum from the audio buffer.
 pub fn compute_spectrum(
-    all_channel_data: &[Vec<f32>],  // Change input to include all channels
+    all_channel_data: &[Vec<f32>],
     channel_index: usize,
     sample_rate: u32, 
     config: &FFTConfig,
     prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
-    // Apply crosstalk filtering first
-    let filtered_channels = filter_crosstalk(
-        all_channel_data,
-        config.crosstalk_threshold,
-        config.crosstalk_reduction
-    );
+    // Only apply crosstalk filtering if enabled
+    let channel_data = if config.crosstalk_enabled {
+        let filtered_channels = filter_crosstalk(
+            all_channel_data,
+            config.crosstalk_threshold,
+            config.crosstalk_reduction
+        );
+        filtered_channels[channel_index].clone()
+    } else {
+        all_channel_data[channel_index].clone()
+    };
 
-    let channel_data = &filtered_channels[channel_index];
-    if channel_data.is_empty() {
-        return vec![(0.0, 0.0); NUM_PARTIALS];
-    }
+    // Apply Hanning window if enabled
+    let windowed_data = if config.hanning_enabled {
+        apply_hanning_window(&channel_data)
+    } else {
+        channel_data
+    };
 
-    // Use the common filtering function
-    let filtered_buffer = filter_buffer(channel_data, config.db_threshold);
-    if filtered_buffer.is_empty() {
+    if windowed_data.is_empty() {
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
@@ -123,11 +132,11 @@ pub fn compute_spectrum(
         base_size.max(512)
     };
 
-    let analysis_buffer = if filtered_buffer.len() >= win_size {
-        filtered_buffer[filtered_buffer.len() - win_size..].to_vec()
+    let analysis_buffer = if windowed_data.len() >= win_size {
+        windowed_data[windowed_data.len() - win_size..].to_vec()
     } else {
         let mut padded = vec![0.0; win_size];
-        padded[win_size - filtered_buffer.len()..].copy_from_slice(&filtered_buffer);
+        padded[win_size - windowed_data.len()..].copy_from_slice(&windowed_data);
         padded
     };
 
@@ -174,21 +183,26 @@ pub fn compute_spectrum(
         magnitudes.push((0.0, 0.0));
     }
 
-    // Apply smoothing
-    let mut smoothed_magnitudes = Vec::with_capacity(NUM_PARTIALS);
-    for (i, &(freq, amp)) in magnitudes.iter().enumerate() {
-        let prev_amp = prev_magnitudes
-            .and_then(|prev| prev.get(i))
-            .map(|&(_, a)| a)
-            .unwrap_or(amp);
-            
-        let smoothed_amp = config.averaging_factor * prev_amp + 
-            (1.0 - config.averaging_factor) * amp;
-            
-        smoothed_magnitudes.push((freq, smoothed_amp));
-    }
+    // Apply smoothing only if enabled
+    let final_magnitudes = if config.smoothing_enabled {
+        let mut smoothed = Vec::with_capacity(NUM_PARTIALS);
+        for (i, &(freq, amp)) in magnitudes.iter().enumerate() {
+            let prev_amp = prev_magnitudes
+                .and_then(|prev| prev.get(i))
+                .map(|&(_, a)| a)
+                .unwrap_or(amp);
+                
+            let smoothed_amp = config.averaging_factor * prev_amp + 
+                (1.0 - config.averaging_factor) * amp;
+                
+            smoothed.push((freq, smoothed_amp));
+        }
+        smoothed
+    } else {
+        magnitudes
+    };
 
-    smoothed_magnitudes
+    final_magnitudes
 }
 
 /// Filters audio buffer based on amplitude threshold
@@ -242,4 +256,15 @@ fn filter_crosstalk(
     }
 
     filtered
+}
+
+// Add Hanning window function
+fn apply_hanning_window(data: &[f32]) -> Vec<f32> {
+    data.iter()
+        .enumerate()
+        .map(|(i, &sample)| {
+            let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / data.len() as f32).cos());
+            sample * window
+        })
+        .collect()
 }

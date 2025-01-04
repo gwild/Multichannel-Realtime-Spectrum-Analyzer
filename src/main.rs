@@ -17,7 +17,6 @@ use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
-use std::env;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
 use crate::pitch_detection::{PitchResults, start_pitch_detection};
@@ -25,12 +24,8 @@ use crate::pitch_detection::{PitchResults, start_pitch_detection};
 fn main() {
     // Only set up logging if --enable-logs flag is present
     if std::env::args().any(|arg| arg == "--enable-logs") {
-        // Only set RUST_LOG if it's not already set
-        if std::env::var("RUST_LOG").is_err() {
-            env::set_var("RUST_LOG", "info");
-        }
+        // Don't set RUST_LOG - let the environment variable control it
         env_logger::init();
-        info!("Application starting...");
     }
 
     if let Err(e) = run() {
@@ -175,8 +170,12 @@ fn run() -> Result<()> {
         num_channels: selected_channels.len(),
         averaging_factor: 0.9,
         frames_per_buffer,
-        crosstalk_threshold: 0.3,  // Default threshold
-        crosstalk_reduction: 0.5,   // Default reduction
+        crosstalk_threshold: 0.3,
+        crosstalk_reduction: 0.5,
+        crosstalk_enabled: true,
+        harmonic_enabled: true,
+        smoothing_enabled: true,
+        hanning_enabled: true,
     }));
 
     let running = Arc::new(AtomicBool::new(false));

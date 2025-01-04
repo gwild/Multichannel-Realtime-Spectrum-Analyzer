@@ -5,7 +5,7 @@ use egui::plot::{Plot, BarChart};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
-use log::info;
+use log::{info, debug};
 use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
@@ -99,7 +99,7 @@ impl MyApp {
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
                 cfg.max_frequency = nyquist_limit;
-                info!("Clamped max frequency at startup to {}", cfg.max_frequency);
+                debug!("Clamped max frequency at startup to {}", cfg.max_frequency);
             }
         }
 
@@ -401,20 +401,62 @@ impl eframe::App for MyApp {
                 }
             }
 
-            // Add crosstalk controls
+            // Signal Processing Controls
+            ui.separator();
+            ui.heading("Signal Processing");
+
+            // Temporal Smoothing Section
             ui.horizontal(|ui| {
                 let mut fft_config = self.fft_config.lock().unwrap();
-                ui.label("Crosstalk Threshold:");
-                ui.add(
-                    egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
-                        .text("ratio")
-                );
-                ui.label("Reduction:");
-                ui.add(
-                    egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
-                        .text("factor")
-                );
+                ui.checkbox(&mut fft_config.smoothing_enabled, "Enable Temporal Smoothing");
             });
+            if let Ok(mut fft_config) = self.fft_config.lock() {
+                if fft_config.smoothing_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Smoothing Factor:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.averaging_factor, 0.0..=0.99)
+                                .text("factor")
+                        );
+                    });
+                }
+            }
+
+            // Window Function Section
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.checkbox(&mut fft_config.hanning_enabled, "Enable Hanning Window");
+            });
+
+            // Harmonic Filtering Section
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.checkbox(&mut fft_config.harmonic_enabled, "Enable Harmonic Filtering");
+            });
+
+            // Crosstalk Section (existing code)
+            ui.separator();
+            ui.label("Crosstalk Filtering");
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.checkbox(&mut fft_config.crosstalk_enabled, "Enable Crosstalk Filtering");
+            });
+            if let Ok(mut fft_config) = self.fft_config.lock() {
+                if fft_config.crosstalk_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Crosstalk Threshold:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
+                                .text("ratio")
+                        );
+                        ui.label("Reduction:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
+                                .text("factor")
+                        );
+                    });
+                }
+            }
         });
     }
 }
