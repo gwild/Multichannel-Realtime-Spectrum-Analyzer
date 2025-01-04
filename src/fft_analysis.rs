@@ -142,8 +142,9 @@ fn generate_spectrum(
         let freq = fundamental * harmonic as f64;
         if freq < sample_rate as f64 / 2.0 {  // Below Nyquist
             let magnitude = 1.0 / harmonic as f64;  // Simple 1/n falloff
-            let magnitude_db = 20.0 * magnitude.log10();
-            partials.push((freq as f32, magnitude_db as f32));
+            // Convert directly to amplitude without going through dB
+            let amplitude = (80.0 * magnitude) as f32;  // Scale to 0-80 range
+            partials.push((freq as f32, amplitude));
         } else {
             partials.push((0.0, 0.0));
         }

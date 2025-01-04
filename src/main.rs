@@ -64,12 +64,13 @@ fn run() -> Result<()> {
 
     info!("Retrieved list of audio devices.");
     println!("Available Input Devices:");
+    
+    // Create a mapping of display index to actual device index
     let mut input_devices = Vec::new();
-
-    for (i, device) in devices.iter().enumerate() {
+    for (_i, device) in devices.iter().enumerate() {
         let (index, info) = device;
         if info.max_input_channels > 0 {
-            println!("  [{}] - {} ({} channels)", i, info.name, info.max_input_channels);
+            println!("  [{}] - {} ({} channels)", input_devices.len(), info.name, info.max_input_channels);
             if ensure_audio_device_ready(&pa, *index) {
                 input_devices.push(*index);
             } else {
@@ -92,8 +93,9 @@ fn run() -> Result<()> {
         .map_err(|_| anyhow!("Invalid device index"))?;
 
     if device_index >= input_devices.len() {
-        return Err(anyhow!("Invalid device index."));
+        return Err(anyhow!("Invalid device index. Please choose a number between 0 and {}", input_devices.len() - 1));
     }
+    
     let selected_device_index = input_devices[device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
     info!(

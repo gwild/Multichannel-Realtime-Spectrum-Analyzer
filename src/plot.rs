@@ -273,7 +273,7 @@ impl eframe::App for MyApp {
             // 3) Sliders for Y scale, alpha, bar width
             ui.horizontal(|ui| {
                 ui.label("Y Max:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text("dB"));
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=80.0).text(""));
                 ui.label("Alpha:");
                 ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
                 ui.label("Bar Width:");
