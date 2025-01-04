@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::{info, warn};
+use log::{info, warn, debug, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use aubio_rs::FFT;
 
@@ -78,7 +78,11 @@ pub fn start_fft_processing(
             }));
 
             if let Err(e) = result {
+                error!("FFT computation failed: {:?}", e);
                 warn!("Panic in FFT thread: {:?}", e);
+                
+                error!("Failed to allocate FFT buffer");
+                warn!("Buffer size mismatch, adjusting...");
             }
         }
         info!("FFT processing thread shutting down.");
@@ -102,27 +106,49 @@ pub fn compute_spectrum(
     config: &FFTConfig,
     prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
-    // Only apply crosstalk filtering if enabled
-    let channel_data = if config.crosstalk_enabled {
-        let filtered_channels = filter_crosstalk(
-            all_channel_data,
+    // Only log once per cycle and only if any processing is happening
+    if channel_index == 0 {
+        let active_filters = [
+            (config.hanning_enabled, "Hanning window"),
+            (config.crosstalk_enabled, "Crosstalk filtering"),
+            (config.smoothing_enabled, "Temporal smoothing")
+        ];
+        
+        let enabled: Vec<&str> = active_filters.iter()
+            .filter(|(enabled, _)| *enabled)
+            .map(|(_, name)| *name)
+            .collect();
+            
+        if !enabled.is_empty() {
+            // Move to debug level since this is detailed processing info
+            debug!("Processing cycle with: {}", enabled.join(", "));
+        }
+    }
+
+    // Start with raw data
+    let mut processed_data = all_channel_data[channel_index].clone();
+
+    // Important state changes should be info level
+    if processed_data.is_empty() {
+        info!("Empty data received for channel {}", channel_index);
+        return vec![(0.0, 0.0); NUM_PARTIALS];
+    }
+
+    // Processing details should be debug level
+    if config.hanning_enabled {
+        debug!("Applying Hanning window to channel {}", channel_index);
+        processed_data = apply_hanning_window(&processed_data);
+    }
+
+    if config.crosstalk_enabled {
+        debug!("Crosstalk filtering ch:{} (thresh:{}, red:{})", 
+               channel_index, config.crosstalk_threshold, config.crosstalk_reduction);
+        let filtered = filter_crosstalk(
+            all_channel_data, 
             config.crosstalk_threshold,
             config.crosstalk_reduction
         );
-        filtered_channels[channel_index].clone()
-    } else {
-        all_channel_data[channel_index].clone()
-    };
-
-    // Apply Hanning window if enabled
-    let windowed_data = if config.hanning_enabled {
-        apply_hanning_window(&channel_data)
-    } else {
-        channel_data
-    };
-
-    if windowed_data.is_empty() {
-        return vec![(0.0, 0.0); NUM_PARTIALS];
+        processed_data = filtered[channel_index].clone();
     }
 
     // Ensure FFT size is a power of 2 and at least 512
@@ -132,11 +158,11 @@ pub fn compute_spectrum(
         base_size.max(512)
     };
 
-    let analysis_buffer = if windowed_data.len() >= win_size {
-        windowed_data[windowed_data.len() - win_size..].to_vec()
+    let analysis_buffer = if processed_data.len() >= win_size {
+        processed_data[processed_data.len() - win_size..].to_vec()
     } else {
         let mut padded = vec![0.0; win_size];
-        padded[win_size - windowed_data.len()..].copy_from_slice(&windowed_data);
+        padded[win_size - processed_data.len()..].copy_from_slice(&processed_data);
         padded
     };
 

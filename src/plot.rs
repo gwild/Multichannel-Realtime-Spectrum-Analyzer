@@ -108,18 +108,19 @@ impl MyApp {
     }
 
     pub fn update_buffer_size(&mut self, new_size: usize) {
-        // Ensure minimum size of 512 and power of 2
         let validated_size = new_size
             .next_power_of_two()
             .max(512)
             .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
         
+        // Only log size adjustments at info level
         if validated_size != new_size {
-            info!(
-                "Adjusted requested buffer size from {} to {} (power of 2 between {} and {})",
-                new_size, validated_size, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE
-            );
+            info!("Buffer size adjusted: {} → {}", new_size, validated_size);
         }
+        
+        // Log detailed calculations at debug level
+        debug!("Buffer validation: min={}, max={}, power_of_2={}", 
+               MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, validated_size);
         
         // Update frame size if necessary
         if let Ok(mut fft_config) = self.fft_config.lock() {
@@ -284,19 +285,35 @@ impl eframe::App for MyApp {
             if ui.button("Reset to Defaults").clicked() {
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
+                    // Store old values to check if we really need a restart
+                    let old_frames = fft_config.frames_per_buffer;
+                    
+                    // Reset FFT config
                     fft_config.min_frequency = MIN_FREQ;
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
                     fft_config.averaging_factor = 0.8;
-                    fft_config.crosstalk_threshold = 0.3;  // Add default crosstalk threshold
-                    fft_config.crosstalk_reduction = 0.5;  // Add default crosstalk reduction
+                    fft_config.crosstalk_threshold = 0.3;
+                    fft_config.crosstalk_reduction = 0.5;
                     
-                    // Platform-specific default frames per buffer
-                    fft_config.frames_per_buffer = if cfg!(target_os = "linux") {
+                    // Reset enable flags to defaults
+                    fft_config.crosstalk_enabled = true;
+                    fft_config.harmonic_enabled = true;
+                    fft_config.smoothing_enabled = true;
+                    fft_config.hanning_enabled = true;
+                    
+                    // Only change frames_per_buffer if platform requires it
+                    let new_frames = if cfg!(target_os = "linux") {
                         1024  // Larger buffer for Linux stability
                     } else {
                         512   // Default for other platforms
                     };
+                    
+                    // Only update if different to avoid unnecessary restarts
+                    if old_frames != new_frames {
+                        fft_config.frames_per_buffer = new_frames;
+                        debug!("Frames per buffer changed from {} to {}", old_frames, new_frames);
+                    }
                 }
                 
                 self.y_scale = 80.0;
@@ -306,7 +323,16 @@ impl eframe::App for MyApp {
                 // Calculate optimal size based on current sample rate
                 let sample_rate = 48000.0f64;
                 let optimal_size = calculate_optimal_buffer_size(sample_rate);
-                self.update_buffer_size(optimal_size);
+                
+                // Fix: Get current size without holding the lock during update
+                let needs_update = {
+                    let current_size = *self.buffer_size.lock().unwrap();
+                    current_size != optimal_size
+                };
+                
+                if needs_update {
+                    self.update_buffer_size(optimal_size);
+                }
                 
                 reset_clicked = true;
             }

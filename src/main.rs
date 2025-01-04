@@ -15,16 +15,25 @@ use std::sync::{
 };
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use env_logger;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
 use crate::pitch_detection::{PitchResults, start_pitch_detection};
 
 fn main() {
-    // Only set up logging if --enable-logs flag is present
+    // Set up proper logging filters
     if std::env::args().any(|arg| arg == "--enable-logs") {
-        // Don't set RUST_LOG - let the environment variable control it
+        // Don't override RUST_LOG if it's already set
+        if std::env::var("RUST_LOG").is_err() {
+            // Default to info if no level specified
+            std::env::set_var("RUST_LOG", 
+                "audio_streaming=info,\
+                 audio_streaming::fft_analysis=info,\
+                 audio_streaming::audio_stream=info,\
+                 audio_streaming::pitch_detection=info");
+        }
+        // This will respect the RUST_LOG environment variable level
         env_logger::init();
     }
 
@@ -267,7 +276,7 @@ fn run() -> Result<()> {
     );
 
     let native_options = NativeOptions {
-        initial_window_size: Some(egui::vec2(1024.0, 500.0)),
+        initial_window_size: Some(egui::vec2(1024.0, 600.0)),
         vsync: true,
         ..Default::default()
     };
