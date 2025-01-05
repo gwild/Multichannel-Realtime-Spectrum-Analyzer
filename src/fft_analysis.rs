@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 use rayon::prelude::*;
+use std::f32::consts::PI;
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
@@ -23,6 +24,7 @@ pub struct FFTConfig {
     pub num_channels: usize,
     pub averaging_factor: f32,
     pub frames_per_buffer: u32,
+    pub window_type: WindowType,
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -101,6 +103,17 @@ fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> 
         .collect()
 }
 
+/// Filters audio buffer based on amplitude threshold
+#[allow(dead_code)]
+pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
+    let linear_threshold = 10.0_f32.powf((db_threshold as f32) / 20.0);
+    buffer
+        .iter()
+        .cloned()
+        .filter(|&sample| sample.abs() >= linear_threshold)
+        .collect()
+}
+
 /// Computes the frequency spectrum from the audio buffer.
 pub fn compute_spectrum(
     all_channel_data: &[Vec<f32>],
@@ -127,12 +140,15 @@ pub fn compute_spectrum(
         return vec![(0.0, -100.0); NUM_PARTIALS];
     }
 
+    // Apply window to filtered signal
+    let windowed_signal = apply_window(&filtered_signal, config.window_type);
+
     // Create FFT planner
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(filtered_signal.len());
+    let fft = planner.plan_fft_forward(windowed_signal.len());
     
     // Create buffers
-    let mut indata = filtered_signal;
+    let mut indata = windowed_signal;  // Use windowed signal
     let mut spectrum = fft.make_output_vec();
     
     // Perform FFT
@@ -182,13 +198,93 @@ pub fn compute_spectrum(
     top_magnitudes
 }
 
-/// Filters audio buffer based on amplitude threshold
-#[allow(dead_code)]
-pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
-    let linear_threshold = 10.0_f32.powf((db_threshold as f32) / 20.0);
-    buffer
-        .iter()
-        .cloned()
-        .filter(|&sample| sample.abs() >= linear_threshold)
+/// Window function types
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WindowType {
+    Rectangular,  // No window (flat)
+    Hanning,
+    Hamming,     // Similar to Hanning but doesn't go to zero at edges
+    BlackmanHarris,
+    FlatTop,     // Best amplitude accuracy
+    Kaiser(f32), // Adjustable side-lobe level, beta parameter
+}
+
+fn apply_window(signal: &[f32], window_type: WindowType) -> Vec<f32> {
+    let len = signal.len();
+    let window = match window_type {
+        WindowType::Rectangular => vec![1.0; len],
+        WindowType::Hanning => hanning_window(len),
+        WindowType::Hamming => hamming_window(len),
+        WindowType::BlackmanHarris => blackman_harris_window(len),
+        WindowType::FlatTop => flattop_window(len),
+        WindowType::Kaiser(beta) => kaiser_window(len, beta),
+    };
+    
+    signal.iter()
+        .zip(window.iter())
+        .map(|(&s, &w)| s * w)
         .collect()
+}
+
+fn hamming_window(len: usize) -> Vec<f32> {
+    (0..len).map(|i| {
+        let x = 2.0 * PI * i as f32 / (len - 1) as f32;
+        0.54 - 0.46 * x.cos()
+    }).collect()
+}
+
+fn flattop_window(len: usize) -> Vec<f32> {
+    let a0 = 0.21557895;
+    let a1 = 0.41663158;
+    let a2 = 0.277263158;
+    let a3 = 0.083578947;
+    let a4 = 0.006947368;
+    
+    (0..len).map(|i| {
+        let x = 2.0 * PI * i as f32 / (len - 1) as f32;
+        a0 - a1 * x.cos() + a2 * (2.0 * x).cos() - a3 * (3.0 * x).cos() + a4 * (4.0 * x).cos()
+    }).collect()
+}
+
+fn kaiser_window(len: usize, beta: f32) -> Vec<f32> {
+    let i0_beta = bessel_i0(beta);
+    (0..len).map(|i| {
+        let x = beta * (1.0 - (2.0 * i as f32 / (len - 1) as f32 - 1.0).powi(2)).sqrt();
+        bessel_i0(x) / i0_beta
+    }).collect()
+}
+
+// Modified Bessel function of the first kind, order 0
+fn bessel_i0(x: f32) -> f32 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let y = (x / 3.75).powi(2);
+        1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492
+            + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
+    } else {
+        let y = 3.75 / ax;
+        (ax.exp() / ax.sqrt()) * (0.39894228 + y * (0.01328592
+            + y * (0.00225319 + y * (-0.00157565 + y * (0.00916281
+            + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633
+            + y * 0.00392377))))))))
+    }
+}
+
+fn hanning_window(len: usize) -> Vec<f32> {
+    (0..len).map(|i| {
+        let x = 2.0 * PI * i as f32 / (len - 1) as f32;
+        0.5 * (1.0 - x.cos())
+    }).collect()
+}
+
+fn blackman_harris_window(len: usize) -> Vec<f32> {
+    let a0 = 0.35875;
+    let a1 = 0.48829;
+    let a2 = 0.14128;
+    let a3 = 0.01168;
+    
+    (0..len).map(|i| {
+        let x = 2.0 * PI * i as f32 / (len - 1) as f32;
+        a0 - a1 * x.cos() + a2 * (2.0 * x).cos() - a3 * (3.0 * x).cos()
+    }).collect()
 }

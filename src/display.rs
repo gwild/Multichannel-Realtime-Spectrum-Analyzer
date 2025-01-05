@@ -21,8 +21,8 @@ impl SpectralDisplay {
                 let magnitudes = values.par_iter()
                     .map(|&(freq, db)| {
                         let magnitude = if db > -100.0 {
-                            let mag = 10.0f32.powf(db / 10.0);
-                            mag.round() as i32
+                            let power = 10.0f32.powf(db / 10.0);
+                            power.sqrt().round() as i32
                         } else {
                             0
                         };
@@ -30,6 +30,7 @@ impl SpectralDisplay {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+
                 format!("Channel {}: [{}]", channel + 1, magnitudes)
             })
             .collect()

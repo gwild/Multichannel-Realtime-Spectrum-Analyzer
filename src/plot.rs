@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use std::sync::RwLock;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES};
 use crate::display::SpectralDisplay;
+use crate::fft_analysis::WindowType;  // Add at top with other imports
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -276,6 +277,20 @@ impl eframe::App for MyApp {
                 ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
                 ui.label("Bar Width:");
                 ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+                ui.label("Window Type:");
+                let mut fft_config = self.fft_config.lock().unwrap();
+                egui::ComboBox::from_label("")
+                    .selected_text(format!("{:?}", fft_config.window_type))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
+                        ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
+                        ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
+                        ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
+                        ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
+                        if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
+                            fft_config.window_type = WindowType::Kaiser(4.0);
+                        }
+                    });
             });
 
             // 4) Reset button
@@ -290,6 +305,7 @@ impl eframe::App for MyApp {
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.db_threshold = -24.0;
                     fft_config.averaging_factor = 0.8;
+                    fft_config.window_type = WindowType::BlackmanHarris;  // Reset to default window
                     
                     // Only change frames_per_buffer if platform requires it
                     let new_frames = if cfg!(target_os = "linux") {
@@ -388,12 +404,8 @@ impl eframe::App for MyApp {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
-                // Create display handler with all channels at once
                 let display = SpectralDisplay::new(&absolute_values);
-                // Get formatted strings for all channels
-                let formatted_channels = display.format_all();
-                // Display each channel's results
-                for line in formatted_channels {
+                for line in display.format_all() {
                     ui.label(line);
                 }
             });

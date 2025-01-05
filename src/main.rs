@@ -19,6 +19,7 @@ use log::{info, error, warn};
 use env_logger;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
+use crate::fft_analysis::WindowType;
 
 fn main() {
     // Set up proper logging filters
@@ -204,6 +205,7 @@ fn run() -> Result<()> {
         num_channels: selected_channels.len(),
         averaging_factor: 0.9,
         frames_per_buffer,
+        window_type: WindowType::BlackmanHarris,
     }));
 
     let running = Arc::new(AtomicBool::new(false));
