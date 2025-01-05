@@ -2,6 +2,7 @@ mod audio_stream;
 mod fft_analysis;
 mod plot;
 mod utils;
+mod display;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -100,6 +101,30 @@ fn run() -> Result<()> {
         "Selected device: {} ({} channels)",
         selected_device_info.name, selected_device_info.max_input_channels
     );
+
+    if let Ok(device_info) = pa.device_info(selected_device_index) {
+        info!("Device: {}", device_info.name);
+        info!("Default sample rate: {}", device_info.default_sample_rate);
+        info!("Input channels: {}", device_info.max_input_channels);
+        info!("Default low latency: {}", device_info.default_low_input_latency);
+        info!("Default high latency: {}", device_info.default_high_input_latency);
+        
+        // Try to get supported formats
+        let input_params = pa::StreamParameters::<f32>::new(
+            selected_device_index,
+            device_info.max_input_channels,
+            true,
+            device_info.default_low_input_latency
+        );
+        
+        // Test different sample formats
+        for &rate in &[44100.0, 48000.0, 96000.0] {
+            match pa.is_input_format_supported(input_params, rate) {
+                Ok(_) => info!("Sample rate {} Hz is supported", rate),
+                Err(e) => info!("Sample rate {} Hz not supported: {}", rate, e)
+            }
+        }
+    }
 
     let supported_sample_rates = get_supported_sample_rates(
         selected_device_index,

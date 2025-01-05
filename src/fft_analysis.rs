@@ -10,6 +10,7 @@ use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
+use rayon::prelude::*;
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
@@ -135,31 +136,22 @@ pub fn compute_spectrum(
 
     // Convert complex spectrum to magnitude pairs and convert to absolute dB
     let freq_step = sample_rate as f32 / signal.len() as f32;
-    let mut all_magnitudes: Vec<(f32, f32)> = spectrum.iter().enumerate()
-        .map(|(i, &complex_val)| {
+    let mut all_magnitudes: Vec<(f32, f32)> = spectrum
+        .par_iter()  // Use parallel iterator
+        .enumerate()
+        .filter_map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
             if frequency < config.min_frequency as f32 || frequency > config.max_frequency as f32 {
-                return (frequency, -100.0);
-            }
-            
-            let power = complex_val.re * complex_val.re + complex_val.im * complex_val.im;
-            let current_db = if power > 0.0 {
-                (10.0 * power.log10()).round()
+                None
             } else {
-                -100.0
-            };
-
-            // Apply averaging if we have previous values
-            if let Some(prev) = prev_magnitudes {
-                if i < prev.len() {
-                    let prev_db = prev[i].1;
-                    let alpha = config.averaging_factor;
-                    let averaged_db = alpha * prev_db + (1.0 - alpha) * current_db;
-                    return (frequency, averaged_db);
-                }
+                let power = complex_val.re * complex_val.re + complex_val.im * complex_val.im;
+                let current_db = if power > 0.0 {
+                    (10.0f32 * power.log10()).round()
+                } else {
+                    -100.0
+                };
+                Some((frequency, current_db))
             }
-            
-            (frequency, current_db)
         })
         .collect();
 

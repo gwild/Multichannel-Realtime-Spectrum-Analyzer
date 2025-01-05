@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES};
+use crate::display::SpectralDisplay;
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -339,18 +340,21 @@ impl eframe::App for MyApp {
             // 6) Plot logic
             let absolute_values = {
                 let spectrum = self.spectrum.lock().unwrap();
-                spectrum.absolute_values.clone()
+                spectrum.absolute_values.clone()  // Contains dB values used for both plotting and display
             };
 
+            // Plotting section - uses dB values directly
             let all_bar_charts: Vec<BarChart> = absolute_values
                 .iter()
                 .enumerate()
                 .map(|(channel, channel_partials)| {
                     let bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(freq, db)| freq > 0.0 && db > -90.0)  // Filter out very low values
+                        .filter(|&&(freq, db)| freq > 0.0 && db > -90.0)
                         .map(|&(freq, db)| {
-                            egui::plot::Bar::new(freq as f64, db as f64)  // Plot dB values directly
+                            // IMPORTANT: Plot uses dB values directly - do not modify this conversion
+                            // Any changes to value display should happen in the text display section below
+                            egui::plot::Bar::new(freq as f64, db as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
@@ -384,19 +388,13 @@ impl eframe::App for MyApp {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
-                for (channel, channel_partials) in absolute_values.iter().enumerate() {
-                    let formatted_partials: Vec<String> = channel_partials
-                        .iter()
-                        .map(|&(freq, db)| {
-                            let absolute = 10.0f32.powf(db / 10.0);  // Correct inverse of power to dB
-                            format!("({:.1}, {})", freq, absolute.round() as i32)  // No need for *100
-                        })
-                        .collect();
-                    ui.label(format!(
-                        "Channel {}: [{}]",
-                        channel + 1,
-                        formatted_partials.join(", ")
-                    ));
+                // Create display handler with all channels at once
+                let display = SpectralDisplay::new(&absolute_values);
+                // Get formatted strings for all channels
+                let formatted_channels = display.format_all();
+                // Display each channel's results
+                for line in formatted_channels {
+                    ui.label(line);
                 }
             });
         });
