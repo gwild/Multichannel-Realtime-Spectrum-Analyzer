@@ -388,8 +388,8 @@ impl eframe::App for MyApp {
                     let formatted_partials: Vec<String> = channel_partials
                         .iter()
                         .map(|&(freq, db)| {
-                            let absolute = 20.0f32.powf(db / 20.0);  // Correct formula: 20*log10 -> 20^(db/20)
-                            format!("({:.1}, {})", freq, (absolute * 100.0).round() as i32)
+                            let absolute = 10.0f32.powf(db / 10.0);  // Correct inverse of power to dB
+                            format!("({:.1}, {})", freq, absolute.round() as i32)  // No need for *100
                         })
                         .collect();
                     ui.label(format!(
