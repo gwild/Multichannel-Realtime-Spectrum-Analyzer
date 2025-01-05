@@ -90,7 +90,14 @@ fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> 
         .iter()
         .skip(channel)  // Start at the correct channel offset
         .step_by(num_channels)  // Pick every Nth sample (de-interleaving)
-        .copied()
+        .map(|&sample| {
+            // Handle potential i32 scaled values on some platforms
+            if sample > 1.0 || sample < -1.0 {
+                sample / 32768.0  // Convert from i16 range to f32 [-1,1]
+            } else {
+                sample  // Already in correct range
+            }
+        })
         .collect()
 }
 
