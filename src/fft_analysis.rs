@@ -8,11 +8,10 @@ use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
 use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
-use pitch_detector::{
-    pitch::{HannedFftDetector, PitchDetector},
-};
+use realfft::RealFftPlanner;
+use realfft::num_complex::Complex;
 
-pub const NUM_PARTIALS: usize = 12;
+pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
 /// Configuration struct for FFT settings.
 pub struct FFTConfig {
@@ -102,45 +101,54 @@ pub fn compute_spectrum(
     _config: &FFTConfig,
     _prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
-    let signal: Vec<f64> = all_channel_data[channel_index]
-        .iter()
-        .map(|&x| x as f64)
+    let signal = &all_channel_data[channel_index];
+    
+    // Create FFT planner
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(signal.len());
+    
+    // Create buffers
+    let mut indata = signal.clone();
+    let mut spectrum = fft.make_output_vec();
+    
+    // Perform FFT
+    if let Err(e) = fft.process(&mut indata, &mut spectrum) {
+        error!("FFT computation error: {:?}", e);
+        return vec![(0.0, 0.0); NUM_PARTIALS];
+    }
+
+    // Convert complex spectrum to magnitude pairs and convert to absolute dB
+    let freq_step = sample_rate as f32 / signal.len() as f32;
+    let mut all_magnitudes: Vec<(f32, f32)> = spectrum.iter().enumerate()
+        .map(|(i, &complex_val)| {
+            let frequency = i as f32 * freq_step;
+            // Get power spectrum first
+            let power = complex_val.re * complex_val.re + complex_val.im * complex_val.im;
+            // Convert to dB with proper scaling and reference
+            let db = if power > 0.0 {
+                (10.0 * power.log10()).round()  // Convert to dB and round
+            } else {
+                -100.0
+            };
+            (frequency, db)  // No need for abs() since we're using power
+        })
         .collect();
 
-    let mut detector = HannedFftDetector::default();
-    
-    if let Some(freq) = detector.detect_pitch(&signal, sample_rate as f64) {
-        generate_spectrum(freq, sample_rate)
-    } else {
-        vec![(0.0, 0.0); NUM_PARTIALS]
-    }
-}
+    // Sort by magnitude to find top 12
+    all_magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut top_magnitudes = all_magnitudes.into_iter()
+        .take(NUM_PARTIALS)
+        .collect::<Vec<_>>();
 
-fn generate_spectrum(
-    fundamental: f64,
-    sample_rate: u32
-) -> Vec<(f32, f32)> {
-    let mut partials = Vec::with_capacity(NUM_PARTIALS);
-    
-    // Generate harmonics based on fundamental frequency
-    for harmonic in 1..=NUM_PARTIALS {
-        let freq = fundamental * harmonic as f64;
-        if freq < sample_rate as f64 / 2.0 {  // Below Nyquist
-            let magnitude = 1.0 / harmonic as f64;  // Simple 1/n falloff
-            // Convert directly to amplitude without going through dB
-            let amplitude = (80.0 * magnitude) as f32;  // Scale to 0-80 range
-            partials.push((freq as f32, amplitude));
-        } else {
-            partials.push((0.0, 0.0));
-        }
+    // Sort by frequency for consistent display
+    top_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Pad with zeros if needed (shouldn't be necessary but keeping for safety)
+    while top_magnitudes.len() < NUM_PARTIALS {
+        top_magnitudes.push((0.0, -100.0));  // Use -100 dB for silence
     }
 
-    // Pad with zeros if needed
-    while partials.len() < NUM_PARTIALS {
-        partials.push((0.0, 0.0));
-    }
-
-    partials
+    top_magnitudes
 }
 
 /// Filters audio buffer based on amplitude threshold

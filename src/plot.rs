@@ -15,24 +15,25 @@ use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calcula
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
-    pub partials: Vec<Vec<(f32, f32)>>, // Frequency, amplitude pairs for partials
+    absolute_values: Vec<Vec<(f32, f32)>>,       // Frequency, absolute pairs
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
-            partials: vec![vec![(0.0, 0.0); 12]; num_channels],
+            absolute_values: vec![vec![(0.0, 0.0); 12]; num_channels],
         }
     }
 
-    pub fn update_partials(&mut self, new_partials: Vec<Vec<(f32, f32)>>) {
-        for (channel, data) in new_partials.into_iter().enumerate() {
-            if channel < self.partials.len() {
-                self.partials[channel] = data;
-                // info!("Updated partials for channel {}: {:?}", channel + 1, log_data);
-            }
-        }
+    pub fn update_partials(&mut self, new_values: Vec<Vec<(f32, f32)>>) {
+        self.absolute_values = new_values;  // Store directly
+    }
+
+    #[allow(dead_code)]
+    /// Get a copy of the current spectral data in absolute values (matching GUI display)
+    pub fn clone_absolute_data(&self) -> Vec<Vec<(f32, f32)>> {
+        self.absolute_values.clone()
     }
 }
 
@@ -336,20 +337,20 @@ impl eframe::App for MyApp {
             }
 
             // 6) Plot logic
-            let partials = {
+            let absolute_values = {
                 let spectrum = self.spectrum.lock().unwrap();
-                spectrum.partials.clone()
+                spectrum.absolute_values.clone()
             };
 
-            let all_bar_charts: Vec<BarChart> = partials
+            let all_bar_charts: Vec<BarChart> = absolute_values
                 .iter()
                 .enumerate()
                 .map(|(channel, channel_partials)| {
                     let bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(freq, amp)| freq > 0.0 && amp > 0.0)  // Filter both zero frequencies and amplitudes
-                        .map(|&(freq, amp)| {
-                            egui::plot::Bar::new(freq as f64, amp as f64)
+                        .filter(|&&(freq, db)| freq > 0.0 && db > -90.0)  // Filter out very low values
+                        .map(|&(freq, db)| {
+                            egui::plot::Bar::new(freq as f64, db as f64)  // Plot dB values directly
                                 .width(self.bar_width as f64)
                         })
                         .collect();
@@ -383,10 +384,13 @@ impl eframe::App for MyApp {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.label("Channel Results:");
-                for (channel, channel_partials) in partials.iter().enumerate() {
+                for (channel, channel_partials) in absolute_values.iter().enumerate() {
                     let formatted_partials: Vec<String> = channel_partials
                         .iter()
-                        .map(|&(freq, amp)| format!("({:.2}, {:.0})", freq, amp))
+                        .map(|&(freq, db)| {
+                            let absolute = 20.0f32.powf(db / 20.0);  // Correct formula: 20*log10 -> 20^(db/20)
+                            format!("({:.1}, {})", freq, (absolute * 100.0).round() as i32)
+                        })
                         .collect();
                     ui.label(format!(
                         "Channel {}: [{}]",

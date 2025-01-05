@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+realfft = "3.3.0"
 rustfft = "6.0"
 egui = "0.22"
 eframe = "0.22"
