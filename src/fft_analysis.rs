@@ -98,17 +98,33 @@ pub fn compute_spectrum(
     all_channel_data: &[Vec<f32>],
     channel_index: usize,
     sample_rate: u32, 
-    _config: &FFTConfig,
-    _prev_magnitudes: Option<&[(f32, f32)]>
+    config: &FFTConfig,
+    prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
     let signal = &all_channel_data[channel_index];
     
+    // Check if signal is effectively zero
+    if signal.iter().all(|&sample| sample.abs() < 1e-6) {
+        return vec![(0.0, -100.0); NUM_PARTIALS];
+    }
+    
+    // Apply db_threshold filter first
+    let linear_threshold = 10.0f32.powf((config.db_threshold as f32) / 20.0);
+    let filtered_signal: Vec<f32> = signal.iter()
+        .map(|&sample| if sample.abs() >= linear_threshold { sample } else { 0.0 })
+        .collect();
+    
+    // Check if filtered signal is effectively zero
+    if filtered_signal.iter().all(|&sample| sample.abs() < 1e-6) {
+        return vec![(0.0, -100.0); NUM_PARTIALS];
+    }
+
     // Create FFT planner
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(signal.len());
+    let fft = planner.plan_fft_forward(filtered_signal.len());
     
     // Create buffers
-    let mut indata = signal.clone();
+    let mut indata = filtered_signal;
     let mut spectrum = fft.make_output_vec();
     
     // Perform FFT
@@ -122,30 +138,46 @@ pub fn compute_spectrum(
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum.iter().enumerate()
         .map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
-            // Get power spectrum first
+            if frequency < config.min_frequency as f32 || frequency > config.max_frequency as f32 {
+                return (frequency, -100.0);
+            }
+            
             let power = complex_val.re * complex_val.re + complex_val.im * complex_val.im;
-            // Convert to dB with proper scaling and reference
-            let db = if power > 0.0 {
-                (10.0 * power.log10()).round()  // Convert to dB and round
+            let current_db = if power > 0.0 {
+                (10.0 * power.log10()).round()
             } else {
                 -100.0
             };
-            (frequency, db)  // No need for abs() since we're using power
+
+            // Apply averaging if we have previous values
+            if let Some(prev) = prev_magnitudes {
+                if i < prev.len() {
+                    let prev_db = prev[i].1;
+                    let alpha = config.averaging_factor;
+                    let averaged_db = alpha * prev_db + (1.0 - alpha) * current_db;
+                    return (frequency, averaged_db);
+                }
+            }
+            
+            (frequency, current_db)
         })
         .collect();
 
     // Sort by magnitude to find top 12
     all_magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut top_magnitudes = all_magnitudes.into_iter()
+        .filter(|&(freq, _)| {
+            freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
+        })
         .take(NUM_PARTIALS)
         .collect::<Vec<_>>();
 
     // Sort by frequency for consistent display
     top_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Pad with zeros if needed (shouldn't be necessary but keeping for safety)
+    // Pad with zeros if needed
     while top_magnitudes.len() < NUM_PARTIALS {
-        top_magnitudes.push((0.0, -100.0));  // Use -100 dB for silence
+        top_magnitudes.push((0.0, -100.0));
     }
 
     top_magnitudes
