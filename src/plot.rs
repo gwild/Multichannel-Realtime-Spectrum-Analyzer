@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES};
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES, map_db_range};
 use crate::display::SpectralDisplay;
 use crate::fft_analysis::WindowType;  // Add at top with other imports
 
@@ -370,7 +370,7 @@ impl eframe::App for MyApp {
                         .map(|&(freq, db)| {
                             // IMPORTANT: Plot uses dB values directly - do not modify this conversion
                             // Any changes to value display should happen in the text display section below
-                            egui::plot::Bar::new(freq as f64, db as f64)
+                            egui::plot::Bar::new(freq as f64, -db as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
@@ -395,7 +395,7 @@ impl eframe::App for MyApp {
                 .include_x(0.0)
                 .include_x(max_freq as f64)
                 .include_y(0.0)
-                .include_y(self.y_scale)
+                .include_y(100.0)
                 .show(ui, |plot_ui| {
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);

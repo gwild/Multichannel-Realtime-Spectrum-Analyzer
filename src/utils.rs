@@ -24,4 +24,13 @@ pub fn calculate_optimal_buffer_size(sample_rate: f64) -> usize {
     );
     
     initial_size
+}
+
+/// Converts raw FFT dB values (-100 to 100) to display/plot range (-100 to 0)
+pub fn map_db_range(raw_db: f32) -> f32 {
+    if raw_db > -100.0 {
+        ((raw_db + 100.0) / 2.0 - 100.0).max(-100.0).min(0.0)  // Map -100..100 to -100..0
+    } else {
+        -100.0
+    }
 } 

@@ -1,9 +1,8 @@
 use rayon::prelude::*;
+use crate::utils::map_db_range;
 
-/// Handles conversion of FFT data for display purposes only.
-/// This is completely separate from plotting and FFT calculations.
 pub struct SpectralDisplay {
-    channels: Vec<Vec<(f32, f32)>>  // All channels' data
+    channels: Vec<Vec<(f32, f32)>>
 }
 
 impl SpectralDisplay {
@@ -13,20 +12,14 @@ impl SpectralDisplay {
         }
     }
 
-    /// Convert all channels' dB values to magnitudes at once
     pub fn format_all(&self) -> Vec<String> {
         self.channels.par_iter()
             .enumerate()
             .map(|(channel, values)| {
                 let magnitudes = values.par_iter()
-                    .map(|&(freq, db)| {
-                        let magnitude = if db > -100.0 {
-                            let power = 10.0f32.powf(db / 10.0);
-                            power.sqrt().round() as i32
-                        } else {
-                            0
-                        };
-                        format!("({:.1}, {})", freq, magnitude)
+                    .map(|&(freq, raw_db)| {
+                        let db = map_db_range(raw_db);
+                        format!("({:6.1}, {:3.0}dB)", freq, db)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
