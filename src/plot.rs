@@ -186,45 +186,13 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
                     ui.label("Magnitude Threshold:");
-                    ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=80.0));
+                    ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=30.0));
                 });
             }
 
             // 2) Second row with frames, buffer size, and averaging
             {
                 ui.horizontal(|ui| {
-                    // Frames/Buffer slider
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.label("Frames/Buffer:");
-                        let mut frames = fft_config.frames_per_buffer;
-                        ui.horizontal(|ui| {
-                            // Get maximum allowed frame size based on buffer size
-                            let buffer_size = *self.buffer_size.lock().unwrap();
-                            let max_frame_index = FRAME_SIZES.iter()
-                                .position(|&x| x > buffer_size as u32)
-                                .unwrap_or(FRAME_SIZES.len())
-                                .saturating_sub(1);
-
-                            let mut index = FRAME_SIZES.iter()
-                                .position(|&x| x == frames)
-                                .unwrap_or(0)
-                                .min(max_frame_index);
-                            
-                            ui.add(egui::Slider::new(&mut index, 0..=max_frame_index)
-                                .custom_formatter(|n, _| {
-                                    format!("{}", FRAME_SIZES[n as usize])
-                                }));
-                            
-                            frames = FRAME_SIZES[index];
-                        });
-                        
-                        if frames != fft_config.frames_per_buffer {
-                            fft_config.frames_per_buffer = frames;
-                            size_changed = true;
-                        }
-                    }
-
                     // Buffer size slider
                     {
                         let buffer_size = *self.buffer_size.lock().unwrap();
@@ -245,6 +213,56 @@ impl eframe::App for MyApp {
                         }
                         ui.label("samples");
                     }
+
+                    // Min freq spacing slider
+                    {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        ui.label("Min Freq Spacing:");
+                        ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
+                    }
+
+                    // Window type selection
+                    {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        ui.label("Window Type:");
+                        egui::ComboBox::from_label("")
+                            .selected_text(format!("{:?}", fft_config.window_type))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
+                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
+                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
+                                ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
+                                ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
+                                if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
+                                    fft_config.window_type = WindowType::Kaiser(4.0);
+                                }
+                            });
+                    }
+                });
+
+                // 3) Sliders for Y scale, alpha, bar width, and Kaiser beta
+                ui.horizontal(|ui| {
+                    ui.label("Y Max:");
+                    ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
+                    ui.label("Alpha:");
+                    ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
+                    ui.label("Bar Width:");
+                    ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+
+                    // Add Kaiser beta slider here if Kaiser window is selected
+                    {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        if let WindowType::Kaiser(_) = fft_config.window_type {
+                            ui.label("Kaiser β:");
+                            let mut beta = match fft_config.window_type {
+                                WindowType::Kaiser(b) => b,
+                                _ => 4.0,
+                            };
+                            if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
+                                fft_config.window_type = WindowType::Kaiser(beta);
+                            }
+                        }
+                    }
                 });
 
                 // Handle max frequency adjustment if buffer size changed
@@ -258,30 +276,6 @@ impl eframe::App for MyApp {
                 }
             }
 
-            // 3) Sliders for Y scale, alpha, bar width
-            ui.horizontal(|ui| {
-                ui.label("Y Max:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
-                ui.label("Alpha:");
-                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
-                ui.label("Bar Width:");
-                ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
-                ui.label("Window Type:");
-                let mut fft_config = self.fft_config.lock().unwrap();
-                egui::ComboBox::from_label("")
-                    .selected_text(format!("{:?}", fft_config.window_type))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
-                        ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
-                        ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
-                        ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
-                        ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
-                        if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
-                            fft_config.window_type = WindowType::Kaiser(4.0);
-                        }
-                    });
-            });
-
             // 4) Reset button
             let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
@@ -293,7 +287,8 @@ impl eframe::App for MyApp {
                     fft_config.min_frequency = MIN_FREQ;
                     fft_config.max_frequency = MAX_FREQ;
                     fft_config.magnitude_threshold = 6.0;
-                    fft_config.window_type = WindowType::BlackmanHarris;  // Reset to default window
+                    fft_config.min_freq_spacing = 20.0;  // Changed from 1.0 to 20.0
+                    fft_config.window_type = WindowType::Hanning;  // Changed from BlackmanHarris to Hanning
                     
                     // Only change frames_per_buffer if platform requires it
                     let new_frames = if cfg!(target_os = "linux") {

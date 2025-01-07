@@ -20,6 +20,7 @@ pub struct FFTConfig {
     pub min_frequency: f64,
     pub max_frequency: f64,
     pub magnitude_threshold: f64,  // Renamed from db_threshold
+    pub min_freq_spacing: f64,  // Add new parameter
     #[allow(dead_code)]
     pub num_channels: usize,
     pub frames_per_buffer: u32,
@@ -161,7 +162,19 @@ pub fn compute_spectrum(
 
     // 6. Sort by magnitude to get top partials
     all_magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    all_magnitudes.truncate(NUM_PARTIALS);
+
+    // After sorting by magnitude but before truncating:
+    let mut filtered_magnitudes = Vec::new();
+    for &mag in all_magnitudes.iter() {
+        if filtered_magnitudes.iter().all(|&prev: &(f32, f32)| 
+            (mag.0 - prev.0).abs() >= config.min_freq_spacing as f32) {
+            filtered_magnitudes.push(mag);
+        }
+        if filtered_magnitudes.len() >= NUM_PARTIALS {
+            break;
+        }
+    }
+    all_magnitudes = filtered_magnitudes;
 
     // 7. Sort by frequency for display
     all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));

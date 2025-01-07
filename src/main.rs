@@ -202,9 +202,10 @@ fn run() -> Result<()> {
         min_frequency: MIN_FREQ,
         max_frequency: MAX_FREQ,
         magnitude_threshold: 6.0,
+        min_freq_spacing: 20.0,
         num_channels: selected_channels.len(),
         frames_per_buffer,
-        window_type: WindowType::BlackmanHarris,
+        window_type: WindowType::Hanning,
     }));
 
     let running = Arc::new(AtomicBool::new(false));
