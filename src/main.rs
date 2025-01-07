@@ -18,7 +18,7 @@ use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
 use fft_analysis::FFTConfig;
-use utils::{MIN_FREQ, MAX_FREQ, calculate_optimal_buffer_size};
+use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE, calculate_optimal_buffer_size};
 use crate::fft_analysis::WindowType;
 
 fn main() {
@@ -175,9 +175,9 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
-    let buffer_size = Arc::new(Mutex::new(calculate_optimal_buffer_size(selected_sample_rate)));
+    let buffer_size = Arc::new(Mutex::new(DEFAULT_BUFFER_SIZE));
     let audio_buffer = Arc::new(RwLock::new(CircularBuffer::new(
-        *buffer_size.lock().unwrap(),
+        DEFAULT_BUFFER_SIZE,
         selected_channels.len()
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
@@ -201,9 +201,8 @@ fn run() -> Result<()> {
     let fft_config = Arc::new(Mutex::new(FFTConfig {
         min_frequency: MIN_FREQ,
         max_frequency: MAX_FREQ,
-        db_threshold: -24.0,
+        magnitude_threshold: 6.0,
         num_channels: selected_channels.len(),
-        averaging_factor: 0.9,
         frames_per_buffer,
         window_type: WindowType::BlackmanHarris,
     }));

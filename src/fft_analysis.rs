@@ -19,10 +19,9 @@ pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 pub struct FFTConfig {
     pub min_frequency: f64,
     pub max_frequency: f64,
-    pub db_threshold: f64,
+    pub magnitude_threshold: f64,  // Renamed from db_threshold
     #[allow(dead_code)]
     pub num_channels: usize,
-    pub averaging_factor: f32,
     pub frames_per_buffer: u32,
     pub window_type: WindowType,
 }
@@ -61,7 +60,7 @@ pub fn start_fft_processing(
                         channel_index,     // Specify which channel to process
                         sample_rate, 
                         &*config,
-                        Some(&prev_results[channel_index])
+                        None
                     );
 
                     all_channels_results[channel_index] = spectrum.clone();
@@ -120,82 +119,59 @@ pub fn compute_spectrum(
     channel_index: usize,
     sample_rate: u32, 
     config: &FFTConfig,
-    prev_magnitudes: Option<&[(f32, f32)]>
+    _prev_magnitudes: Option<&[(f32, f32)]>  // Not used anymore
 ) -> Vec<(f32, f32)> {
     let signal = &all_channel_data[channel_index];
     
-    // Check if signal is effectively zero
-    if signal.iter().all(|&sample| sample.abs() < 1e-6) {
-        return vec![(0.0, -100.0); NUM_PARTIALS];
-    }
-    
-    // Apply db_threshold filter first
-    let linear_threshold = 10.0f32.powf((config.db_threshold as f32) / 20.0);
-    let filtered_signal: Vec<f32> = signal.iter()
-        .map(|&sample| if sample.abs() >= linear_threshold { sample } else { 0.0 })
-        .collect();
-    
-    // Check if filtered signal is effectively zero
-    if filtered_signal.iter().all(|&sample| sample.abs() < 1e-6) {
-        return vec![(0.0, -100.0); NUM_PARTIALS];
-    }
+    // 1. Apply window to signal
+    let windowed_signal = apply_window(&signal, config.window_type);
 
-    // Apply window to filtered signal
-    let windowed_signal = apply_window(&filtered_signal, config.window_type);
-
-    // Create FFT planner
+    // 2. Perform FFT
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(windowed_signal.len());
-    
-    // Create buffers
-    let mut indata = windowed_signal;  // Use windowed signal
+    let mut indata = windowed_signal;
     let mut spectrum = fft.make_output_vec();
     
-    // Perform FFT
     if let Err(e) = fft.process(&mut indata, &mut spectrum) {
         error!("FFT computation error: {:?}", e);
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    // Convert complex spectrum to magnitude pairs and convert to absolute dB
+    // 3. Convert to absolute magnitudes and scale
     let freq_step = sample_rate as f32 / signal.len() as f32;
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum
-        .par_iter()  // Use parallel iterator
+        .par_iter()
         .enumerate()
-        .filter_map(|(i, &complex_val)| {
+        .map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
-            if frequency < config.min_frequency as f32 || frequency > config.max_frequency as f32 {
-                None
-            } else {
-                let power = complex_val.re * complex_val.re + complex_val.im * complex_val.im;
-                let current_db = if power > 0.0 {
-                    (10.0f32 * power.log10()).round()
-                } else {
-                    -100.0
-                };
-                Some((frequency, current_db))
-            }
+            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt() / 4.0;  // Divide by 4 after sqrt
+            (frequency, magnitude)
         })
         .collect();
 
-    // Sort by magnitude to find top 12
+    // 4. Apply frequency thresholds
+    all_magnitudes.retain(|&(freq, _)| {
+        freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
+    });
+
+    // 5. Apply magnitude threshold
+    all_magnitudes.retain(|&(_, magnitude)| {
+        magnitude >= config.magnitude_threshold as f32
+    });
+
+    // 6. Sort by magnitude to get top partials
     all_magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut top_magnitudes = all_magnitudes.into_iter()
-        .filter(|&(freq, _)| {
-            freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
-        })
-        .take(NUM_PARTIALS)
-        .collect::<Vec<_>>();
+    all_magnitudes.truncate(NUM_PARTIALS);
 
-    // Sort by frequency for consistent display
-    top_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // 7. Sort by frequency for display
+    all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Pad with zeros if needed
-    while top_magnitudes.len() < NUM_PARTIALS {
-        top_magnitudes.push((0.0, -100.0));
+    // 8. Pad with zeros if needed
+    while all_magnitudes.len() < NUM_PARTIALS {
+        all_magnitudes.push((0.0, 0.0));
     }
 
-    top_magnitudes
+    all_magnitudes
 }
 
 /// Window function types

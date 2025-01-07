@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES, map_db_range};
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES, map_db_range, DEFAULT_BUFFER_SIZE};
 use crate::display::SpectralDisplay;
 use crate::fft_analysis::WindowType;  // Add at top with other imports
 
@@ -82,7 +82,7 @@ impl MyApp {
             audio_buffer,
             colors,
             y_scale: 80.0,
-            alpha: 255,
+            alpha: 50,
             bar_width: 5.0,
             last_repaint: Instant::now(),
             shutdown_flag,
@@ -185,8 +185,8 @@ impl eframe::App for MyApp {
                     let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
-                    ui.label("DB Threshold:");
-                    ui.add(egui::Slider::new(&mut fft_config.db_threshold, -80.0..=-10.0).text("dB"));
+                    ui.label("Magnitude Threshold:");
+                    ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=80.0));
                 });
             }
 
@@ -245,17 +245,6 @@ impl eframe::App for MyApp {
                         }
                         ui.label("samples");
                     }
-
-                    // FFT Averaging slider
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.label("FFT Averaging:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.averaging_factor, 0.5..=0.99)
-                                .text("α")
-                                .logarithmic(true)
-                        );
-                    }
                 });
 
                 // Handle max frequency adjustment if buffer size changed
@@ -272,7 +261,7 @@ impl eframe::App for MyApp {
             // 3) Sliders for Y scale, alpha, bar width
             ui.horizontal(|ui| {
                 ui.label("Y Max:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=80.0).text(""));
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
                 ui.label("Alpha:");
                 ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
                 ui.label("Bar Width:");
@@ -303,8 +292,7 @@ impl eframe::App for MyApp {
                     // Reset FFT config
                     fft_config.min_frequency = MIN_FREQ;
                     fft_config.max_frequency = MAX_FREQ;
-                    fft_config.db_threshold = -24.0;
-                    fft_config.averaging_factor = 0.8;
+                    fft_config.magnitude_threshold = 6.0;
                     fft_config.window_type = WindowType::BlackmanHarris;  // Reset to default window
                     
                     // Only change frames_per_buffer if platform requires it
@@ -322,7 +310,7 @@ impl eframe::App for MyApp {
                 }
                 
                 self.y_scale = 80.0;
-                self.alpha = 255;
+                self.alpha = 50;
                 self.bar_width = 5.0;
                 
                 // Calculate optimal size based on current sample rate
@@ -332,11 +320,11 @@ impl eframe::App for MyApp {
                 // Fix: Get current size without holding the lock during update
                 let needs_update = {
                     let current_size = *self.buffer_size.lock().unwrap();
-                    current_size != optimal_size
+                    current_size != DEFAULT_BUFFER_SIZE
                 };
                 
                 if needs_update {
-                    self.update_buffer_size(optimal_size);
+                    self.update_buffer_size(DEFAULT_BUFFER_SIZE);
                 }
                 
                 reset_clicked = true;
@@ -366,11 +354,9 @@ impl eframe::App for MyApp {
                 .map(|(channel, channel_partials)| {
                     let bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(freq, db)| freq > 0.0 && db > -90.0)
-                        .map(|&(freq, db)| {
-                            // IMPORTANT: Plot uses dB values directly - do not modify this conversion
-                            // Any changes to value display should happen in the text display section below
-                            egui::plot::Bar::new(freq as f64, -db as f64)
+                        .filter(|&&(freq, raw_val)| freq > 0.0 && raw_val != 0.0)  // Filter out both zero freq and zero values
+                        .map(|&(freq, raw_val)| {
+                            egui::plot::Bar::new(freq as f64, raw_val as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
@@ -395,7 +381,7 @@ impl eframe::App for MyApp {
                 .include_x(0.0)
                 .include_x(max_freq as f64)
                 .include_y(0.0)
-                .include_y(100.0)
+                .include_y(self.y_scale as f64)
                 .show(ui, |plot_ui| {
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);

@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use crate::utils::map_db_range;
 
 pub struct SpectralDisplay {
     channels: Vec<Vec<(f32, f32)>>
@@ -17,9 +16,8 @@ impl SpectralDisplay {
             .enumerate()
             .map(|(channel, values)| {
                 let magnitudes = values.par_iter()
-                    .map(|&(freq, raw_db)| {
-                        let db = map_db_range(raw_db);
-                        format!("({:6.1}, {:3.0}dB)", freq, db)
+                    .map(|&(freq, raw_val)| {
+                        format!("({:.2}, {:.0})", freq, raw_val)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
