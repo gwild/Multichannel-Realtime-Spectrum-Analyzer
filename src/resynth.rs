@@ -26,7 +26,8 @@ impl SmoothParam {
 
     fn update(&mut self, target: f32, smoothing: f32) {
         self.target = target;
-        self.current = self.current * smoothing + target * (1.0 - smoothing);
+        let factor = smoothing * smoothing;
+        self.current = self.current * factor + target * (1.0 - factor);
     }
 }
 
@@ -56,7 +57,7 @@ impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
             gain: 0.01,
-            smoothing: 0.97,
+            smoothing: 0.99,
         }
     }
 }

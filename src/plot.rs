@@ -234,13 +234,34 @@ impl eframe::App for MyApp {
                             egui::ComboBox::from_id_source("window_type")
                                 .selected_text(format!("{:?}", fft_config.window_type))
                                 .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
                                     ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
                                     ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
-                                    ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
+                                    if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
+                                        fft_config.window_type = WindowType::Kaiser(4.0);
+                                    }
                                 });
                         }
                         ui.checkbox(&mut self.show_line_plot, "Show FFT");
                     });
+
+                    // Add Kaiser beta slider if Kaiser window is selected
+                    if let Ok(mut fft_config) = self.fft_config.lock() {
+                        if let WindowType::Kaiser(_) = fft_config.window_type {
+                            ui.horizontal(|ui| {
+                                ui.label("Kaiser β:");
+                                let mut beta = match fft_config.window_type {
+                                    WindowType::Kaiser(b) => b,
+                                    _ => 4.0,
+                                };
+                                if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
+                                    fft_config.window_type = WindowType::Kaiser(beta);
+                                }
+                            });
+                        }
+                    }
                 });
 
                 // 3) Sliders for Y scale, alpha, bar width, and Kaiser beta
@@ -263,7 +284,7 @@ impl eframe::App for MyApp {
                     ui.horizontal(|ui| {
                         ui.label("Smoothing:");
                         if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                            ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.5..=0.999));
+                            ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.9..=0.9999));
                         }
                     });
                 });
