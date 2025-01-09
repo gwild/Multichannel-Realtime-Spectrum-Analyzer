@@ -87,7 +87,7 @@ pub fn start_fft_processing(
     });
 }
 /// Extracts data for a specific channel from the interleaved buffer.
-fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
+pub fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
     buffer
         .iter()
         .skip(channel)  // Start at the correct channel offset
@@ -198,7 +198,7 @@ pub enum WindowType {
     Kaiser(f32), // Adjustable side-lobe level, beta parameter
 }
 
-fn apply_window(signal: &[f32], window_type: WindowType) -> Vec<f32> {
+pub fn apply_window(signal: &[f32], window_type: WindowType) -> Vec<f32> {
     let len = signal.len();
     let window = match window_type {
         WindowType::Rectangular => vec![1.0; len],

@@ -3,6 +3,7 @@ mod fft_analysis;
 mod plot;
 mod utils;
 mod display;
+mod resynth;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -20,6 +21,7 @@ use env_logger;
 use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE, calculate_optimal_buffer_size};
 use crate::fft_analysis::WindowType;
+use crate::resynth::{ResynthConfig, start_resynth_thread};
 
 fn main() {
     // Set up proper logging filters
@@ -218,6 +220,39 @@ fn run() -> Result<()> {
     let shutdown_flag_audio = Arc::clone(&shutdown_flag);
     let stream_ready_audio = Arc::clone(&stream_ready);
 
+    // Add before thread creation
+    let resynth_config = Arc::new(Mutex::new(ResynthConfig::default()));
+
+    // After input device selection but before thread creation
+    println!("\nAvailable Output Devices:");
+    let mut output_devices = Vec::new();
+    for (_i, device) in devices.iter().enumerate() {
+        let (index, info) = device;
+        if info.max_output_channels >= 2 {  // Need at least stereo output
+            println!("  [{}] - {} ({} channels)", output_devices.len(), info.name, info.max_output_channels);
+            output_devices.push(*index);
+        }
+    }
+
+    if output_devices.is_empty() {
+        return Err(anyhow!("No stereo output devices found."));
+    }
+
+    print!("Enter the index of the desired output device: ");
+    io::stdout().flush()?;
+    user_input.clear();
+    io::stdin().read_line(&mut user_input)?;
+    let output_device_index = user_input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("Invalid device index"))?;
+
+    if output_device_index >= output_devices.len() {
+        return Err(anyhow!("Invalid output device index"));
+    }
+
+    let selected_output_device = output_devices[output_device_index];
+
     // Start audio thread
     info!("Starting audio sampling thread...");
     let fft_config_clone = Arc::clone(&fft_config);
@@ -261,6 +296,23 @@ fn run() -> Result<()> {
         }
     });
 
+    // Start resynthesis thread
+    info!("Starting resynthesis...");
+    let resynth_thread = std::thread::spawn({
+        let spectrum_app = Arc::clone(&spectrum_app);
+        let resynth_config = Arc::clone(&resynth_config);
+        let shutdown_flag = Arc::clone(&shutdown_flag);
+        move || {
+            start_resynth_thread(
+                spectrum_app,
+                resynth_config,
+                selected_output_device,
+                selected_sample_rate,
+                shutdown_flag,
+            );
+        }
+    });
+
     // Start GUI
     info!("Starting GUI...");
     let app = plot::MyApp::new(
@@ -268,6 +320,7 @@ fn run() -> Result<()> {
         fft_config.clone(),
         buffer_size.clone(),
         audio_buffer.clone(),
+        resynth_config.clone(),
         shutdown_flag.clone(),
     );
 
@@ -300,6 +353,12 @@ fn run() -> Result<()> {
         info!("FFT thread terminated successfully");
     } else {
         warn!("FFT thread may not have terminated cleanly");
+    }
+
+    if let Ok(_) = resynth_thread.join() {
+        info!("Resynthesis thread terminated successfully");
+    } else {
+        warn!("Resynthesis thread may not have terminated cleanly");
     }
 
     Ok(())

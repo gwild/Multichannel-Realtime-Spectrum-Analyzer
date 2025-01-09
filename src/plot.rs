@@ -13,6 +13,9 @@ use std::sync::RwLock;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES, map_db_range, DEFAULT_BUFFER_SIZE};
 use crate::display::SpectralDisplay;
 use crate::fft_analysis::WindowType;  // Add at top with other imports
+use crate::fft_analysis::{apply_window, extract_channel_data};
+use realfft::RealFftPlanner;
+use crate::resynth::ResynthConfig;  // Add this import
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -45,14 +48,14 @@ pub struct MyApp {
     pub fft_config: Arc<Mutex<FFTConfig>>,
     pub buffer_size: Arc<Mutex<usize>>,
     pub audio_buffer: Arc<RwLock<CircularBuffer>>,
+    pub resynth_config: Arc<Mutex<ResynthConfig>>,
     colors: Vec<egui::Color32>,
     y_scale: f32,
     alpha: u8,
     bar_width: f32,
-
-    // Throttling: Added to track the last repaint time
-    last_repaint: Instant, // Reminder: This field was added to implement GUI throttling. Do not modify without permission.
-    shutdown_flag: Arc<AtomicBool>,  // Add shutdown flag
+    show_line_plot: bool,
+    last_repaint: Instant,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -62,6 +65,7 @@ impl MyApp {
         fft_config: Arc<Mutex<FFTConfig>>,
         buffer_size: Arc<Mutex<usize>>,
         audio_buffer: Arc<RwLock<CircularBuffer>>,
+        resynth_config: Arc<Mutex<ResynthConfig>>,
         shutdown_flag: Arc<AtomicBool>,
     ) -> Self {
         let colors = vec![
@@ -80,10 +84,12 @@ impl MyApp {
             fft_config,
             buffer_size,
             audio_buffer,
+            resynth_config,
             colors,
             y_scale: 80.0,
             alpha: 50,
             bar_width: 5.0,
+            show_line_plot: false,
             last_repaint: Instant::now(),
             shutdown_flag,
         };
@@ -248,6 +254,15 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
                     ui.label("Bar Width:");
                     ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+                    
+                    // Add gain slider
+                    {
+                        let mut resynth_config = self.resynth_config.lock().unwrap();
+                        ui.label("Gain:");
+                        ui.add(egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0));
+                    }
+
+                    ui.checkbox(&mut self.show_line_plot, "Show FFT");
 
                     // Add Kaiser beta slider here if Kaiser window is selected
                     {
@@ -307,6 +322,7 @@ impl eframe::App for MyApp {
                 self.y_scale = 80.0;
                 self.alpha = 50;
                 self.bar_width = 5.0;
+                self.show_line_plot = false;
                 
                 // Calculate optimal size based on current sample rate
                 let sample_rate = 48000.0f64;
@@ -321,6 +337,9 @@ impl eframe::App for MyApp {
                 if needs_update {
                     self.update_buffer_size(DEFAULT_BUFFER_SIZE);
                 }
+                
+                let mut resynth_config = self.resynth_config.lock().unwrap();
+                resynth_config.gain = 0.5;  // Default gain
                 
                 reset_clicked = true;
             }
@@ -342,19 +361,23 @@ impl eframe::App for MyApp {
                 spectrum.absolute_values.clone()  // Contains dB values used for both plotting and display
             };
 
-            // Plotting section - uses dB values directly
-            let all_bar_charts: Vec<BarChart> = absolute_values
-                .iter()
-                .enumerate()
-                .map(|(channel, channel_partials)| {
-                    let bars: Vec<egui::plot::Bar> = channel_partials
+            // Bar charts with static legend names - always show all channels
+            let all_bar_charts: Vec<BarChart> = (0..absolute_values.len())
+                .map(|channel| {
+                    let channel_partials = &absolute_values[channel];
+                    let mut bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(freq, raw_val)| freq > 0.0 && raw_val != 0.0)  // Filter out both zero freq and zero values
+                        .filter(|&&(freq, raw_val)| freq > 0.0 && raw_val != 0.0)
                         .map(|&(freq, raw_val)| {
                             egui::plot::Bar::new(freq as f64, raw_val as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
+
+                    // If no visible bars, add a single invisible bar
+                    if bars.is_empty() {
+                        bars.push(egui::plot::Bar::new(0.0, 0.0).width(0.0));
+                    }
 
                     let color = self.colors[channel % self.colors.len()]
                         .linear_multiply(self.alpha as f32 / 255.0);
@@ -364,6 +387,44 @@ impl eframe::App for MyApp {
                         .color(color)
                 })
                 .collect();
+
+            // Line plots without legend names - more memory efficient
+            let all_line_plots: Vec<egui::plot::Line> = if self.show_line_plot {
+                (0..absolute_values.len())
+                    .map(|channel| {
+                        let fft_config = self.fft_config.lock().unwrap();
+                        let buffer = self.audio_buffer.read().unwrap();
+                        let buffer_data = buffer.clone_data();
+                        
+                        let channel_data = extract_channel_data(&buffer_data, channel, fft_config.num_channels);
+                        let windowed = apply_window(&channel_data, fft_config.window_type);
+                        
+                        let mut planner = RealFftPlanner::<f32>::new();
+                        let fft = planner.plan_fft_forward(windowed.len());
+                        let mut spectrum = fft.make_output_vec();
+                        let _ = fft.process(&mut windowed.clone(), &mut spectrum);
+                        
+                        let freq_step = 48000.0 / windowed.len() as f32;
+                        let points: Vec<[f64; 2]> = spectrum
+                            .iter()
+                            .take((fft_config.max_frequency as f32 / freq_step) as usize)
+                            .enumerate()
+                            .map(|(i, &complex_val)| {
+                                let freq = i as f64 * freq_step as f64;
+                                let mag = ((complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt() / 4.0) as f64;
+                                [freq, mag]
+                            })
+                            .collect();
+
+                        let color = self.colors[channel % self.colors.len()]
+                            .linear_multiply(self.alpha as f32 / 255.0);
+
+                        egui::plot::Line::new(points).color(color)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let max_freq = {
                 let fft = self.fft_config.lock().unwrap();
@@ -378,8 +439,14 @@ impl eframe::App for MyApp {
                 .include_y(0.0)
                 .include_y(self.y_scale as f64)
                 .show(ui, |plot_ui| {
+                    // Draw both bar charts and line plots
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);
+                    }
+                    if self.show_line_plot {
+                        for line in all_line_plots {
+                            plot_ui.line(line);
+                        }
                     }
                 });
 
