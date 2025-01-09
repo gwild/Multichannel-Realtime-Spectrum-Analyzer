@@ -300,7 +300,7 @@ impl eframe::App for MyApp {
                     
                     // Reset FFT config
                     fft_config.min_frequency = MIN_FREQ;
-                    fft_config.max_frequency = MAX_FREQ;
+                    fft_config.max_frequency = 1400.0;  // Changed from MAX_FREQ to explicit 1400.0
                     fft_config.magnitude_threshold = 6.0;
                     fft_config.min_freq_spacing = 20.0;  // Changed from 1.0 to 20.0
                     fft_config.window_type = WindowType::Hanning;  // Changed from BlackmanHarris to Hanning
@@ -339,7 +339,7 @@ impl eframe::App for MyApp {
                 }
                 
                 let mut resynth_config = self.resynth_config.lock().unwrap();
-                resynth_config.gain = 0.5;  // Default gain
+                resynth_config.gain = 0.01;  // Changed from 0.5 to 0.01
                 
                 reset_clicked = true;
             }

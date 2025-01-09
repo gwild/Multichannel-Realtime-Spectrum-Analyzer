@@ -1,7 +1,7 @@
 use log::info;
 
 pub const MIN_FREQ: f64 = 20.0;  // Lowest frequency we want to analyze
-pub const MAX_FREQ: f64 = 500.0;  // Changed from 2000.0 to 500.0
+pub const MAX_FREQ: f64 = 1400.0;  // Changed from 20000.0 to 1400.0
 pub const MIN_BUFFER_SIZE: usize = 512;  // Increased from previous value
 pub const MAX_BUFFER_SIZE: usize = 16384;  // Absolute maximum buffer size
 pub const DEFAULT_BUFFER_SIZE: usize = 4096;  // Add this constant
