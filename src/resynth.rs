@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
 use log::{info, error};
 use crate::plot::SpectrumApp;
+use crate::fft_analysis::NUM_PARTIALS;
 
 pub struct ResynthConfig {
     pub gain: f32,  // 0.0 to 1.0
@@ -14,7 +15,7 @@ pub struct ResynthConfig {
 impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
-            gain: 0.5  // Default gain of 0.5
+            gain: 0.01  // Changed from 0.5 to 0.01
         }
     }
 }
@@ -50,7 +51,8 @@ pub fn start_resynth_thread(
         );
 
         // Phase accumulators for each partial
-        let mut phases = vec![0.0f32; 24];  // 12 partials * 2 channels
+        let num_channels = spectrum_app.lock().unwrap().clone_absolute_data().len();
+        let mut phases = vec![0.0f32; num_channels * NUM_PARTIALS];  // Size based on actual channels
 
         let mut stream = match pa.open_non_blocking_stream(settings, move |args: pa::OutputStreamCallbackArgs<f32>| {
             let buffer = args.buffer;
@@ -71,8 +73,9 @@ pub fn start_resynth_thread(
                 // Process each channel's partials
                 for (channel, channel_partials) in partials.iter().enumerate() {
                     for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                        if freq > 0.0 && amp > 0.0 {
-                            let phase = &mut phases[channel * 12 + i];
+                        let phase_idx = channel * NUM_PARTIALS + i;  // Use NUM_PARTIALS constant
+                        if freq > 0.0 && amp > 0.0 && phase_idx < phases.len() {
+                            let phase = &mut phases[phase_idx];
                             let sample = amp * phase.sin();
                             
                             // Route odd channels left, even channels right

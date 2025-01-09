@@ -89,7 +89,7 @@ impl MyApp {
             y_scale: 80.0,
             alpha: 50,
             bar_width: 5.0,
-            show_line_plot: false,
+            show_line_plot: true,
             last_repaint: Instant::now(),
             shutdown_flag,
         };
@@ -322,7 +322,7 @@ impl eframe::App for MyApp {
                 self.y_scale = 80.0;
                 self.alpha = 50;
                 self.bar_width = 5.0;
-                self.show_line_plot = false;
+                self.show_line_plot = true;
                 
                 // Calculate optimal size based on current sample rate
                 let sample_rate = 48000.0f64;
