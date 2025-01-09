@@ -24,9 +24,9 @@ impl SmoothParam {
         }
     }
 
-    fn update(&mut self, target: f32) {
+    fn update(&mut self, target: f32, smoothing: f32) {
         self.target = target;
-        self.current = self.current * SMOOTHING_FACTOR + target * (1.0 - SMOOTHING_FACTOR);
+        self.current = self.current * smoothing + target * (1.0 - smoothing);
     }
 }
 
@@ -49,12 +49,14 @@ impl PartialState {
 
 pub struct ResynthConfig {
     pub gain: f32,
+    pub smoothing: f32,
 }
 
 impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
-            gain: 0.01
+            gain: 0.01,
+            smoothing: 0.97,
         }
     }
 }
@@ -98,6 +100,7 @@ pub fn start_resynth_thread(
             
             let partials = spectrum_app.lock().unwrap().clone_absolute_data();
             let gain = config.lock().unwrap().gain;
+            let smoothing = config.lock().unwrap().smoothing;
 
             buffer.fill(0.0);
 
@@ -110,8 +113,8 @@ pub fn start_resynth_thread(
                         let state = &mut partial_states[channel][i];
                         
                         // Update smoothed parameters
-                        state.freq.update(freq);
-                        state.amp.update(amp);
+                        state.freq.update(freq, smoothing);
+                        state.amp.update(amp, smoothing);
 
                         if state.freq.current > 0.0 && state.amp.current > 0.0 {
                             let sample = state.amp.current * state.phase.sin();

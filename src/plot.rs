@@ -228,22 +228,19 @@ impl eframe::App for MyApp {
                     }
 
                     // Window type selection
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.label("Window Type:");
-                        egui::ComboBox::from_label("")
-                            .selected_text(format!("{:?}", fft_config.window_type))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
-                                if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
-                                    fft_config.window_type = WindowType::Kaiser(4.0);
-                                }
-                            });
-                    }
+                    ui.horizontal(|ui| {
+                        if let Ok(mut fft_config) = self.fft_config.lock() {
+                            ui.label("Window Type:");
+                            egui::ComboBox::from_id_source("window_type")
+                                .selected_text(format!("{:?}", fft_config.window_type))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
+                                    ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
+                                });
+                        }
+                        ui.checkbox(&mut self.show_line_plot, "Show FFT");
+                    });
                 });
 
                 // 3) Sliders for Y scale, alpha, bar width, and Kaiser beta
@@ -256,28 +253,19 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
                     
                     // Add gain slider
-                    {
-                        let mut resynth_config = self.resynth_config.lock().unwrap();
+                    ui.horizontal(|ui| {
                         ui.label("Gain:");
-                        ui.add(egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0));
-                    }
-
-                    ui.checkbox(&mut self.show_line_plot, "Show FFT");
-
-                    // Add Kaiser beta slider here if Kaiser window is selected
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        if let WindowType::Kaiser(_) = fft_config.window_type {
-                            ui.label("Kaiser β:");
-                            let mut beta = match fft_config.window_type {
-                                WindowType::Kaiser(b) => b,
-                                _ => 4.0,
-                            };
-                            if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
-                                fft_config.window_type = WindowType::Kaiser(beta);
-                            }
+                        if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                            ui.add(egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0));
                         }
-                    }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Smoothing:");
+                        if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                            ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.5..=0.999));
+                        }
+                    });
                 });
 
                 // Handle max frequency adjustment if buffer size changed
