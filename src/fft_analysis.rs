@@ -103,6 +103,49 @@ pub fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize)
         .collect()
 }
 
+/// Reduces crosstalk between channels
+pub fn filter_crosstalk(
+    channel_data: &[Vec<f32>],
+    threshold: f32,
+    reduction: f32
+) -> Vec<Vec<f32>> {
+    if channel_data.is_empty() {
+        return Vec::new();
+    }
+
+    let num_channels = channel_data.len();
+    let samples_per_channel = channel_data[0].len();
+    let mut filtered = vec![vec![0.0; samples_per_channel]; num_channels];
+
+    for sample_idx in 0..samples_per_channel {
+        // Get all channel values for this sample
+        let sample_values: Vec<f32> = channel_data.iter()
+            .map(|channel| channel[sample_idx])
+            .collect();
+
+        // Process each channel
+        for (ch_idx, channel) in channel_data.iter().enumerate() {
+            let main_signal = channel[sample_idx];
+            let mut crosstalk = 0.0;
+
+            // Calculate crosstalk from other channels
+            for (other_idx, &other_val) in sample_values.iter().enumerate() {
+                if other_idx != ch_idx {
+                    let ratio = (other_val / main_signal).abs();
+                    if ratio > threshold {
+                        crosstalk += other_val * reduction;
+                    }
+                }
+            }
+
+            // Subtract crosstalk from main signal
+            filtered[ch_idx][sample_idx] = main_signal - crosstalk;
+        }
+    }
+
+    filtered
+}
+
 /// Filters audio buffer based on amplitude threshold
 #[allow(dead_code)]
 pub fn filter_buffer(buffer: &[f32], db_threshold: f64) -> Vec<f32> {
