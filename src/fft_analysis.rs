@@ -24,6 +24,9 @@ pub struct FFTConfig {
     #[allow(dead_code)]
     pub num_channels: usize,
     pub frames_per_buffer: u32,
+    pub crosstalk_threshold: f32,  // Add crosstalk threshold (0.0 to 1.0)
+    pub crosstalk_reduction: f32,  // Add reduction factor (0.0 to 1.0)
+    pub crosstalk_enabled: bool,  // Add enable flag for crosstalk filtering
     pub window_type: WindowType,
 }
 
