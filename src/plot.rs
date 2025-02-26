@@ -227,6 +227,30 @@ impl eframe::App for MyApp {
                         ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
                     }
 
+                    // Crosstalk Section (existing code)
+                    ui.separator();
+                    ui.label("Crosstalk Filtering");
+                    ui.horizontal(|ui| {
+                        let mut fft_config = self.fft_config.lock().unwrap();
+                        ui.checkbox(&mut fft_config.crosstalk_enabled, "Enable Crosstalk Filtering");
+                    });
+                    if let Ok(mut fft_config) = self.fft_config.lock() {
+                        if fft_config.crosstalk_enabled {
+                            ui.horizontal(|ui| {
+                                ui.label("Crosstalk Threshold:");
+                                ui.add(
+                                    egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
+                                        .text("ratio")
+                                );
+                                ui.label("Reduction:");
+                                ui.add(
+                                    egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
+                                        .text("factor")
+                                );
+                            });
+                        }
+                    }
+
                     // Window type selection
                     ui.horizontal(|ui| {
                         if let Ok(mut fft_config) = self.fft_config.lock() {
