@@ -38,7 +38,7 @@ pub fn start_fft_processing(
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    let mut prev_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
+    let _prev_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
@@ -48,7 +48,7 @@ pub fn start_fft_processing(
                     buffer.clone_data()
                 };
 
-                // First deinterleave into separate channel buffers
+                // Extract channel data
                 let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
                     .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
                     .collect();
@@ -57,30 +57,32 @@ pub fn start_fft_processing(
                 let config = fft_config.lock().unwrap();
                 let crosstalk_enabled = config.crosstalk_enabled;
                 let crosstalk_threshold = config.crosstalk_threshold;
-                let crosstalk_reduction = config.crosstalk_reduction;
                 
-                // Apply crosstalk filtering if enabled
-                let processed_buffers = if crosstalk_enabled {
-                    filter_crosstalk(&channel_buffers, crosstalk_threshold, crosstalk_reduction)
-                } else {
-                    channel_buffers
-                };
-
-                let mut all_channels_results = 
-                    vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
+                // Process each channel independently first to get spectra
+                let mut all_channels_spectra: Vec<Vec<(f32, f32)>> = Vec::new();
+                
                 for (channel_index, _) in selected_channels.iter().enumerate() {
                     let spectrum = compute_spectrum(
-                        &processed_buffers,  // Use the processed buffers (with or without crosstalk filtering)
+                        &channel_buffers,
                         channel_index,     
                         sample_rate, 
                         &*config,
                         None
                     );
-
-                    all_channels_results[channel_index] = spectrum.clone();
-                    prev_results[channel_index] = spectrum;
+                    
+                    all_channels_spectra.push(spectrum);
                 }
+                
+                // Now apply frequency-domain crosstalk filtering if enabled
+                let all_channels_results = if crosstalk_enabled {
+                    filter_crosstalk_frequency_domain(
+                        &mut all_channels_spectra,
+                        crosstalk_threshold,
+                        0.03 // Harmonic tolerance
+                    )
+                } else {
+                    all_channels_spectra
+                };
 
                 if let Ok(mut spectrum) = spectrum_app.lock() {
                     spectrum.update_partials(all_channels_results);
@@ -223,7 +225,7 @@ pub fn compute_spectrum(
     channel_index: usize,
     sample_rate: u32, 
     config: &FFTConfig,
-    _prev_magnitudes: Option<&[(f32, f32)]>  // Not used anymore
+    _prev_magnitudes: Option<&[(f32, f32)]>
 ) -> Vec<(f32, f32)> {
     let signal = &all_channel_data[channel_index];
     
@@ -379,4 +381,167 @@ fn blackman_harris_window(len: usize) -> Vec<f32> {
         let x = 2.0 * PI * i as f32 / (len - 1) as f32;
         a0 - a1 * x.cos() + a2 * (2.0 * x).cos() - a3 * (3.0 * x).cos()
     }).collect()
+}
+
+/// Applies crosstalk filtering in the frequency domain after FFT analysis
+pub fn filter_crosstalk_frequency_domain(
+    spectra: &mut Vec<Vec<(f32, f32)>>, // Vector of (frequency, magnitude) pairs for each channel
+    crosstalk_threshold: f32,           // Relative magnitude threshold (0.0 to 1.0)
+    harmonic_tolerance: f32,            // How close a frequency must be to be considered a harmonic (e.g. 0.03)
+) -> Vec<Vec<(f32, f32)>> {
+    if spectra.is_empty() {
+        return Vec::new();
+    }
+
+    let num_channels = spectra.len();
+    if num_channels == 1 {
+        return spectra.clone(); // No crosstalk with single channel
+    }
+
+    // Find root frequency for each channel (strongest low frequency peak)
+    let mut root_frequencies: Vec<f32> = Vec::with_capacity(num_channels);
+    
+    for channel_spectra in spectra.iter() {
+        // Sort by magnitude to find strongest peaks
+        let mut peaks = channel_spectra.clone();
+        peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Find the lowest significant frequency below 500Hz
+        // This is a common range for fundamental frequencies
+        let root = peaks.iter()
+            .filter(|&&(freq, mag)| freq > 20.0 && freq < 500.0 && mag > 0.01)
+            .next()
+            .map(|&(freq, _)| freq)
+            .unwrap_or(0.0);
+            
+        root_frequencies.push(root);
+    }
+    
+    // Create a copy to store filtered results
+    let mut filtered_spectra = spectra.clone();
+    
+    // For each frequency in each channel
+    for ch_idx in 0..num_channels {
+        // Skip if no root frequency detected for this channel
+        if root_frequencies[ch_idx] < 20.0 {
+            continue;
+        }
+        
+        // For each partial in this channel
+        for i in 0..filtered_spectra[ch_idx].len() {
+            let (freq, magnitude) = filtered_spectra[ch_idx][i];
+            
+            // Skip if already filtered out
+            if magnitude <= 0.0 {
+                continue;
+            }
+            
+            // Check if this is a harmonic of our root
+            let is_harmonic = is_harmonic_of(freq, root_frequencies[ch_idx], harmonic_tolerance);
+            
+            // Check other channels for the same frequency
+            for other_ch in 0..num_channels {
+                if other_ch == ch_idx {
+                    continue;
+                }
+                
+                // Find closest matching frequency in other channel
+                if let Some(other_idx) = find_closest_frequency(&filtered_spectra[other_ch], freq, 5.0) {
+                    let (other_freq, other_mag) = filtered_spectra[other_ch][other_idx];
+                    
+                    // Is this frequency a harmonic of the other channel's root?
+                    let other_is_harmonic = is_harmonic_of(other_freq, root_frequencies[other_ch], harmonic_tolerance);
+                    
+                    // If both channels have harmonic claim to this frequency
+                    if is_harmonic && other_is_harmonic {
+                        // Keep it in both channels if they're both strong
+                        if magnitude > 0.1 && other_mag > 0.1 {
+                            continue;
+                        }
+                        
+                        // Otherwise, assign to the stronger channel
+                        if other_mag > magnitude * (1.0 + crosstalk_threshold) {
+                            // Other channel is stronger, remove from this channel
+                            filtered_spectra[ch_idx][i].1 = 0.0;
+                        } else if magnitude > other_mag * (1.0 + crosstalk_threshold) {
+                            // This channel is stronger, remove from other channel
+                            filtered_spectra[other_ch][other_idx].1 = 0.0;
+                        }
+                        // If magnitudes are similar, keep in both channels
+                    }
+                    // If only one has harmonic claim
+                    else if is_harmonic && !other_is_harmonic {
+                        // This is our harmonic, reduce or remove it from other channel
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - crosstalk_threshold;
+                    }
+                    else if !is_harmonic && other_is_harmonic {
+                        // This is their harmonic, reduce it in our channel
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - crosstalk_threshold;
+                    }
+                    // Neither has harmonic claim - decide based on magnitude
+                    else if other_mag > magnitude * (1.0 + crosstalk_threshold) {
+                        // Other channel is significantly stronger
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - crosstalk_threshold;
+                    } else if magnitude > other_mag * (1.0 + crosstalk_threshold) {
+                        // This channel is significantly stronger
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - crosstalk_threshold;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Remove zero-magnitude partials from each channel
+    for ch_idx in 0..num_channels {
+        filtered_spectra[ch_idx].retain(|&(_, mag)| mag > 0.001);
+        
+        // Sort by frequency
+        filtered_spectra[ch_idx].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Ensure we have exactly NUM_PARTIALS partials
+        while filtered_spectra[ch_idx].len() < NUM_PARTIALS {
+            filtered_spectra[ch_idx].push((0.0, 0.0));
+        }
+        
+        // Truncate if we have too many
+        filtered_spectra[ch_idx].truncate(NUM_PARTIALS);
+    }
+    
+    filtered_spectra
+}
+
+/// Helper function to check if a frequency is a harmonic of a root frequency
+fn is_harmonic_of(freq: f32, root: f32, tolerance: f32) -> bool {
+    if root <= 0.0 {
+        return false;
+    }
+    
+    // Calculate harmonic ratio
+    let ratio = freq / root;
+    
+    // Check if it's close to an integer
+    let nearest_harmonic = ratio.round();
+    let distance = (ratio - nearest_harmonic).abs();
+    
+    // Allow more tolerance for higher harmonics
+    let adjusted_tolerance = tolerance * (1.0 + 0.1 * nearest_harmonic);
+    
+    // Return true if it's within tolerance of an integer ratio
+    distance < adjusted_tolerance && nearest_harmonic > 0.0 && nearest_harmonic < 20.0
+}
+
+/// Helper function to find the index of the closest frequency in a spectrum
+fn find_closest_frequency(spectrum: &[(f32, f32)], target: f32, max_distance: f32) -> Option<usize> {
+    let mut closest_idx = None;
+    let mut min_distance = max_distance;
+    
+    for (idx, &(freq, _)) in spectrum.iter().enumerate() {
+        let distance = (freq - target).abs();
+        if distance < min_distance {
+            min_distance = distance;
+            closest_idx = Some(idx);
+        }
+    }
+    
+    closest_idx
 }
