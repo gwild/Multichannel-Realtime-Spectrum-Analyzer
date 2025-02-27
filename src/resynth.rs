@@ -8,11 +8,48 @@ use log::{info, error};
 use crate::plot::SpectrumApp;
 use crate::fft_analysis::NUM_PARTIALS;
 
+// Add Pi-specific constants
+#[cfg(target_arch = "arm")]
+const CROSSFADE_THRESHOLD: f32 = 10.0; // More conservative for Pi
+#[cfg(target_arch = "arm")]
+const ATTACK_TIME: f32 = 0.05; // Longer attack for Pi (50ms)
+#[cfg(target_arch = "arm")]
+const RELEASE_TIME: f32 = 0.08; // Longer release for Pi (80ms)
+
+// For non-Pi platforms
+#[cfg(not(target_arch = "arm"))]
+const CROSSFADE_THRESHOLD: f32 = 20.0;
+#[cfg(not(target_arch = "arm"))]
+const ATTACK_TIME: f32 = 0.02; 
+#[cfg(not(target_arch = "arm"))]
+const RELEASE_TIME: f32 = 0.03;
+
+const MIN_ENVELOPE_VALUE: f32 = 0.001;
+
 const SMOOTHING_FACTOR: f32 = 0.97; // Higher = smoother but slower response
-const CROSSFADE_THRESHOLD: f32 = 20.0; // Reduced threshold to catch more frequency changes
-const ATTACK_TIME: f32 = 0.02; // Increased to 20ms for smoother attack
-const RELEASE_TIME: f32 = 0.03; // Increased to 30ms for smoother release
-const MIN_ENVELOPE_VALUE: f32 = 0.001; // Minimum envelope to avoid total silence
+
+// Adjust global gain scaling values for Pi and other systems
+#[cfg(target_arch = "arm")]
+const GAIN_SCALING: f32 = 0.4; // Less aggressive gain reduction for Pi
+#[cfg(not(target_arch = "arm"))]
+const GAIN_SCALING: f32 = 0.5; // Less aggressive gain reduction for other systems
+
+// Adjust the limiter threshold to engage earlier
+const LIMIT_THRESHOLD: f32 = 0.85; // Higher threshold means less limiting
+const LIMIT_STRENGTH: f32 = 0.4; // Lower strength for more transparent limiting (was 0.8)
+
+// Modify the Pi-specific filtering to be less aggressive
+#[cfg(target_arch = "arm")]
+const MIN_PARTIAL_AMP: f32 = 0.002; // Less aggressive filtering for quiet partials
+
+// Dynamic gain scaling based on partial activity
+const BASE_GAIN_SCALING: f32 = 0.2; // Base level gain scaling
+const DYNAMIC_SCALING_FACTOR: f32 = 0.8; // How much to scale based on active partials
+
+// Phase cancellation prevention
+const PHASE_JITTER: f32 = 0.01; // Small amount of phase randomization to prevent perfect cancellation
+
+const VOLUME_CORRECTION: f32 = 0.1; // 1/10th instead of 10x
 
 #[derive(Clone)]
 struct SmoothParam {
@@ -169,7 +206,8 @@ pub fn start_resynth_thread(
         let settings = pa::OutputStreamSettings::new(
             output_params,
             sample_rate,
-            512,
+            // Use larger buffer on Pi to prevent underruns
+            if cfg!(target_arch = "arm") { 1024 } else { 512 },
         );
 
         // Initialize partial states for smoothing
@@ -194,7 +232,28 @@ pub fn start_resynth_thread(
             for frame in 0..frames {
                 let mut left = 0.0f32;
                 let mut right = 0.0f32;
+                
+                // Count active partials to apply dynamic scaling
+                let mut active_partial_count = 0;
+                
+                // First pass: count active partials for dynamic scaling
+                for channel_partials in &partials {
+                    for &(freq, amp) in channel_partials.iter() {
+                        if freq > 0.0 && amp > 0.01 {
+                            active_partial_count += 1;
+                        }
+                    }
+                }
+                
+                // Calculate dynamic scaling - more active partials = lower per-partial gain
+                let dynamic_scale = if active_partial_count > 0 {
+                    let scaling = 1.0 / (1.0 + (active_partial_count as f32 * 0.05));
+                    BASE_GAIN_SCALING + (DYNAMIC_SCALING_FACTOR * scaling)
+                } else {
+                    BASE_GAIN_SCALING
+                };
 
+                // Process all partials
                 for (channel, channel_partials) in partials.iter().enumerate() {
                     for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
                         let state = &mut partial_states[channel][i];
@@ -202,6 +261,22 @@ pub fn start_resynth_thread(
                         // Update smoothed parameters
                         state.freq.update(freq, smoothing);
                         state.amp.update(amp, smoothing);
+                        
+                        // Apply more aggressive filtering on Pi
+                        #[cfg(target_arch = "arm")]
+                        {
+                            // Filter out very quiet partials, but with a lower threshold
+                            if state.amp.target < MIN_PARTIAL_AMP && state.amp.current < MIN_PARTIAL_AMP * 2.0 {
+                                state.amp.current = 0.0;
+                                state.amp.target = 0.0;
+                                continue;
+                            }
+                            
+                            // Less aggressive frequency smoothing
+                            if state.freq.large_change() {
+                                state.freq.current = state.freq.current * 0.85 + state.freq.target * 0.15;
+                            }
+                        }
                         
                         // Update envelope for attack/release
                         state.update_envelope(sample_rate as f32, attack_samples, release_samples);
@@ -232,29 +307,23 @@ pub fn start_resynth_thread(
                         }
 
                         if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
-                            // Apply envelope for smooth attack/release with additional smoothing
+                            // Apply envelope with per-partial dynamic scaling
                             let amplitude = if state.is_active {
                                 state.amp.current * state.envelope
                             } else {
-                                // During release, use the previous amplitude value for smoother fade-out
                                 state.amp.current * state.envelope
                             };
                             
-                            // Use a smoother waveform - blend between sine and previous value
-                            // This helps reduce aliasing and buzzing on rapid changes
-                            let raw_sample = amplitude * state.phase.sin();
+                            // Slight phase jitter to prevent perfect cancellation between partials
+                            let phase_with_jitter = state.phase + (PHASE_JITTER * (i as f32 * 0.1));
                             
-                            // Apply soft clipping to avoid harsh digital distortion on loud transients
-                            let sample = if raw_sample.abs() > 0.8 {
-                                (raw_sample.signum() * (0.8 + (raw_sample.abs() - 0.8) * 0.2)).clamp(-1.0, 1.0)
-                            } else {
-                                raw_sample
-                            };
+                            let raw_sample = amplitude * phase_with_jitter.sin();
                             
+                            // Channel-dependent panning to reduce mono summing issues
                             if channel % 2 == 0 {
-                                left += sample;
+                                left += raw_sample;
                             } else {
-                                right += sample;
+                                right += raw_sample;
                             }
                             
                             // Update phase using smoothed frequency with more careful wrapping
@@ -272,9 +341,17 @@ pub fn start_resynth_thread(
                     }
                 }
 
+                // Apply the dynamic scaling and user gain
                 let frame_offset = frame * 2;
-                buffer[frame_offset] = (left * gain).clamp(-1.0, 1.0);
-                buffer[frame_offset + 1] = (right * gain).clamp(-1.0, 1.0);
+
+                // Apply the correct volume scaling (gain is 0.001-0.01 range)
+                // When user sets volume to 1 (gain=0.001), the actual gain becomes 0.0001
+                // When user sets volume to 10 (gain=0.01), the actual gain becomes 0.001
+                let corrected_gain = gain * VOLUME_CORRECTION;
+
+                // Use corrected gain with dynamic scaling
+                buffer[frame_offset] = (left * dynamic_scale * corrected_gain).clamp(-0.95, 0.95);
+                buffer[frame_offset + 1] = (right * dynamic_scale * corrected_gain).clamp(-0.95, 0.95);
             }
 
             pa::Continue
