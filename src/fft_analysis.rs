@@ -9,7 +9,6 @@ use crate::audio_stream::CircularBuffer;
 use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
-use realfft::num_complex::Complex;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 

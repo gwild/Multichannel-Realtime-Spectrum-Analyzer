@@ -19,7 +19,7 @@ use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
 use fft_analysis::FFTConfig;
-use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE, calculate_optimal_buffer_size};
+use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;
 use crate::resynth::{ResynthConfig, start_resynth_thread};
 
@@ -208,6 +208,9 @@ fn run() -> Result<()> {
         num_channels: selected_channels.len(),
         frames_per_buffer,
         window_type: WindowType::Hanning,
+        crosstalk_enabled: false,
+        crosstalk_reduction: 0.5,
+        crosstalk_threshold: 0.3,
     }));
 
     let running = Arc::new(AtomicBool::new(false));
