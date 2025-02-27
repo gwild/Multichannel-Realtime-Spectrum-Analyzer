@@ -49,7 +49,15 @@ const DYNAMIC_SCALING_FACTOR: f32 = 0.8; // How much to scale based on active pa
 // Phase cancellation prevention
 const PHASE_JITTER: f32 = 0.01; // Small amount of phase randomization to prevent perfect cancellation
 
-const VOLUME_CORRECTION: f32 = 0.1; // 1/10th instead of 10x
+// Keep these constants at the module level
+const VOLUME_CORRECTION: f32 = 0.2; // Doubled from 0.1 to make max volume twice as loud
+
+// Modify the envelope handling for more robust cross-buffer continuity
+#[cfg(target_arch = "arm")]
+const ENVELOPE_SLOPE_LIMIT: f32 = 0.01; // Limit how quickly envelopes can change per sample
+
+#[cfg(target_arch = "arm")]
+const DC_FILTER_COEFF: f32 = 0.995; // DC blocking filter coefficient
 
 #[derive(Clone)]
 struct SmoothParam {
@@ -206,7 +214,7 @@ pub fn start_resynth_thread(
         let settings = pa::OutputStreamSettings::new(
             output_params,
             sample_rate,
-            // Use larger buffer on Pi to prevent underruns
+            // Keep original larger buffer size for Pi
             if cfg!(target_arch = "arm") { 1024 } else { 512 },
         );
 
@@ -218,6 +226,16 @@ pub fn start_resynth_thread(
         let attack_samples = (ATTACK_TIME * sample_rate as f32) as usize;
         let release_samples = (RELEASE_TIME * sample_rate as f32) as usize;
 
+        // Add a buffer state tracker for the Pi
+        #[cfg(target_arch = "arm")]
+        let mut last_buffer_state: Vec<(f32, f32)> = vec![(0.0, 0.0); 2]; // Left/right values from end of last buffer
+        
+        // Add these variables inside the function instead
+        #[cfg(target_arch = "arm")]
+        let mut prev_left = 0.0f32;
+        #[cfg(target_arch = "arm")]
+        let mut prev_right = 0.0f32;
+        
         let mut stream = match pa.open_non_blocking_stream(settings, move |args: pa::OutputStreamCallbackArgs<f32>| {
             let buffer = args.buffer;
             let frames = buffer.len() / 2;
@@ -228,6 +246,26 @@ pub fn start_resynth_thread(
             let smoothing = config_lock.smoothing;
 
             buffer.fill(0.0);
+
+            // At the beginning of processing, apply special handling for buffer boundaries on Pi
+            #[cfg(target_arch = "arm")]
+            {
+                // Apply a small crossfade between buffer boundaries
+                if frames > 0 {
+                    // Start with the last values from previous buffer and fade to new values
+                    buffer[0] = last_buffer_state[0].0;
+                    buffer[1] = last_buffer_state[0].1;
+                    
+                    // For first few frames, do a quick crossfade from last buffer
+                    let crossfade_frames = frames.min(16); // Max 16 frames for crossfade
+                    for frame in 1..crossfade_frames {
+                        let ratio = frame as f32 / crossfade_frames as f32;
+                        // Blend previous buffer end with current buffer start
+                        buffer[frame*2] = buffer[frame*2] * ratio + last_buffer_state[0].0 * (1.0-ratio);
+                        buffer[frame*2+1] = buffer[frame*2+1] * ratio + last_buffer_state[0].1 * (1.0-ratio);
+                    }
+                }
+            }
 
             for frame in 0..frames {
                 let mut left = 0.0f32;
@@ -317,13 +355,44 @@ pub fn start_resynth_thread(
                             // Slight phase jitter to prevent perfect cancellation between partials
                             let phase_with_jitter = state.phase + (PHASE_JITTER * (i as f32 * 0.1));
                             
-                            let raw_sample = amplitude * phase_with_jitter.sin();
+                            // Define raw_sample outside the cfg blocks
+                            let raw_sample: f32;
+                            
+                            // On Pi, simplify the oscillator to reduce computational load
+                            #[cfg(target_arch = "arm")]
+                            {
+                                // Less expensive sine approximation for Pi
+                                let phase_sin = if phase_with_jitter < PI {
+                                    (1.57079632679 - phase_with_jitter) * (phase_with_jitter)
+                                } else {
+                                    (phase_with_jitter - 4.71238898038) * (phase_with_jitter - 3.14159265359) 
+                                };
+                                
+                                // Set the outer raw_sample
+                                raw_sample = amplitude * phase_sin;
+                            }
+                            
+                            // On other platforms, use the regular sine function
+                            #[cfg(not(target_arch = "arm"))]
+                            {
+                                // Set the outer raw_sample
+                                raw_sample = amplitude * phase_with_jitter.sin();
+                            }
+                            
+                            // Now we can use raw_sample outside the cfg blocks
+                            
+                            // Apply additional filtering to prevent high-frequency noise for high frequencies
+                            let filtered_sample = if freq > 10000.0 {
+                                raw_sample * (20000.0 - freq) / 10000.0
+                            } else {
+                                raw_sample
+                            };
                             
                             // Channel-dependent panning to reduce mono summing issues
                             if channel % 2 == 0 {
-                                left += raw_sample;
+                                left += filtered_sample;
                             } else {
-                                right += raw_sample;
+                                right += filtered_sample;
                             }
                             
                             // Update phase using smoothed frequency with more careful wrapping
@@ -354,6 +423,35 @@ pub fn start_resynth_thread(
                 buffer[frame_offset + 1] = (right * dynamic_scale * corrected_gain).clamp(-0.95, 0.95);
             }
 
+            // At the end of processing, store last buffer values for next time on Pi
+            #[cfg(target_arch = "arm")]
+            {
+                if frames > 0 {
+                    // Store last values for next buffer
+                    last_buffer_state[0].0 = buffer[(frames-1)*2];
+                    last_buffer_state[0].1 = buffer[(frames-1)*2+1];
+                }
+            }
+            
+            // Before final output, add DC filtering for Pi
+            #[cfg(target_arch = "arm")]
+            {
+                // We need to iterate through all frames for DC filtering
+                for frame in 0..frames {
+                    let frame_offset = frame * 2;
+                    
+                    // Simple DC blocking filter for left channel
+                    let filtered_left = buffer[frame_offset] - prev_left + (DC_FILTER_COEFF * prev_left);
+                    prev_left = filtered_left;
+                    buffer[frame_offset] = filtered_left;
+                    
+                    // Simple DC blocking filter for right channel
+                    let filtered_right = buffer[frame_offset + 1] - prev_right + (DC_FILTER_COEFF * prev_right);
+                    prev_right = filtered_right;
+                    buffer[frame_offset + 1] = filtered_right;
+                }
+            }
+            
             pa::Continue
         }) {
             Ok(stream) => stream,
