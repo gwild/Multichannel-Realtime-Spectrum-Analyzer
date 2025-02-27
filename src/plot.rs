@@ -162,8 +162,8 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn on_close_event(&mut self) -> bool {
         info!("Closing GUI window...");
-        self.shutdown_flag.store(true, Ordering::SeqCst);  // Changed back to true for shutdown
-        true // Allow the window to close
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        true
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -182,8 +182,7 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("First Twelve Partials per Channel");
 
-            // Before all controls
-            let mut size_changed = false;  // Single declaration for size_changed
+            let mut size_changed = false;
 
             // 1) First row of sliders
             {
@@ -199,139 +198,134 @@ impl eframe::App for MyApp {
 
                     ui.label("Magnitude Threshold:");
                     ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=30.0));
-                    
-                    // Remove Show FFT checkbox from first row
                 });
             }
 
             // 2) Second row with frames, buffer size, and averaging
-            {
-                ui.horizontal(|ui| {
-                    // Buffer size slider
-                    {
-                        let buffer_size = *self.buffer_size.lock().unwrap();
-                        let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
-                        ui.label("Buffer Size:");
-                        let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
-                        let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
-                        if ui
-                            .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power)
-                                .custom_formatter(|n, _| {
-                                    format!("{}", 1_usize << (n as usize))
-                                }))
-                            .changed()
-                        {
-                            let new_size = 1 << buffer_log_slider;
-                            self.update_buffer_size(new_size);
-                            size_changed = true;
-                        }
-                        ui.label("samples");
-                    }
-
-                    // Min freq spacing slider
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.label("Min Freq Spacing:");
-                        ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
-                    }
-                    
-                    // Move Show FFT checkbox to end of second row
-                    ui.checkbox(&mut self.show_line_plot, "Show FFT");
-                });
-
-                // 3) Sliders for Y scale, alpha, bar width
-                ui.horizontal(|ui| {
-                    ui.label("Y Max:");
-                    ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
-                    ui.label("Alpha:");
-                    ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
-                    ui.label("Bar Width:");
-                    ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
-                });
-                
-                // 4) New row for Window Type and Crosstalk
-                ui.horizontal(|ui| {
-                    // Window type selection
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.label("Window Type:");
-                        egui::ComboBox::from_id_source("window_type")
-                            .selected_text(format!("{:?}", fft_config.window_type))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
-                                ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
-                                if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
-                                    fft_config.window_type = WindowType::Kaiser(4.0);
-                                }
-                            });
-                            
-                        // Kaiser beta slider appears to the right if Kaiser window is selected
-                        if let WindowType::Kaiser(_) = fft_config.window_type {
-                            ui.label("Kaiser β:");
-                            let mut beta = match fft_config.window_type {
-                                WindowType::Kaiser(b) => b,
-                                _ => 4.0,
-                            };
-                            if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
-                                fft_config.window_type = WindowType::Kaiser(beta);
-                            }
-                        }
-                    }
-                    
-                    ui.separator();
-                    
-                    // Crosstalk section
-                    {
-                        let mut fft_config = self.fft_config.lock().unwrap();
-                        ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
-                        
-                        // Show crosstalk parameters to the right if enabled
-                        if fft_config.crosstalk_enabled {
-                            ui.label("Threshold:");
-                            ui.add(
-                                egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
-                            );
-                            ui.label("Reduction:");
-                            ui.add(
-                                egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
-                            );
-                        }
-                    }
-                });
-                
-                // 5) New row for Volume and Smoothing
-                ui.horizontal(|ui| {
-                    // Volume slider (renamed from Gain)
-                    ui.label("Volume:");
-                    if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                        // Create a temporary display value 0-10 that maps to gain 0-0.01
-                        let mut volume_display = (resynth_config.gain / 0.001).round() as i32;
-                        if ui.add(egui::Slider::new(&mut volume_display, 0..=10)).changed() {
-                            // Map the display value back to actual gain value
-                            resynth_config.gain = volume_display as f32 * 0.001;
-                        }
-                    }
-                    
-                    ui.separator();
-                    
-                    // Smoothing slider with new minimum of 0
-                    ui.label("Smoothing:");
-                    if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                        ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.0..=0.9999));
-                    }
-                });
-
-                // Handle max frequency adjustment if buffer size changed
-                if size_changed {
+            ui.horizontal(|ui| {
+                // Buffer size slider
+                {
                     let buffer_size = *self.buffer_size.lock().unwrap();
-                    let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
-                    let mut fft_config = self.fft_config.lock().unwrap();
-                    if fft_config.max_frequency > nyquist_limit {
-                        fft_config.max_frequency = nyquist_limit;
+                    let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
+                    ui.label("Buffer Size:");
+                    let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
+                    let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
+                    if ui
+                        .add(egui::Slider::new(&mut buffer_log_slider, min_power..=max_power)
+                            .custom_formatter(|n, _| {
+                                format!("{}", 1_usize << (n as usize))
+                            }))
+                        .changed()
+                    {
+                        let new_size = 1 << buffer_log_slider;
+                        self.update_buffer_size(new_size);
+                        size_changed = true;
                     }
+                    ui.label("samples");
+                }
+
+                // Min freq spacing slider
+                {
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    ui.label("Min Freq Spacing:");
+                    ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
+                }
+                
+                ui.checkbox(&mut self.show_line_plot, "Show FFT");
+            });
+
+            // 3) Sliders for Y scale, alpha, bar width
+            ui.horizontal(|ui| {
+                ui.label("Y Max:");
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
+                ui.label("Alpha:");
+                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
+                ui.label("Bar Width:");
+                ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+            });
+            
+            // 4) New row for Window Type and Crosstalk
+            ui.horizontal(|ui| {
+                // Window type selection
+                {
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    ui.label("Window Type:");
+                    egui::ComboBox::from_id_source("window_type")
+                        .selected_text(format!("{:?}", fft_config.window_type))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut fft_config.window_type, WindowType::Rectangular, "Rectangular");
+                            ui.selectable_value(&mut fft_config.window_type, WindowType::Hanning, "Hanning");
+                            ui.selectable_value(&mut fft_config.window_type, WindowType::Hamming, "Hamming");
+                            ui.selectable_value(&mut fft_config.window_type, WindowType::BlackmanHarris, "Blackman-Harris");
+                            ui.selectable_value(&mut fft_config.window_type, WindowType::FlatTop, "Flat Top");
+                            if ui.selectable_value(&mut fft_config.window_type, WindowType::Kaiser(4.0), "Kaiser").clicked() {
+                                fft_config.window_type = WindowType::Kaiser(4.0);
+                            }
+                        });
+                        
+                    // Kaiser beta slider appears to the right if Kaiser window is selected
+                    if let WindowType::Kaiser(_) = fft_config.window_type {
+                        ui.label("Kaiser β:");
+                        let mut beta = match fft_config.window_type {
+                            WindowType::Kaiser(b) => b,
+                            _ => 4.0,
+                        };
+                        if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
+                            fft_config.window_type = WindowType::Kaiser(beta);
+                        }
+                    }
+                }
+                
+                ui.separator();
+                
+                // Crosstalk section
+                {
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
+                    
+                    // Show crosstalk parameters to the right if enabled
+                    if fft_config.crosstalk_enabled {
+                        ui.label("Threshold:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
+                        );
+                        ui.label("Reduction:");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
+                        );
+                    }
+                }
+            });
+            
+            // 5) New row for Volume and Smoothing
+            ui.horizontal(|ui| {
+                // Volume slider (renamed from Gain)
+                ui.label("Volume:");
+                if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                    // Create a temporary display value 0-10 that maps to gain 0-0.01
+                    let mut volume_display = (resynth_config.gain / 0.001).round() as i32;
+                    if ui.add(egui::Slider::new(&mut volume_display, 0..=10)).changed() {
+                        // Map the display value back to actual gain value
+                        resynth_config.gain = volume_display as f32 * 0.001;
+                    }
+                }
+                
+                ui.separator();
+                
+                // Smoothing slider with new minimum of 0
+                ui.label("Smoothing:");
+                if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                    ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.0..=0.9999));
+                }
+            });
+
+            // Handle max frequency adjustment if buffer size changed
+            if size_changed {
+                let buffer_size = *self.buffer_size.lock().unwrap();
+                let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
+                let mut fft_config = self.fft_config.lock().unwrap();
+                if fft_config.max_frequency > nyquist_limit {
+                    fft_config.max_frequency = nyquist_limit;
                 }
             }
 
@@ -348,6 +342,11 @@ impl eframe::App for MyApp {
                     fft_config.magnitude_threshold = 6.0;
                     fft_config.min_freq_spacing = 20.0;  // Changed from 1.0 to 20.0
                     fft_config.window_type = WindowType::Hanning;  // Changed from BlackmanHarris to Hanning
+                    
+                    // Reset crosstalk settings
+                    fft_config.crosstalk_enabled = false;  // Disable crosstalk by default
+                    fft_config.crosstalk_threshold = 0.5;  // Reset threshold to middle value
+                    fft_config.crosstalk_reduction = 0.5;  // Reset reduction to middle value
                     
                     // Only change frames_per_buffer if platform requires it
                     let new_frames = if cfg!(target_os = "linux") {
@@ -383,8 +382,8 @@ impl eframe::App for MyApp {
                 }
                 
                 let mut resynth_config = self.resynth_config.lock().unwrap();
-                resynth_config.gain = 0.001;  // Changed from 0.01 to 0.001
-                resynth_config.smoothing = 0.5;  // Added default smoothing value
+                resynth_config.gain = 0.001;  // Volume = 1 on our 0-10 scale
+                resynth_config.smoothing = 0.5;  // Default smoothing value
                 
                 reset_clicked = true;
             }

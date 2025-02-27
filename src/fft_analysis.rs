@@ -53,14 +53,26 @@ pub fn start_fft_processing(
                     .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
                     .collect();
 
+                // Get crosstalk settings from config
+                let config = fft_config.lock().unwrap();
+                let crosstalk_enabled = config.crosstalk_enabled;
+                let crosstalk_threshold = config.crosstalk_threshold;
+                let crosstalk_reduction = config.crosstalk_reduction;
+                
+                // Apply crosstalk filtering if enabled
+                let processed_buffers = if crosstalk_enabled {
+                    filter_crosstalk(&channel_buffers, crosstalk_threshold, crosstalk_reduction)
+                } else {
+                    channel_buffers
+                };
+
                 let mut all_channels_results = 
                     vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-                let config = fft_config.lock().unwrap();
                 for (channel_index, _) in selected_channels.iter().enumerate() {
                     let spectrum = compute_spectrum(
-                        &channel_buffers,  // Pass all channel data
-                        channel_index,     // Specify which channel to process
+                        &processed_buffers,  // Use the processed buffers (with or without crosstalk filtering)
+                        channel_index,     
                         sample_rate, 
                         &*config,
                         None
@@ -119,33 +131,79 @@ pub fn filter_crosstalk(
     let samples_per_channel = channel_data[0].len();
     let mut filtered = vec![vec![0.0; samples_per_channel]; num_channels];
 
-    for sample_idx in 0..samples_per_channel {
-        // Get all channel values for this sample
-        let sample_values: Vec<f32> = channel_data.iter()
-            .map(|channel| channel[sample_idx])
-            .collect();
+    // Calculate channel energy levels for normalization
+    let channel_energy: Vec<f32> = channel_data.iter()
+        .map(|channel| {
+            channel.iter().map(|&s| s * s).sum::<f32>().sqrt() / channel.len() as f32
+        })
+        .collect();
 
+    // Apply a stronger reduction factor (squared to make it more aggressive)
+    let enhanced_reduction = reduction * 2.0;
+    
+    for sample_idx in 0..samples_per_channel {
         // Process each channel
         for (ch_idx, channel) in channel_data.iter().enumerate() {
             let main_signal = channel[sample_idx];
-            let mut crosstalk = 0.0;
-
-            // Calculate crosstalk from other channels
-            for (other_idx, &other_val) in sample_values.iter().enumerate() {
+            let mut filtered_signal = main_signal;
+            
+            // Apply crosstalk reduction from other channels
+            for (other_idx, other_channel) in channel_data.iter().enumerate() {
                 if other_idx != ch_idx {
-                    let ratio = (other_val / main_signal).abs();
-                    if ratio > threshold {
-                        crosstalk += other_val * reduction;
+                    let other_signal = other_channel[sample_idx];
+                    
+                    // Calculate correlation between signals at this point
+                    let correlation = (main_signal * other_signal).abs();
+                    
+                    // Normalize by channel energy to get relative correlation
+                    let normalized_correlation = if channel_energy[ch_idx] > 1e-6 && channel_energy[other_idx] > 1e-6 {
+                        correlation / (channel_energy[ch_idx] * channel_energy[other_idx])
+                    } else {
+                        0.0
+                    };
+                    
+                    // Apply stronger reduction with a non-linear response curve
+                    if normalized_correlation > threshold {
+                        // Apply non-linear scaling to make reduction more aggressive
+                        let scale_factor = (normalized_correlation - threshold) / (1.0 - threshold);
+                        let dynamic_reduction = enhanced_reduction * (1.0 + scale_factor);
+                        
+                        // Limit maximum reduction to 1.0 to avoid over-subtraction
+                        let clamped_reduction = dynamic_reduction.min(1.0);
+                        filtered_signal -= other_signal * clamped_reduction;
                     }
                 }
             }
-
-            // Subtract crosstalk from main signal
-            filtered[ch_idx][sample_idx] = main_signal - crosstalk;
+            
+            filtered[ch_idx][sample_idx] = filtered_signal;
         }
     }
 
     filtered
+}
+
+/// Check if all channels have nearly identical signals
+fn is_identical_signals(channel_data: &[Vec<f32>]) -> bool {
+    if channel_data.len() <= 1 {
+        return false;
+    }
+    
+    let first_channel = &channel_data[0];
+    let sample_count = first_channel.len().min(100); // Check first 100 samples
+    
+    for ch_idx in 1..channel_data.len() {
+        let other_channel = &channel_data[ch_idx];
+        
+        // Compare a subset of samples
+        for i in 0..sample_count {
+            let diff = (first_channel[i] - other_channel[i]).abs();
+            if diff > 0.01 { // Allow small differences
+                return false;
+            }
+        }
+    }
+    
+    true
 }
 
 /// Filters audio buffer based on amplitude threshold
