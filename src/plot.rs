@@ -93,7 +93,7 @@ impl MyApp {
             resynth_config,
             colors,
             y_scale: 80.0,
-            alpha: 50,
+            alpha: 255,
             bar_width: 5.0,
             show_line_plot: true,
             last_repaint: Instant::now(),
@@ -389,7 +389,7 @@ impl eframe::App for MyApp {
                 }
                 
                 self.y_scale = 80.0;
-                self.alpha = 50;
+                self.alpha = 255;
                 self.bar_width = 5.0;
                 self.show_line_plot = true;
                 
@@ -510,7 +510,7 @@ impl eframe::App for MyApp {
                 });
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label("Channel Results:");
+                // ui.label("Channel Results:");
                 let display = SpectralDisplay::new(&absolute_values);
                 for line in display.format_all() {
                     ui.label(line);
