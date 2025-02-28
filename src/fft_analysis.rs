@@ -26,7 +26,32 @@ pub struct FFTConfig {
     pub crosstalk_threshold: f32,  // Add crosstalk threshold (0.0 to 1.0)
     pub crosstalk_reduction: f32,  // Add reduction factor (0.0 to 1.0)
     pub crosstalk_enabled: bool,  // Add enable flag for crosstalk filtering
+    pub harmonic_tolerance: f32,  // Add this field - controls how closely a frequency must match a harmonic
     pub window_type: WindowType,
+    pub root_freq_min: f32,  // Add this (default: 20.0)
+    pub root_freq_max: f32,  // Add this (default: 500.0)
+    pub freq_match_distance: f32,  // Maximum Hz difference to consider frequencies as matching
+}
+
+impl Default for FFTConfig {
+    fn default() -> Self {
+        Self {
+            min_frequency: 20.0,
+            max_frequency: 1400.0,
+            magnitude_threshold: 6.0, 
+            min_freq_spacing: 20.0,
+            num_channels: 1,
+            frames_per_buffer: 512,
+            crosstalk_threshold: 0.3,
+            crosstalk_reduction: 0.5,
+            crosstalk_enabled: false,
+            harmonic_tolerance: 0.03,
+            root_freq_min: 20.0,
+            root_freq_max: 500.0,
+            freq_match_distance: 5.0,
+            window_type: WindowType::Hanning,
+        }
+    }
 }
 
 /// Spawns a thread to continuously process FFT data and update the plot.
@@ -57,6 +82,7 @@ pub fn start_fft_processing(
                 let config = fft_config.lock().unwrap();
                 let crosstalk_enabled = config.crosstalk_enabled;
                 let crosstalk_threshold = config.crosstalk_threshold;
+                let crosstalk_reduction = config.crosstalk_reduction;
                 
                 // Process each channel independently first to get spectra
                 let mut all_channels_spectra: Vec<Vec<(f32, f32)>> = Vec::new();
@@ -78,7 +104,11 @@ pub fn start_fft_processing(
                     filter_crosstalk_frequency_domain(
                         &mut all_channels_spectra,
                         crosstalk_threshold,
-                        0.03 // Harmonic tolerance
+                        crosstalk_reduction,
+                        config.harmonic_tolerance,
+                        config.root_freq_min,
+                        config.root_freq_max,
+                        config.freq_match_distance
                     )
                 } else {
                     all_channels_spectra
@@ -385,9 +415,13 @@ fn blackman_harris_window(len: usize) -> Vec<f32> {
 
 /// Applies crosstalk filtering in the frequency domain after FFT analysis
 pub fn filter_crosstalk_frequency_domain(
-    spectra: &mut Vec<Vec<(f32, f32)>>, // Vector of (frequency, magnitude) pairs for each channel
-    crosstalk_threshold: f32,           // Relative magnitude threshold (0.0 to 1.0)
-    harmonic_tolerance: f32,            // How close a frequency must be to be considered a harmonic (e.g. 0.03)
+    spectra: &mut Vec<Vec<(f32, f32)>>,
+    crosstalk_threshold: f32,
+    crosstalk_reduction: f32,
+    harmonic_tolerance: f32,
+    root_freq_min: f32,
+    root_freq_max: f32,
+    freq_match_distance: f32
 ) -> Vec<Vec<(f32, f32)>> {
     if spectra.is_empty() {
         return Vec::new();
@@ -409,7 +443,7 @@ pub fn filter_crosstalk_frequency_domain(
         // Find the lowest significant frequency below 500Hz
         // This is a common range for fundamental frequencies
         let root = peaks.iter()
-            .filter(|&&(freq, mag)| freq > 20.0 && freq < 500.0 && mag > 0.01)
+            .filter(|&&(freq, mag)| freq > root_freq_min && freq < root_freq_max && mag > 0.01)
             .next()
             .map(|&(freq, _)| freq)
             .unwrap_or(0.0);
@@ -420,10 +454,16 @@ pub fn filter_crosstalk_frequency_domain(
     // Create a copy to store filtered results
     let mut filtered_spectra = spectra.clone();
     
+    // Make reduction 2x more aggressive by doubling the effect
+    let scaled_reduction = crosstalk_reduction * 2.0;
+    
+    // Apply a limit to ensure we don't exceed 1.0 which would invert the signal
+    let clamped_reduction = scaled_reduction.min(1.0);
+    
     // For each frequency in each channel
     for ch_idx in 0..num_channels {
         // Skip if no root frequency detected for this channel
-        if root_frequencies[ch_idx] < 20.0 {
+        if root_frequencies[ch_idx] < root_freq_min {
             continue;
         }
         
@@ -446,7 +486,7 @@ pub fn filter_crosstalk_frequency_domain(
                 }
                 
                 // Find closest matching frequency in other channel
-                if let Some(other_idx) = find_closest_frequency(&filtered_spectra[other_ch], freq, 5.0) {
+                if let Some(other_idx) = find_closest_frequency(&filtered_spectra[other_ch], freq, freq_match_distance) {
                     let (other_freq, other_mag) = filtered_spectra[other_ch][other_idx];
                     
                     // Is this frequency a harmonic of the other channel's root?
@@ -472,19 +512,19 @@ pub fn filter_crosstalk_frequency_domain(
                     // If only one has harmonic claim
                     else if is_harmonic && !other_is_harmonic {
                         // This is our harmonic, reduce or remove it from other channel
-                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - crosstalk_threshold;
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (crosstalk_threshold * clamped_reduction);
                     }
                     else if !is_harmonic && other_is_harmonic {
                         // This is their harmonic, reduce it in our channel
-                        filtered_spectra[ch_idx][i].1 *= 1.0 - crosstalk_threshold;
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - (crosstalk_threshold * clamped_reduction);
                     }
                     // Neither has harmonic claim - decide based on magnitude
                     else if other_mag > magnitude * (1.0 + crosstalk_threshold) {
                         // Other channel is significantly stronger
-                        filtered_spectra[ch_idx][i].1 *= 1.0 - crosstalk_threshold;
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - (crosstalk_threshold * clamped_reduction);
                     } else if magnitude > other_mag * (1.0 + crosstalk_threshold) {
                         // This channel is significantly stronger
-                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - crosstalk_threshold;
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (crosstalk_threshold * clamped_reduction);
                     }
                 }
             }

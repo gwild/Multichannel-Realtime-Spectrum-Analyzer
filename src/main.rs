@@ -200,18 +200,12 @@ fn run() -> Result<()> {
         }
     };
 
-    let fft_config = Arc::new(Mutex::new(FFTConfig {
-        min_frequency: MIN_FREQ,
-        max_frequency: MAX_FREQ,
-        magnitude_threshold: 6.0,
-        min_freq_spacing: 20.0,
-        num_channels: selected_channels.len(),
-        frames_per_buffer,
-        window_type: WindowType::Hanning,
-        crosstalk_enabled: false,
-        crosstalk_reduction: 0.5,
-        crosstalk_threshold: 0.3,
-    }));
+    let mut config = FFTConfig::default();
+    // Override only what needs to be different from defaults
+    config.num_channels = selected_channels.len();
+    config.frames_per_buffer = frames_per_buffer;
+
+    let fft_config = Arc::new(Mutex::new(config));
 
     let running = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::new(AtomicBool::new(false));

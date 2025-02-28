@@ -231,22 +231,7 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
                 }
                 
-                ui.checkbox(&mut self.show_line_plot, "Show FFT");
-            });
-
-            // 3) Sliders for Y scale, alpha, bar width
-            ui.horizontal(|ui| {
-                ui.label("Y Max:");
-                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
-                ui.label("Alpha:");
-                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
-                ui.label("Bar Width:");
-                ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
-            });
-            
-            // 4) New row for Window Type and Crosstalk
-            ui.horizontal(|ui| {
-                // Window type selection
+                // Window Type section
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
                     ui.label("Window Type:");
@@ -263,41 +248,36 @@ impl eframe::App for MyApp {
                             }
                         });
                         
-                    // Kaiser beta slider appears to the right if Kaiser window is selected
-                    if let WindowType::Kaiser(_) = fft_config.window_type {
-                        ui.label("Kaiser β:");
-                        let mut beta = match fft_config.window_type {
-                            WindowType::Kaiser(b) => b,
-                            _ => 4.0,
-                        };
-                        if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
-                            fft_config.window_type = WindowType::Kaiser(beta);
+                        // Kaiser beta slider appears if Kaiser window is selected
+                        if let WindowType::Kaiser(_) = fft_config.window_type {
+                            ui.label("Kaiser β:");
+                            let mut beta = match fft_config.window_type {
+                                WindowType::Kaiser(b) => b,
+                                _ => 4.0,
+                            };
+                            if ui.add(egui::Slider::new(&mut beta, 0.0..=20.0)).changed() {
+                                fft_config.window_type = WindowType::Kaiser(beta);
+                            }
                         }
                     }
-                }
-                
-                ui.separator();
-                
-                // Crosstalk section
-                {
-                    let mut fft_config = self.fft_config.lock().unwrap();
-                    ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
+
+                    ui.separator();
                     
-                    // Show crosstalk parameters to the right if enabled
-                    if fft_config.crosstalk_enabled {
-                        ui.label("Threshold:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0)
-                        );
-                        ui.label("Reduction:");
-                        ui.add(
-                            egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0)
-                        );
-                    }
-                }
+                    // Then Show FFT checkbox
+                    ui.checkbox(&mut self.show_line_plot, "Show FFT");
+            });
+
+            // 3) Sliders for Y scale, alpha, bar width
+            ui.horizontal(|ui| {
+                ui.label("Y Max:");
+                ui.add(egui::Slider::new(&mut self.y_scale, 0.0..=100.0).text(""));
+                ui.label("Alpha:");
+                ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
+                ui.label("Bar Width:");
+                ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
             });
             
-            // 5) New row for Volume and Smoothing
+            // 4) Volume and Smoothing row + Crosstalk checkbox
             ui.horizontal(|ui| {
                 // Volume slider (renamed from Gain)
                 ui.label("Volume:");
@@ -317,6 +297,52 @@ impl eframe::App for MyApp {
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
                     ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.0..=0.9999));
                 }
+                
+                ui.separator();
+                
+                // Move Crosstalk checkbox to this row
+                let mut fft_config = self.fft_config.lock().unwrap();
+                ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
+            });
+
+            // 5) Crosstalk basic parameters row + Harmonic Tolerance
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                
+                // Only show crosstalk parameters if enabled
+                if fft_config.crosstalk_enabled {
+                    ui.label("Threshold:");
+                    ui.add(egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0));
+                    ui.label("Reduction:");
+                    ui.add(egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0));
+                    
+                    // Move Harmonic Tolerance to this row
+                    ui.separator();
+                    ui.label("Harmonic Tolerance:");
+                    ui.add(egui::Slider::new(&mut fft_config.harmonic_tolerance, 0.01..=0.10)
+                        .logarithmic(true));
+                }
+            });
+
+            // 6) Advanced Crosstalk controls - only show if crosstalk is enabled (removed Harmonic Tolerance)
+            ui.horizontal(|ui| {
+                let mut fft_config = self.fft_config.lock().unwrap();
+                
+                // Only show advanced parameters if enabled
+                if fft_config.crosstalk_enabled {
+                    // Harmonic Tolerance moved to row above
+                    
+                    ui.label("Root Freq Min:");
+                    ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 10.0..=300.0)
+                        .logarithmic(true));
+                    
+                    ui.label("Root Freq Max:");
+                    ui.add(egui::Slider::new(&mut fft_config.root_freq_max, 300.0..=1000.0)
+                        .logarithmic(true));
+                    
+                    ui.label("Frequency Match:");
+                    ui.add(egui::Slider::new(&mut fft_config.freq_match_distance, 1.0..=20.0));
+                }
             });
 
             // Handle max frequency adjustment if buffer size changed
@@ -329,7 +355,7 @@ impl eframe::App for MyApp {
                 }
             }
 
-            // 5) Reset button
+            // 7) Reset button
             let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
                 {
@@ -388,7 +414,7 @@ impl eframe::App for MyApp {
                 reset_clicked = true;
             }
 
-            // 6) Plot logic
+            // 8) Plot logic
             let absolute_values = {
                 let spectrum = self.spectrum.lock().unwrap();
                 spectrum.absolute_values.clone()  // Contains dB values used for both plotting and display
