@@ -492,17 +492,27 @@ pub fn filter_crosstalk_frequency_domain(
                     // Is this frequency a harmonic of the other channel's root?
                     let other_is_harmonic = is_harmonic_of(other_freq, root_frequencies[other_ch], harmonic_tolerance);
                     
-                    // If both channels have harmonic claim to this frequency
+                    // Apply much more aggressive filtering when both channels have a harmonic claim
                     if is_harmonic && other_is_harmonic {
-                        // If magnitudes are very different, fully assign to stronger channel
+                        // If one channel is clearly stronger (2x), heavily reduce the weaker one
                         if other_mag > magnitude * 2.0 {
-                            filtered_spectra[ch_idx][i].1 *= 0.2; // heavy reduction
+                            filtered_spectra[ch_idx][i].1 *= 0.1; // 90% reduction
                             count_filtered += 1;
                         } else if magnitude > other_mag * 2.0 {
-                            filtered_spectra[other_ch][other_idx].1 *= 0.2;
+                            filtered_spectra[other_ch][other_idx].1 *= 0.1; // 90% reduction
                             count_filtered += 1;
                         }
-                        // Otherwise apply partial reduction to both
+                        // If they're similar strength, reduce both proportionally
+                        else {
+                            let total = magnitude + other_mag;
+                            let my_ratio = magnitude / total;
+                            let other_ratio = other_mag / total;
+                            
+                            // Apply proportional reduction based on relative strength
+                            filtered_spectra[ch_idx][i].1 *= my_ratio;
+                            filtered_spectra[other_ch][other_idx].1 *= other_ratio;
+                            count_filtered += 2;
+                        }
                     }
                     // If only one has harmonic claim
                     else if is_harmonic && !other_is_harmonic {
