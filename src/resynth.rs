@@ -59,6 +59,11 @@ const ENVELOPE_SLOPE_LIMIT: f32 = 0.01; // Limit how quickly envelopes can chang
 #[cfg(target_arch = "arm")]
 const DC_FILTER_COEFF: f32 = 0.995; // DC blocking filter coefficient
 
+// Add these constants at the top with the other constants
+const ZERO_CROSSING_THRESHOLD: f32 = 0.01; // How close to zero is considered a crossing
+const CROSSFADE_FRAMES: usize = 32; // Number of frames to crossfade between significant changes
+const PHASE_RESET_THRESHOLD: f32 = 5.0; // Hz difference that triggers phase reset consideration
+
 #[derive(Clone)]
 struct SmoothParam {
     current: f32,
@@ -92,9 +97,13 @@ struct PartialState {
     freq: SmoothParam,
     amp: SmoothParam,
     phase: f32,
-    crossfade_counter: usize, // For managing crossfades
-    is_active: bool,          // Tracks if this partial is currently audible
-    envelope: f32,            // Current envelope value (0.0-1.0)
+    crossfade_counter: usize,
+    is_active: bool,
+    envelope: f32,
+    old_sample: f32, // Previous sample for zero-crossing detection
+    needs_crossfade: bool, // Flag to indicate when crossfading is needed
+    crossfade_buffer: Vec<f32>, // Buffer to store old samples for crossfading
+    last_freq_change: f32, // Track when the last significant frequency change occurred
 }
 
 impl PartialState {
@@ -106,15 +115,61 @@ impl PartialState {
             crossfade_counter: 0,
             is_active: false,
             envelope: 0.0,
+            old_sample: 0.0,
+            needs_crossfade: false,
+            crossfade_buffer: vec![0.0; CROSSFADE_FRAMES],
+            last_freq_change: 0.0,
         }
     }
     
     // Determine if phase needs reset due to large frequency change
     fn needs_phase_reset(&self) -> bool {
-        // Detect any significant frequency change
-        self.freq.large_change()
+        // Only consider phase reset if the frequency change is significant
+        (self.freq.target - self.freq.prev_target).abs() > PHASE_RESET_THRESHOLD
     }
-    
+
+    // Check if we're at or near a zero crossing
+    fn is_at_zero_crossing(&self, current_sample: f32) -> bool {
+        // Zero crossing occurs when samples change sign or are very close to zero
+        (self.old_sample * current_sample <= 0.0) || 
+        current_sample.abs() < ZERO_CROSSING_THRESHOLD
+    }
+
+    // Prepare for crossfade when significant changes occur
+    fn prepare_crossfade(&mut self, frames: usize) {
+        self.needs_crossfade = true;
+        self.crossfade_counter = frames.min(CROSSFADE_FRAMES).max(1);
+        // Ensure buffer is the right size
+        if self.crossfade_buffer.len() < self.crossfade_counter {
+            self.crossfade_buffer.resize(self.crossfade_counter, 0.0);
+        }
+    }
+
+    // Store a sample in the crossfade buffer
+    fn store_sample(&mut self, sample: f32, position: usize) {
+        if position < self.crossfade_buffer.len() && position < CROSSFADE_FRAMES {
+            self.crossfade_buffer[position] = sample;
+        }
+    }
+
+    // Get a crossfaded sample
+    fn get_crossfaded_sample(&self, new_sample: f32, position: usize) -> f32 {
+        if !self.needs_crossfade || position >= self.crossfade_counter {
+            return new_sample;
+        }
+        
+        let old_sample = if position < self.crossfade_buffer.len() {
+            self.crossfade_buffer[position]
+        } else {
+            0.0
+        };
+        
+        // Apply smooth crossfade curve (cosine interpolation)
+        let ratio = position as f32 / self.crossfade_counter as f32;
+        let crossfade_gain = 0.5 - 0.5 * (ratio * std::f32::consts::PI).cos();
+        old_sample * (1.0 - crossfade_gain) + new_sample * crossfade_gain
+    }
+
     // Update envelope based on amplitude changes for smooth attack/release
     fn update_envelope(&mut self, sample_rate: f32, attack_samples: usize, release_samples: usize) {
         // Calculate smoother envelope curves using exponential approach
@@ -299,6 +354,21 @@ pub fn start_resynth_thread(
                     for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
                         let state = &mut partial_states[channel][i];
                         
+                        // Check if we need to prepare for crossfade due to significant change
+                        let freq_change = (freq * freq_scale - state.freq.current).abs();
+                        let amp_change = (amp - state.amp.current).abs();
+                        
+                        if (freq_change > PHASE_RESET_THRESHOLD || amp_change > 0.5) && 
+                           state.is_active && state.crossfade_counter == 0 {
+                            state.prepare_crossfade(frames);
+                            // Store current state for crossfade
+                            for f in 0..state.crossfade_counter {
+                                let phase_pos = state.phase + (f as f32 * 2.0 * PI * state.freq.current / sample_rate as f32);
+                                let sample = state.amp.current * phase_pos.sin() * state.envelope;
+                                state.store_sample(sample, f);
+                            }
+                        }
+                        
                         // Update smoothed parameters
                         state.freq.update(freq * freq_scale, smoothing);
                         state.amp.update(amp, smoothing);
@@ -324,27 +394,23 @@ pub fn start_resynth_thread(
                         
                         // Check if we need to reset phase (for large frequency changes)
                         if state.needs_phase_reset() {
-                            // Instead of immediately resetting phase, schedule a phase reset
-                            // when we next cross zero to minimize pops
+                            // Record the time of this frequency change
+                            state.last_freq_change = frame as f32;
+                            
+                            // Only reset phase at zero crossings to minimize pops
                             let phase_mod = state.phase % (2.0 * PI);
-                            
-                            // Check if we're near a zero crossing (sin wave = 0)
-                            // which occurs at 0, π, and 2π
-                            let near_zero = phase_mod < 0.2 || (phase_mod - PI).abs() < 0.2 || phase_mod > (2.0 * PI - 0.2);
-                            
-                            if near_zero {
-                                // At a zero crossing, we can safely reset phase
-                                // But instead of setting to exactly 0, use the closest zero crossing point
-                                // to maintain continuity
-                                if phase_mod < 0.2 {
-                                    state.phase = state.phase - phase_mod; // Reset to 0
-                                } else if (phase_mod - PI).abs() < 0.2 {
-                                    state.phase = state.phase - (phase_mod - PI); // Reset to π
+                            if phase_mod < ZERO_CROSSING_THRESHOLD || 
+                               (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD || 
+                               phase_mod > (2.0 * PI - ZERO_CROSSING_THRESHOLD) {
+                                // Reset to nearest zero crossing
+                                if phase_mod < ZERO_CROSSING_THRESHOLD {
+                                    state.phase = state.phase - phase_mod;
+                                } else if (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD {
+                                    state.phase = state.phase - (phase_mod - PI);
                                 } else {
-                                    state.phase = state.phase + (2.0 * PI - phase_mod); // Reset to 2π
+                                    state.phase = state.phase + (2.0 * PI - phase_mod);
                                 }
                             }
-                            // If not near zero, don't reset - wait until we get to a zero crossing
                         }
 
                         if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
@@ -382,13 +448,31 @@ pub fn start_resynth_thread(
                                 raw_sample = amplitude * phase_with_jitter.sin();
                             }
                             
-                            // Now we can use raw_sample outside the cfg blocks
+                            // Apply crossfade if needed
+                            let final_sample = if state.needs_crossfade && state.crossfade_counter > 0 {
+                                let pos = if state.crossfade_counter <= CROSSFADE_FRAMES {
+                                    CROSSFADE_FRAMES - state.crossfade_counter
+                                } else {
+                                    0
+                                };
+                                let crossfaded = state.get_crossfaded_sample(raw_sample, pos);
+                                state.crossfade_counter -= 1;
+                                if state.crossfade_counter == 0 {
+                                    state.needs_crossfade = false;
+                                }
+                                crossfaded
+                            } else {
+                                raw_sample
+                            };
+                            
+                            // Store current sample for zero-crossing detection
+                            state.old_sample = final_sample;
                             
                             // Apply additional filtering to prevent high-frequency noise for high frequencies
                             let filtered_sample = if freq > 10000.0 {
-                                raw_sample * (20000.0 - freq) / 10000.0
+                                final_sample * (20000.0 - freq) / 10000.0
                             } else {
-                                raw_sample
+                                final_sample
                             };
                             
                             // Channel-dependent panning to reduce mono summing issues
