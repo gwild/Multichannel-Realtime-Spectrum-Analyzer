@@ -177,6 +177,7 @@ impl PartialState {
 pub struct ResynthConfig {
     pub gain: f32,
     pub smoothing: f32,
+    pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
 }
 
 impl Default for ResynthConfig {
@@ -184,6 +185,7 @@ impl Default for ResynthConfig {
         Self {
             gain: 0.01,
             smoothing: 0.99,
+            freq_scale: 1.0,  // Default to no scaling
         }
     }
 }
@@ -244,6 +246,7 @@ pub fn start_resynth_thread(
             let config_lock = config.lock().unwrap();
             let gain = config_lock.gain;
             let smoothing = config_lock.smoothing;
+            let freq_scale = config_lock.freq_scale;
 
             buffer.fill(0.0);
 
@@ -297,7 +300,7 @@ pub fn start_resynth_thread(
                         let state = &mut partial_states[channel][i];
                         
                         // Update smoothed parameters
-                        state.freq.update(freq, smoothing);
+                        state.freq.update(freq * freq_scale, smoothing);
                         state.amp.update(amp, smoothing);
                         
                         // Apply more aggressive filtering on Pi

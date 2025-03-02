@@ -316,7 +316,7 @@ impl eframe::App for MyApp {
                 ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
             });
             
-            // 4) Volume and Smoothing row + Crosstalk checkbox
+            // 4) Volume and Smoothing row + Crosstalk checkbox + Frequency Scale
             ui.horizontal(|ui| {
                 // Volume slider (renamed from Gain)
                 ui.label("Volume:");
@@ -327,6 +327,40 @@ impl eframe::App for MyApp {
                         // Map the display value back to actual gain value
                         resynth_config.gain = volume_display as f32 * 0.001;
                     }
+                }
+                
+                ui.separator();
+                
+                // Add Frequency Scale control right after Volume
+                ui.label("Freq Scale:");
+                if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                    // Create a custom widget with up/down buttons for octave changes
+                    ui.horizontal(|ui| {
+                        // Down button (divide by 2 = one octave down)
+                        if ui.button("▼").clicked() {
+                            resynth_config.freq_scale /= 2.0;
+                        }
+                        
+                        // Display current value with 2 decimal places in a compact field
+                        let mut freq_text = format!("{:.2}", resynth_config.freq_scale);
+                        if ui.add(egui::TextEdit::singleline(&mut freq_text)
+                            .desired_width(50.0)  // Make the text field narrower
+                            .hint_text("1.00"))   // Add hint text
+                            .changed() 
+                        {
+                            // Try to parse the new value
+                            if let Ok(new_value) = freq_text.parse::<f32>() {
+                                if new_value > 0.0 {  // Ensure positive value
+                                    resynth_config.freq_scale = new_value;
+                                }
+                            }
+                        }
+                        
+                        // Up button (multiply by 2 = one octave up)
+                        if ui.button("▲").clicked() {
+                            resynth_config.freq_scale *= 2.0;
+                        }
+                    });
                 }
                 
                 ui.separator();
@@ -457,6 +491,7 @@ impl eframe::App for MyApp {
                 let mut resynth_config = self.resynth_config.lock().unwrap();
                 resynth_config.gain = 0.001;  // Volume = 1 on our 0-10 scale
                 resynth_config.smoothing = 0.5;  // Default smoothing value
+                resynth_config.freq_scale = 1.0;  // Reset frequency scale to normal
                 
                 reset_clicked = true;
             }
