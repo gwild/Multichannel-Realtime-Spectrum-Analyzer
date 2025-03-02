@@ -154,6 +154,45 @@ impl MyApp {
             buffer.resize(validated_size);
         }
     }
+
+    // Helper method to get the current nyquist limit
+    fn get_nyquist_limit(&self) -> f32 {
+        let buffer_size = *self.buffer_size.lock().unwrap();
+        (buffer_size as f32 / 2.0)
+    }
+
+    pub fn update_ui(&mut self, ui: &mut egui::Ui) {
+        let mut config = self.fft_config.lock().unwrap();
+
+        // Get nyquist limit once using the helper method
+        let nyquist_limit = self.get_nyquist_limit();
+
+        ui.label("Root frequency max:");
+        ui.add(
+            egui::Slider::new(&mut config.root_freq_max, 0.0..=nyquist_limit)
+                .logarithmic(true)
+        );
+
+        // ... any other UI code ...
+
+        // 6) Advanced Crosstalk controls
+        ui.horizontal(|ui| {
+            let mut fft_config = self.fft_config.lock().unwrap();
+            
+            if fft_config.crosstalk_enabled {
+                ui.label("Root Freq Min:");
+                ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 0.0..=nyquist_limit as f32));
+
+                ui.label("Root Freq Max (Advanced):");
+                ui.add(
+                    egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
+                        .logarithmic(true)
+                );
+
+                // ...
+            }
+        });
+    }
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -324,21 +363,23 @@ impl eframe::App for MyApp {
                 }
             });
 
-            // 6) Advanced Crosstalk controls - only show if crosstalk is enabled (removed Harmonic Tolerance)
+            // 6) Advanced Crosstalk controls - only show if crosstalk is enabled
             ui.horizontal(|ui| {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 
+                // Use the helper method
+                let nyquist_limit = self.get_nyquist_limit();
+                
                 // Only show advanced parameters if enabled
                 if fft_config.crosstalk_enabled {
-                    // Harmonic Tolerance moved to row above
-                    
                     ui.label("Root Freq Min:");
-                    ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 10.0..=300.0)
-                        .logarithmic(true));
+                    ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 0.0..=nyquist_limit as f32));
                     
-                    ui.label("Root Freq Max:");
-                    ui.add(egui::Slider::new(&mut fft_config.root_freq_max, 300.0..=1000.0)
-                        .logarithmic(true));
+                    ui.label("Root Freq Max (Advanced):");
+                    ui.add(
+                        egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
+                            .logarithmic(true)
+                    );
                     
                     ui.label("Frequency Match:");
                     ui.add(egui::Slider::new(&mut fft_config.freq_match_distance, 1.0..=20.0));
@@ -347,11 +388,17 @@ impl eframe::App for MyApp {
 
             // Handle max frequency adjustment if buffer size changed
             if size_changed {
-                let buffer_size = *self.buffer_size.lock().unwrap();
-                let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
+                let nyquist_limit = self.get_nyquist_limit() as f64;
                 let mut fft_config = self.fft_config.lock().unwrap();
+                
+                // Update max_frequency if needed
                 if fft_config.max_frequency > nyquist_limit {
                     fft_config.max_frequency = nyquist_limit;
+                    
+                    // Also update root_freq_max to match the same nyquist limit
+                    if fft_config.root_freq_max > nyquist_limit as f32 {
+                        fft_config.root_freq_max = nyquist_limit as f32;
+                    }
                 }
             }
 

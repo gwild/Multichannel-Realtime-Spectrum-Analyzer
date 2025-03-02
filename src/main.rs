@@ -24,20 +24,25 @@ use crate::fft_analysis::WindowType;
 use crate::resynth::{ResynthConfig, start_resynth_thread};
 
 fn main() {
-    // Set up proper logging filters
-    if std::env::args().any(|arg| arg == "--enable-logs") {
+    // Keep your existing --enable-logs code, but also respect RUST_LOG if set
+    // If no RUST_LOG is set and user passes --enable-logs, default to your old logic
+    // Otherwise, if RUST_LOG is set externally, we respect that
+
+    let logs_enabled_via_arg = std::env::args().any(|arg| arg == "--enable-logs");
+    if logs_enabled_via_arg {
         // Don't override RUST_LOG if it's already set
         if std::env::var("RUST_LOG").is_err() {
-            // Default to info if no level specified
+            // Default to your old multi-module settings
             std::env::set_var("RUST_LOG", 
                 "audio_streaming=info,\
                  audio_streaming::fft_analysis=info,\
                  audio_streaming::audio_stream=info,\
                  audio_streaming::pitch_detection=info");
         }
-        // This will respect the RUST_LOG environment variable level
-        env_logger::init();
     }
+
+    // Init the logger
+    env_logger::init();
 
     if let Err(e) = run() {
         if std::env::args().any(|arg| arg == "--enable-logs") {

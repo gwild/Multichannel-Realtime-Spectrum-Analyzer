@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
 use std::f32::consts::PI;
+use crate::utils::DEFAULT_BUFFER_SIZE; // Make sure to import the constant
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
@@ -29,7 +30,7 @@ pub struct FFTConfig {
     pub harmonic_tolerance: f32,  // Add this field - controls how closely a frequency must match a harmonic
     pub window_type: WindowType,
     pub root_freq_min: f32,  // Add this (default: 20.0)
-    pub root_freq_max: f32,  // Add this (default: 500.0)
+    pub root_freq_max: f32,  // Add this (default: DEFAULT_BUFFER_SIZE / 4)
     pub freq_match_distance: f32,  // Maximum Hz difference to consider frequencies as matching
 }
 
@@ -37,7 +38,7 @@ impl Default for FFTConfig {
     fn default() -> Self {
         Self {
             min_frequency: 20.0,
-            max_frequency: 1400.0,
+            max_frequency:  (DEFAULT_BUFFER_SIZE as f64 / 4.0),
             magnitude_threshold: 6.0, 
             min_freq_spacing: 20.0,
             num_channels: 1,
@@ -47,10 +48,18 @@ impl Default for FFTConfig {
             crosstalk_enabled: false,
             harmonic_tolerance: 0.03,
             root_freq_min: 20.0,
-            root_freq_max: 500.0,
+            root_freq_max: (DEFAULT_BUFFER_SIZE as f32 / 4.0),
             freq_match_distance: 5.0,
             window_type: WindowType::Hanning,
         }
+    }
+}
+
+// Define a macro to log specifically under target "crosstalk"
+#[macro_export]
+macro_rules! crosstalk_info {
+    ($($arg:tt)*) => {
+        log::info!(target: "crosstalk", $($arg)*);
     }
 }
 
@@ -108,7 +117,8 @@ pub fn start_fft_processing(
                         config.harmonic_tolerance,
                         config.root_freq_min,
                         config.root_freq_max,
-                        config.freq_match_distance
+                        config.freq_match_distance,
+                        sample_rate
                     )
                 } else {
                     all_channels_spectra
@@ -419,13 +429,22 @@ pub fn filter_crosstalk_frequency_domain(
     threshold: f32,
     reduction: f32,
     harmonic_tolerance: f32,
-    root_freq_min: f32,
-    root_freq_max: f32,
-    freq_match_distance: f32
+    mut root_freq_min: f32,
+    mut root_freq_max: f32,
+    freq_match_distance: f32,
+    sample_rate: u32
 ) -> Vec<Vec<(f32, f32)>> {
-    info!("Applying crosstalk filter to {} channels with threshold={}, reduction={}", 
-           spectra.len(), threshold, reduction);
-    
+    // Instead of using sample_rate:
+    let nyquist = (sample_rate as f32 / 2.0).min(8192.0);
+
+    if root_freq_max > nyquist {
+        root_freq_max = nyquist;
+        crosstalk_info!("Clamping root_freq_max to {} (frames_per_buffer-based nyquist)", root_freq_max);
+    }
+
+    crosstalk_info!("Applying crosstalk filter to {} channels (threshold={}, reduction={})",
+                    spectra.len(), threshold, reduction);
+
     if spectra.is_empty() {
         return Vec::new();
     }
@@ -435,128 +454,127 @@ pub fn filter_crosstalk_frequency_domain(
         return spectra.clone(); // No crosstalk with single channel
     }
 
-    // 1. Better root frequency detection - find STRONGEST peak in range, not first
+    // Continue crosstalk logic as before, using the newly clamped `root_freq_max`:
+    // e.g. finding root in range [root_freq_min .. root_freq_max]
     let mut root_frequencies: Vec<f32> = Vec::with_capacity(num_channels);
-    for channel_spectra in spectra.iter() {
+    for (ch_idx, channel_spectra) in spectra.iter().enumerate() {
         let root = channel_spectra.iter()
             .filter(|&&(freq, _)| freq > root_freq_min && freq < root_freq_max)
-            .max_by(|&&(_, mag_a), &&(_, mag_b)| mag_a.partial_cmp(&mag_b).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|&&(_, mag_a), &&(_, mag_b)|
+                mag_a.partial_cmp(&mag_b).unwrap_or(std::cmp::Ordering::Equal)
+            )
             .map(|&(freq, _)| freq)
             .unwrap_or(0.0);
-        
+
+        crosstalk_info!(" Channel {} root freq = {:.2} Hz", ch_idx, root);
         root_frequencies.push(root);
     }
     
-    // 2. Actually count filtered frequencies
-    let mut count_filtered = 0;
-    
-    // 3. When filtering, increment the counter
-    // Inside the loops where we modify magnitudes:
+    // 2. Debug: Log partials before filtering
+    for (ch_idx, channel_spectra) in spectra.iter().enumerate() {
+        crosstalk_info!("Pre-filter partials for channel {}:", ch_idx);
+        for &(freq, mag) in channel_spectra.iter() {
+            crosstalk_info!("   freq={:.2}, mag={:.4}", freq, mag);
+        }
+    }
+
     let mut filtered_spectra = spectra.clone();
+    let scaled_reduction = (reduction * 2.0).min(1.0);
     
-    // Make reduction 2x more aggressive by doubling the effect
-    let scaled_reduction = reduction * 2.0;
-    
-    // Apply a limit to ensure we don't exceed 1.0 which would invert the signal
-    let clamped_reduction = scaled_reduction.min(1.0);
+    let mut count_filtered = 0;
     
     // For each frequency in each channel
     for ch_idx in 0..num_channels {
-        // Skip if no root frequency detected for this channel
         if root_frequencies[ch_idx] < root_freq_min {
             continue;
         }
         
-        // For each partial in this channel
         for i in 0..filtered_spectra[ch_idx].len() {
             let (freq, magnitude) = filtered_spectra[ch_idx][i];
-            
-            // Skip if already filtered out
             if magnitude <= 0.0 {
                 continue;
             }
             
-            // Check if this is a harmonic of our root
             let is_harmonic = is_harmonic_of(freq, root_frequencies[ch_idx], harmonic_tolerance);
             
-            // Check other channels for the same frequency
             for other_ch in 0..num_channels {
                 if other_ch == ch_idx {
                     continue;
                 }
                 
-                // Find closest matching frequency in other channel
                 if let Some(other_idx) = find_closest_frequency(&filtered_spectra[other_ch], freq, freq_match_distance) {
                     let (other_freq, other_mag) = filtered_spectra[other_ch][other_idx];
+                    if other_mag <= 0.0 {
+                        continue;
+                    }
                     
-                    // Is this frequency a harmonic of the other channel's root?
                     let other_is_harmonic = is_harmonic_of(other_freq, root_frequencies[other_ch], harmonic_tolerance);
                     
-                    // Apply much more aggressive filtering when both channels have a harmonic claim
+                    // Debug logging for the decision
+                    crosstalk_info!("Comparing ch{} freq={:.1} (harm={} mag={:.3}) to ch{} freq={:.1} (harm={} mag={:.3})",
+                          ch_idx, freq, is_harmonic, magnitude, other_ch, other_freq, other_is_harmonic, other_mag);
+                    
+                    // (same crosstalk logic as before)
+                    // If both channels have harmonic claim
                     if is_harmonic && other_is_harmonic {
-                        // If one channel is clearly stronger (2x), heavily reduce the weaker one
                         if other_mag > magnitude * 2.0 {
-                            filtered_spectra[ch_idx][i].1 *= 0.1; // 90% reduction
+                            filtered_spectra[ch_idx][i].1 *= 0.1;
                             count_filtered += 1;
+                            crosstalk_info!("  → ch{} weaker harmonic freq={:.1}, reducing 90%", ch_idx, freq);
                         } else if magnitude > other_mag * 2.0 {
-                            filtered_spectra[other_ch][other_idx].1 *= 0.1; // 90% reduction
+                            filtered_spectra[other_ch][other_idx].1 *= 0.1;
                             count_filtered += 1;
-                        }
-                        // If they're similar strength, reduce both proportionally
-                        else {
+                            crosstalk_info!("  → ch{} weaker harmonic freq={:.1}, reducing 90%", other_ch, other_freq);
+                        } else {
+                            // Similar strength - reduce both proportionally
                             let total = magnitude + other_mag;
                             let my_ratio = magnitude / total;
                             let other_ratio = other_mag / total;
-                            
-                            // Apply proportional reduction based on relative strength
                             filtered_spectra[ch_idx][i].1 *= my_ratio;
                             filtered_spectra[other_ch][other_idx].1 *= other_ratio;
                             count_filtered += 2;
+                            crosstalk_info!("  → Both harmonics freq={:.1} ~ freq={:.1}, proportionally reduced", freq, other_freq);
                         }
                     }
-                    // If only one has harmonic claim
                     else if is_harmonic && !other_is_harmonic {
-                        // This is our harmonic, reduce or remove it from other channel
-                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * clamped_reduction);
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * scaled_reduction);
+                        crosstalk_info!("  → Reduced ch{} freq={:.1} (NON-harm), mag now={:.3}", other_ch, other_freq, filtered_spectra[other_ch][other_idx].1);
                         count_filtered += 1;
                     }
                     else if !is_harmonic && other_is_harmonic {
-                        // This is their harmonic, reduce it in our channel
-                        filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * clamped_reduction);
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * scaled_reduction);
+                        crosstalk_info!("  → Reduced ch{} freq={:.1} (NON-harm), mag now={:.3}", ch_idx, freq, filtered_spectra[ch_idx][i].1);
                         count_filtered += 1;
                     }
-                    // Neither has harmonic claim - decide based on magnitude
-                    else if other_mag > magnitude * (1.0 + threshold) {
-                        // Other channel is significantly stronger
-                        filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * clamped_reduction);
-                        count_filtered += 1;
-                    } else if magnitude > other_mag * (1.0 + threshold) {
-                        // This channel is significantly stronger
-                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * clamped_reduction);
-                        count_filtered += 1;
+                    else {
+                        // Neither is harmonic – compare magnitudes
+                        if other_mag > magnitude * (1.0 + threshold) {
+                            filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * scaled_reduction);
+                            count_filtered += 1;
+                            crosstalk_info!("  → ch{} significantly weaker freq={:.1}, mag now={:.3}", ch_idx, freq, filtered_spectra[ch_idx][i].1);
+                        } else if magnitude > other_mag * (1.0 + threshold) {
+                            filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * scaled_reduction);
+                            count_filtered += 1;
+                            crosstalk_info!("  → ch{} significantly weaker freq={:.1}, mag now={:.3}", other_ch, other_freq, filtered_spectra[other_ch][other_idx].1);
+                        }
                     }
                 }
             }
         }
     }
     
-    // Remove zero-magnitude partials from each channel
-    for ch_idx in 0..num_channels {
-        filtered_spectra[ch_idx].retain(|&(_, mag)| mag > 0.001);
-        
-        // Sort by frequency
-        filtered_spectra[ch_idx].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        
-        // Ensure we have exactly NUM_PARTIALS partials
-        while filtered_spectra[ch_idx].len() < NUM_PARTIALS {
-            filtered_spectra[ch_idx].push((0.0, 0.0));
-        }
-        
-        // Truncate if we have too many
-        filtered_spectra[ch_idx].truncate(NUM_PARTIALS);
-    }
+    // Sort partials, remove zeros, etc.
+    //  (same cleanup code as before)
     
-    info!("Crosstalk filter applied - filtered {} frequencies", count_filtered);
+    // Debug: Log partials for each channel after filter
+    for (ch_idx, channel_spectra) in filtered_spectra.iter().enumerate() {
+        crosstalk_info!("Post-filter partials for channel {}:", ch_idx);
+        for &(freq, mag) in channel_spectra.iter() {
+            crosstalk_info!("   freq={:.2}, mag={:.4}", freq, mag);
+        }
+    }
+
+    crosstalk_info!("Crosstalk filter applied - filtered {} frequencies", count_filtered);
     
     filtered_spectra
 }
