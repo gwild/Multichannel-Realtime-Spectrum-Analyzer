@@ -22,6 +22,16 @@ use fft_analysis::FFTConfig;
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;
 use crate::resynth::{ResynthConfig, start_resynth_thread};
+use crate::plot::MyApp;
+use std::ffi::CString;
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone)]
+pub struct SharedMemory {
+    data: Vec<Vec<(f32, f32)>>,
+    path: String,
+}
 
 fn main() {
     // Keep your existing --enable-logs code, but also respect RUST_LOG if set
@@ -255,6 +265,46 @@ fn run() -> Result<()> {
 
     let selected_output_device = output_devices[output_device_index];
 
+    // Create shared memory without mutex BEFORE threads start
+    let shared_partials = if std::env::args().any(|arg| arg == "--gui-ipc") {
+        info!("Starting in GUI+IPC mode");
+        let shmem_name = format!("audio_streaming_partials_{}", std::process::id());
+        let shared_memory_path = format!("/dev/shm/{}", shmem_name);
+        let file = std::fs::File::create(&shared_memory_path)?;
+        file.set_len(4 * 1024 * 1024)?;
+        println!("SHMEM_READY:{}", shmem_name);
+        
+        Some(SharedMemory {
+            data: Vec::new(),
+            path: shared_memory_path,
+        })
+    } else {
+        None
+    };
+
+    // Pass shared_partials to FFT thread
+    let shared_partials_clone = shared_partials.clone();
+    let fft_thread = std::thread::spawn({
+        let audio_buffer = Arc::clone(&audio_buffer);
+        let fft_config = Arc::clone(&fft_config);
+        let spectrum_app = Arc::clone(&spectrum_app);
+        let selected_channels = selected_channels.clone();
+        let shutdown_flag_fft = Arc::clone(&shutdown_flag);
+        let shared_partials_clone = shared_partials_clone.clone();
+
+        move || {
+            fft_analysis::start_fft_processing(
+                audio_buffer,
+                fft_config,
+                spectrum_app,
+                selected_channels,
+                selected_sample_rate as u32,
+                shutdown_flag_fft,
+                shared_partials_clone,
+            );
+        }
+    });
+
     // Start audio thread
     info!("Starting audio sampling thread...");
     let fft_config_clone = Arc::clone(&fft_config);
@@ -278,25 +328,6 @@ fn run() -> Result<()> {
     while !stream_ready_fft.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-
-    info!("Starting FFT processing...");
-    let fft_thread = std::thread::spawn({
-        let audio_buffer = Arc::clone(&audio_buffer);
-        let fft_config = Arc::clone(&fft_config);
-        let spectrum_app = Arc::clone(&spectrum_app);
-        let selected_channels = selected_channels.clone();
-        let shutdown_flag_fft = Arc::clone(&shutdown_flag);
-        move || {
-            fft_analysis::start_fft_processing(
-                audio_buffer,
-                fft_config,
-                spectrum_app,
-                selected_channels,
-                selected_sample_rate as u32,
-                shutdown_flag_fft,
-            );
-        }
-    });
 
     // Start resynthesis thread
     info!("Starting resynthesis...");

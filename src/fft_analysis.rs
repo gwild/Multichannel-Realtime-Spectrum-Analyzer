@@ -12,6 +12,10 @@ use realfft::RealFftPlanner;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 use crate::utils::DEFAULT_BUFFER_SIZE; // Make sure to import the constant
+use std::io::Write;  // For write_all
+use crate::SharedMemory;  // Import the struct from main.rs
+use bincode;
+use serde_json;
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
@@ -71,76 +75,102 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
+    shared_partials: Option<SharedMemory>,
 ) {
     let _prev_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
 
-    thread::spawn(move || {
-        while !shutdown_flag.load(Ordering::Relaxed) {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let buffer_clone = {
-                    let buffer = audio_buffer.read().unwrap();
-                    buffer.clone_data()
-                };
+    // At start of function, make shared_partials mutable
+    let mut shared_partials = shared_partials.clone();  // Make mutable to allow assignment
 
-                // Extract channel data
-                let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
-                    .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
-                    .collect();
+    while !shutdown_flag.load(Ordering::Relaxed) {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let buffer_clone = {
+                let buffer = audio_buffer.read().unwrap();
+                buffer.clone_data()
+            };
 
-                // Get crosstalk settings from config
-                let config = fft_config.lock().unwrap();
-                let crosstalk_enabled = config.crosstalk_enabled;
-                let crosstalk_threshold = config.crosstalk_threshold;
-                let crosstalk_reduction = config.crosstalk_reduction;
+            // Extract channel data
+            let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
+                .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
+                .collect();
+
+            // Get crosstalk settings from config
+            let config = fft_config.lock().unwrap();
+            let crosstalk_enabled = config.crosstalk_enabled;
+            let crosstalk_threshold = config.crosstalk_threshold;
+            let crosstalk_reduction = config.crosstalk_reduction;
+            
+            // Process each channel independently first to get spectra
+            let mut all_channels_spectra: Vec<Vec<(f32, f32)>> = Vec::new();
+            
+            for (channel_index, _) in selected_channels.iter().enumerate() {
+                let spectrum = compute_spectrum(
+                    &channel_buffers,
+                    channel_index,     
+                    sample_rate, 
+                    &*config,
+                    None
+                );
                 
-                // Process each channel independently first to get spectra
-                let mut all_channels_spectra: Vec<Vec<(f32, f32)>> = Vec::new();
-                
-                for (channel_index, _) in selected_channels.iter().enumerate() {
-                    let spectrum = compute_spectrum(
-                        &channel_buffers,
-                        channel_index,     
-                        sample_rate, 
-                        &*config,
-                        None
-                    );
-                    
-                    all_channels_spectra.push(spectrum);
-                }
-                
-                // Now apply frequency-domain crosstalk filtering if enabled
-                let all_channels_results = if crosstalk_enabled {
-                    filter_crosstalk_frequency_domain(
-                        &mut all_channels_spectra,
-                        crosstalk_threshold,
-                        crosstalk_reduction,
-                        config.harmonic_tolerance,
-                        config.root_freq_min,
-                        config.root_freq_max,
-                        config.freq_match_distance,
-                        sample_rate
-                    )
-                } else {
-                    all_channels_spectra
-                };
-
-                if let Ok(mut spectrum) = spectrum_app.lock() {
-                    spectrum.update_partials(all_channels_results);
-                }
-
-                thread::sleep(Duration::from_millis(100));
-            }));
-
-            if let Err(e) = result {
-                error!("FFT computation failed: {:?}", e);
-                warn!("Panic in FFT thread: {:?}", e);
-                
-                error!("Failed to allocate FFT buffer");
-                warn!("Buffer size mismatch, adjusting...");
+                all_channels_spectra.push(spectrum);
             }
+            
+            // Now apply frequency-domain crosstalk filtering if enabled
+            let all_channels_results = if crosstalk_enabled {
+                filter_crosstalk_frequency_domain(
+                    &mut all_channels_spectra,
+                    crosstalk_threshold,
+                    crosstalk_reduction,
+                    config.harmonic_tolerance,
+                    config.root_freq_min,
+                    config.root_freq_max,
+                    config.freq_match_distance,
+                    sample_rate
+                )
+            } else {
+                all_channels_spectra
+            };
+
+            // After results is updated with new FFT data
+            let results = all_channels_results;  // Get the new results
+
+            // Then update GUI
+            if let Ok(mut spectrum) = spectrum_app.lock() {
+                spectrum.update_partials(results.clone());  // Clone for GUI
+            }
+
+            // Write raw results directly to shared memory
+            if let Some(shared) = &mut shared_partials {
+                // Update the data in shared memory struct
+                shared.data = results.clone();  // Clone for shared memory
+
+                // Write to file
+                let json = serde_json::to_string(&results).unwrap_or_default();
+                let data_len = json.len() as u32;
+                
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&shared.path) 
+                {
+                    let _ = file.write_all(&data_len.to_le_bytes());
+                    let _ = file.write_all(json.as_bytes());
+                }
+            }
+
+            // Give other threads more time to run
+            thread::sleep(Duration::from_millis(10));
+        }));
+
+        if let Err(e) = result {
+            error!("FFT computation failed: {:?}", e);
+            warn!("Panic in FFT thread: {:?}", e);
+            
+            error!("Failed to allocate FFT buffer");
+            warn!("Buffer size mismatch, adjusting...");
         }
-        info!("FFT processing thread shutting down.");
-    });
+    }
+    info!("FFT processing thread shutting down.");
 }
 /// Extracts data for a specific channel from the interleaved buffer.
 pub fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
@@ -511,8 +541,8 @@ pub fn filter_crosstalk_frequency_domain(
                     let other_is_harmonic = is_harmonic_of(other_freq, root_frequencies[other_ch], harmonic_tolerance);
                     
                     // Debug logging for the decision
-                    crosstalk_info!("Comparing ch{} freq={:.1} (harm={} mag={:.3}) to ch{} freq={:.1} (harm={} mag={:.3})",
-                          ch_idx, freq, is_harmonic, magnitude, other_ch, other_freq, other_is_harmonic, other_mag);
+                    crosstalk_info!("Comparing ch{} freq={:.1} (harm={}) to ch{} freq={:.1} (harm={} mag={:.3})",
+                          ch_idx, freq, is_harmonic, other_ch, other_freq, other_is_harmonic, other_mag);
                     
                     // (same crosstalk logic as before)
                     // If both channels have harmonic claim
