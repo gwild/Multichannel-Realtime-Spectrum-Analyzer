@@ -141,21 +141,34 @@ pub fn start_fft_processing(
 
             // Write raw results directly to shared memory
             if let Some(shared) = &mut shared_partials {
-                // Update the data in shared memory struct
-                shared.data = results.clone();  // Clone for shared memory
-
-                // Write to file
-                let json = serde_json::to_string(&results).unwrap_or_default();
-                let data_len = json.len() as u32;
+                // Create buffer with exact binary layout
+                let num_channels = results.len();
+                let partials_per_channel = results.first().map(|c| c.len()).unwrap_or(0);
                 
+                let mut buffer = Vec::with_capacity(8 + num_channels * partials_per_channel * 8);
+                
+                // Write header: u32 channels, u32 partials_per_channel
+                buffer.extend_from_slice(&(num_channels as u32).to_le_bytes());
+                buffer.extend_from_slice(&(partials_per_channel as u32).to_le_bytes());
+                
+                // Write raw data exactly as it exists in memory
+                for channel in &results {
+                    for &(freq, amp) in channel {
+                        buffer.extend_from_slice(&freq.to_le_bytes());
+                        buffer.extend_from_slice(&amp.to_le_bytes());
+                    }
+                }
+                
+                // Direct byte-for-byte write to shared memory
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .write(true)
-                    .truncate(true)
-                    .open(&shared.path) 
+                    .open(&shared.path)  // REMOVED .truncate(true)
                 {
-                    let _ = file.write_all(&data_len.to_le_bytes());
-                    let _ = file.write_all(json.as_bytes());
+                    file.set_len(buffer.len() as u64).unwrap();  // Resize file to exact data size
+                    file.write_all(&buffer).unwrap();
                 }
+                
+                shared.data = results.clone();
             }
 
             // Give other threads more time to run
