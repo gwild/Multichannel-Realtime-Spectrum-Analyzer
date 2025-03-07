@@ -21,6 +21,9 @@ use crate::resynth::ResynthConfig;  // Add this import
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
     absolute_values: Vec<Vec<(f32, f32)>>,       // Frequency, absolute pairs
+    partial_textures: Vec<Option<egui::TextureHandle>>,
+    freq_axis_lines: Vec<Vec<[f32; 2]>>,
+    num_channels: usize,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -28,11 +31,24 @@ impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
             absolute_values: vec![vec![(0.0, 0.0); 12]; num_channels],
+            partial_textures: vec![None; num_channels],
+            freq_axis_lines: vec![vec![]; 2],
+            num_channels,
         }
     }
 
-    pub fn update_partials(&mut self, new_values: Vec<Vec<(f32, f32)>>) {
-        self.absolute_values = new_values;  // Store directly
+    pub fn update_partials(&mut self, partials: Vec<Vec<(f32, f32)>>) {
+        let num_channels = partials.len();
+        self.absolute_values = partials;
+        
+        // Resize textures array to match channel count
+        self.partial_textures.resize_with(num_channels, || None);
+        
+        // Always keep 2 frequency axis lines
+        self.freq_axis_lines = vec![vec![]; 2]; 
+        
+        // Update channel count display
+        self.num_channels = num_channels;
     }
 
     #[allow(dead_code)]
