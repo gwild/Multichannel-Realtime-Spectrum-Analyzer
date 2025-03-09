@@ -436,6 +436,18 @@ impl eframe::App for MyApp {
                 }
             });
 
+            // 7) Resynth update timer control
+            ui.horizontal(|ui| {
+                if let Ok(mut resynth_config) = self.resynth_config.lock() {
+                    ui.label("Resynth Update Rate:");
+                    ui.add(
+                        egui::Slider::new(&mut resynth_config.update_rate, 0.01..=60.0)
+                            .text("seconds")
+                            .logarithmic(true)
+                    );
+                }
+            });
+
             // Handle max frequency adjustment if buffer size changed
             if size_changed {
                 let nyquist_limit = self.get_nyquist_limit() as f64;
@@ -452,7 +464,7 @@ impl eframe::App for MyApp {
                 }
             }
 
-            // 7) Reset button
+            // 8) Reset button
             let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
                 {
@@ -508,6 +520,7 @@ impl eframe::App for MyApp {
                 resynth_config.gain = 0.001;  // Volume = 1 on our 0-10 scale
                 resynth_config.smoothing = 0.5;  // Default smoothing value
                 resynth_config.freq_scale = 1.0;  // Reset frequency scale to normal
+                resynth_config.update_rate = 1.0;  // Reset update rate to default
                 
                 reset_clicked = true;
             }
