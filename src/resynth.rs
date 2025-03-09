@@ -7,6 +7,7 @@ use portaudio as pa;
 use log::{info, error};
 use crate::plot::SpectrumApp;
 use crate::fft_analysis::NUM_PARTIALS;
+use rayon::prelude::*;  // Add at top with other imports
 
 // Add Pi-specific constants
 #[cfg(target_arch = "arm")]
@@ -63,6 +64,7 @@ const DC_FILTER_COEFF: f32 = 0.995; // DC blocking filter coefficient
 const ZERO_CROSSING_THRESHOLD: f32 = 0.01; // How close to zero is considered a crossing
 const CROSSFADE_FRAMES: usize = 32; // Number of frames to crossfade between significant changes
 const PHASE_RESET_THRESHOLD: f32 = 5.0; // Hz difference that triggers phase reset consideration
+const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
 
 #[derive(Clone)]
 struct SmoothParam {
@@ -233,6 +235,7 @@ pub struct ResynthConfig {
     pub gain: f32,
     pub smoothing: f32,
     pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
+    pub update_rate: f32, // How often to update synthesis (in seconds)
 }
 
 impl Default for ResynthConfig {
@@ -241,6 +244,7 @@ impl Default for ResynthConfig {
             gain: 0.01,
             smoothing: 0.99,
             freq_scale: 1.0,  // Default to no scaling
+            update_rate: DEFAULT_UPDATE_RATE,
         }
     }
 }
@@ -294,6 +298,8 @@ pub fn start_resynth_thread(
         let mut prev_right = 0.0f32;
         
         let mut stream = match pa.open_non_blocking_stream(settings, move |args: pa::OutputStreamCallbackArgs<f32>| {
+            static mut LAST_UPDATE: Option<std::time::Instant> = None;
+            
             let buffer = args.buffer;
             let frames = buffer.len() / 2;
             
@@ -302,8 +308,57 @@ pub fn start_resynth_thread(
             let gain = config_lock.gain;
             let smoothing = config_lock.smoothing;
             let freq_scale = config_lock.freq_scale;
+            let update_rate = config_lock.update_rate;
 
             buffer.fill(0.0);
+
+            // Check if it's time to update
+            let now = std::time::Instant::now();
+            let should_update = unsafe {
+                if let Some(last) = LAST_UPDATE {
+                    if now.duration_since(last).as_secs_f32() >= update_rate {
+                        LAST_UPDATE = Some(now);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    LAST_UPDATE = Some(now);
+                    true
+                }
+            };
+            
+            if !should_update {
+                // Just continue playing current state
+                for frame in 0..frames {
+                    let frame_offset = frame * 2;
+                    // Continue synthesizing with current states
+                    let mut left = 0.0f32;
+                    let mut right = 0.0f32;
+                    
+                    for (channel, channel_states) in partial_states.iter_mut().enumerate() {
+                        for state in channel_states.iter_mut() {
+                            if state.is_active {
+                                let sample = state.amp.current * state.phase.sin() * state.envelope;
+                                state.phase += 2.0 * PI * state.freq.current / sample_rate as f32;
+                                if state.phase >= 2.0 * PI {
+                                    state.phase -= 2.0 * PI;
+                                }
+                                
+                                if channel % 2 == 0 {
+                                    left += sample;
+                                } else {
+                                    right += sample;
+                                }
+                            }
+                        }
+                    }
+                    
+                    buffer[frame_offset] = (left * gain).clamp(-0.95, 0.95);
+                    buffer[frame_offset + 1] = (right * gain).clamp(-0.95, 0.95);
+                }
+                return pa::Continue;
+            }
 
             // At the beginning of processing, apply special handling for buffer boundaries on Pi
             #[cfg(target_arch = "arm")]
@@ -325,189 +380,207 @@ pub fn start_resynth_thread(
                 }
             }
 
+            // Process channels in parallel and collect results
+            let results: Vec<(Vec<(f32, f32)>, Vec<PartialState>)> = partials.par_iter().enumerate()
+                .map(|(channel, channel_partials)| {
+                    // Clone states for this channel
+                    let mut channel_states = partial_states[channel].clone();
+                    let mut frame_outputs = Vec::with_capacity(frames);
+                    
+                    for frame in 0..frames {
+                        let mut frame_left = 0.0f32;
+                        let mut frame_right = 0.0f32;
+
+                        for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
+                            let state = &mut channel_states[i];
+                            
+                            // Check if we need to prepare for crossfade due to significant change
+                            let freq_change = (freq * freq_scale - state.freq.current).abs();
+                            let amp_change = (amp - state.amp.current).abs();
+                            
+                            if (freq_change > PHASE_RESET_THRESHOLD || amp_change > 0.5) && 
+                               state.is_active && state.crossfade_counter == 0 {
+                                state.prepare_crossfade(frames);
+                                // Store current state for crossfade
+                                for f in 0..state.crossfade_counter {
+                                    let phase_pos = state.phase + (f as f32 * 2.0 * PI * state.freq.current / sample_rate as f32);
+                                    let sample = state.amp.current * phase_pos.sin() * state.envelope;
+                                    state.store_sample(sample, f);
+                                }
+                            }
+                            
+                            // Update smoothed parameters
+                            state.freq.update(freq * freq_scale, smoothing);
+                            state.amp.update(amp, smoothing);
+                            
+                            // Apply more aggressive filtering on Pi
+                            #[cfg(target_arch = "arm")]
+                            {
+                                // Filter out very quiet partials, but with a lower threshold
+                                if state.amp.target < MIN_PARTIAL_AMP && state.amp.current < MIN_PARTIAL_AMP * 2.0 {
+                                    state.amp.current = 0.0;
+                                    state.amp.target = 0.0;
+                                    continue;
+                                }
+                                
+                                // Less aggressive frequency smoothing
+                                if state.freq.large_change() {
+                                    state.freq.current = state.freq.current * 0.85 + state.freq.target * 0.15;
+                                }
+                            }
+                            
+                            // Update envelope for attack/release
+                            state.update_envelope(sample_rate as f32, attack_samples, release_samples);
+                            
+                            // Check if we need to reset phase (for large frequency changes)
+                            if state.needs_phase_reset() {
+                                // Record the time of this frequency change
+                                state.last_freq_change = frame as f32;
+                                
+                                // Only reset phase at zero crossings to minimize pops
+                                let phase_mod = state.phase % (2.0 * PI);
+                                if phase_mod < ZERO_CROSSING_THRESHOLD || 
+                                   (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD || 
+                                   phase_mod > (2.0 * PI - ZERO_CROSSING_THRESHOLD) {
+                                    // Reset to nearest zero crossing
+                                    if phase_mod < ZERO_CROSSING_THRESHOLD {
+                                        state.phase = state.phase - phase_mod;
+                                    } else if (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD {
+                                        state.phase = state.phase - (phase_mod - PI);
+                                    } else {
+                                        state.phase = state.phase + (2.0 * PI - phase_mod);
+                                    }
+                                }
+                            }
+
+                            if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
+                                // Apply envelope with per-partial dynamic scaling
+                                let amplitude = if state.is_active {
+                                    state.amp.current * state.envelope
+                                } else {
+                                    state.amp.current * state.envelope
+                                };
+                                
+                                // Slight phase jitter to prevent perfect cancellation between partials
+                                let phase_with_jitter = state.phase + (PHASE_JITTER * (i as f32 * 0.1));
+                                
+                                // Define raw_sample outside the cfg blocks
+                                let raw_sample: f32;
+                                
+                                // On Pi, simplify the oscillator to reduce computational load
+                                #[cfg(target_arch = "arm")]
+                                {
+                                    // Less expensive sine approximation for Pi
+                                    let phase_sin = if phase_with_jitter < PI {
+                                        (1.57079632679 - phase_with_jitter) * (phase_with_jitter)
+                                    } else {
+                                        (phase_with_jitter - 4.71238898038) * (phase_with_jitter - 3.14159265359) 
+                                    };
+                                    
+                                    // Set the outer raw_sample
+                                    raw_sample = amplitude * phase_sin;
+                                }
+                                
+                                // On other platforms, use the regular sine function
+                                #[cfg(not(target_arch = "arm"))]
+                                {
+                                    // Set the outer raw_sample
+                                    raw_sample = amplitude * phase_with_jitter.sin();
+                                }
+                                
+                                // Apply crossfade if needed
+                                let final_sample = if state.needs_crossfade && state.crossfade_counter > 0 {
+                                    let pos = if state.crossfade_counter <= CROSSFADE_FRAMES {
+                                        CROSSFADE_FRAMES - state.crossfade_counter
+                                    } else {
+                                        0
+                                    };
+                                    let crossfaded = state.get_crossfaded_sample(raw_sample, pos);
+                                    state.crossfade_counter -= 1;
+                                    if state.crossfade_counter == 0 {
+                                        state.needs_crossfade = false;
+                                    }
+                                    crossfaded
+                                } else {
+                                    raw_sample
+                                };
+                                
+                                // Store current sample for zero-crossing detection
+                                state.old_sample = final_sample;
+                                
+                                // Apply additional filtering to prevent high-frequency noise for high frequencies
+                                let filtered_sample = if freq > 10000.0 {
+                                    final_sample * (20000.0 - freq) / 10000.0
+                                } else {
+                                    final_sample
+                                };
+                                
+                                // Channel-dependent panning to reduce mono summing issues
+                                if channel % 2 == 0 {
+                                    frame_left += filtered_sample;
+                                } else {
+                                    frame_right += filtered_sample;
+                                }
+                                
+                                // Update phase using smoothed frequency with more careful wrapping
+                                let phase_increment = 2.0 * PI * state.freq.current / sample_rate as f32;
+                                state.phase += phase_increment;
+                                
+                                // Normalize phase to prevent floating point precision issues over time
+                                while state.phase >= 2.0 * PI {
+                                    state.phase -= 2.0 * PI;
+                                }
+                                while state.phase < 0.0 {
+                                    state.phase += 2.0 * PI;
+                                }
+                            }
+                        }
+                        frame_outputs.push((frame_left, frame_right));
+                    }
+                    (frame_outputs, channel_states)
+                }).collect();
+
+            // Update states after parallel processing
+            for (channel, (_, states)) in results.iter().enumerate() {
+                // Check if states have changed significantly before updating
+                let mut needs_update = false;
+                for (i, new_state) in states.iter().enumerate() {
+                    let old_state = &partial_states[channel][i];
+                    if (new_state.freq.current - old_state.freq.current).abs() > 0.1 ||
+                       (new_state.amp.current - old_state.amp.current).abs() > 0.01 {
+                        needs_update = true;
+                        break;
+                    }
+                }
+                
+                if needs_update {
+                    // Store old states for crossfade
+                    let old_states = partial_states[channel].clone();
+                    partial_states[channel] = states.clone();
+                    
+                    // Prepare crossfade for all active partials in this channel
+                    for (i, state) in partial_states[channel].iter_mut().enumerate() {
+                        if state.is_active || old_states[i].is_active {
+                            state.prepare_crossfade(frames);
+                            state.crossfade_buffer = old_states[i].crossfade_buffer.clone();
+                        }
+                    }
+                }
+            }
+
+            // Combine results and write to buffer
             for frame in 0..frames {
                 let mut left = 0.0f32;
                 let mut right = 0.0f32;
                 
-                // Count active partials to apply dynamic scaling
-                let mut active_partial_count = 0;
-                
-                // First pass: count active partials for dynamic scaling
-                for channel_partials in &partials {
-                    for &(freq, amp) in channel_partials.iter() {
-                        if freq > 0.0 && amp > 0.01 {
-                            active_partial_count += 1;
-                        }
-                    }
-                }
-                
-                // Calculate dynamic scaling - more active partials = lower per-partial gain
-                let dynamic_scale = if active_partial_count > 0 {
-                    let scaling = 1.0 / (1.0 + (active_partial_count as f32 * 0.05));
-                    BASE_GAIN_SCALING + (DYNAMIC_SCALING_FACTOR * scaling)
-                } else {
-                    BASE_GAIN_SCALING
-                };
-
-                // Process all partials
-                for (channel, channel_partials) in partials.iter().enumerate() {
-                    for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                        let state = &mut partial_states[channel][i];
-                        
-                        // Check if we need to prepare for crossfade due to significant change
-                        let freq_change = (freq * freq_scale - state.freq.current).abs();
-                        let amp_change = (amp - state.amp.current).abs();
-                        
-                        if (freq_change > PHASE_RESET_THRESHOLD || amp_change > 0.5) && 
-                           state.is_active && state.crossfade_counter == 0 {
-                            state.prepare_crossfade(frames);
-                            // Store current state for crossfade
-                            for f in 0..state.crossfade_counter {
-                                let phase_pos = state.phase + (f as f32 * 2.0 * PI * state.freq.current / sample_rate as f32);
-                                let sample = state.amp.current * phase_pos.sin() * state.envelope;
-                                state.store_sample(sample, f);
-                            }
-                        }
-                        
-                        // Update smoothed parameters
-                        state.freq.update(freq * freq_scale, smoothing);
-                        state.amp.update(amp, smoothing);
-                        
-                        // Apply more aggressive filtering on Pi
-                        #[cfg(target_arch = "arm")]
-                        {
-                            // Filter out very quiet partials, but with a lower threshold
-                            if state.amp.target < MIN_PARTIAL_AMP && state.amp.current < MIN_PARTIAL_AMP * 2.0 {
-                                state.amp.current = 0.0;
-                                state.amp.target = 0.0;
-                                continue;
-                            }
-                            
-                            // Less aggressive frequency smoothing
-                            if state.freq.large_change() {
-                                state.freq.current = state.freq.current * 0.85 + state.freq.target * 0.15;
-                            }
-                        }
-                        
-                        // Update envelope for attack/release
-                        state.update_envelope(sample_rate as f32, attack_samples, release_samples);
-                        
-                        // Check if we need to reset phase (for large frequency changes)
-                        if state.needs_phase_reset() {
-                            // Record the time of this frequency change
-                            state.last_freq_change = frame as f32;
-                            
-                            // Only reset phase at zero crossings to minimize pops
-                            let phase_mod = state.phase % (2.0 * PI);
-                            if phase_mod < ZERO_CROSSING_THRESHOLD || 
-                               (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD || 
-                               phase_mod > (2.0 * PI - ZERO_CROSSING_THRESHOLD) {
-                                // Reset to nearest zero crossing
-                                if phase_mod < ZERO_CROSSING_THRESHOLD {
-                                    state.phase = state.phase - phase_mod;
-                                } else if (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD {
-                                    state.phase = state.phase - (phase_mod - PI);
-                                } else {
-                                    state.phase = state.phase + (2.0 * PI - phase_mod);
-                                }
-                            }
-                        }
-
-                        if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
-                            // Apply envelope with per-partial dynamic scaling
-                            let amplitude = if state.is_active {
-                                state.amp.current * state.envelope
-                            } else {
-                                state.amp.current * state.envelope
-                            };
-                            
-                            // Slight phase jitter to prevent perfect cancellation between partials
-                            let phase_with_jitter = state.phase + (PHASE_JITTER * (i as f32 * 0.1));
-                            
-                            // Define raw_sample outside the cfg blocks
-                            let raw_sample: f32;
-                            
-                            // On Pi, simplify the oscillator to reduce computational load
-                            #[cfg(target_arch = "arm")]
-                            {
-                                // Less expensive sine approximation for Pi
-                                let phase_sin = if phase_with_jitter < PI {
-                                    (1.57079632679 - phase_with_jitter) * (phase_with_jitter)
-                                } else {
-                                    (phase_with_jitter - 4.71238898038) * (phase_with_jitter - 3.14159265359) 
-                                };
-                                
-                                // Set the outer raw_sample
-                                raw_sample = amplitude * phase_sin;
-                            }
-                            
-                            // On other platforms, use the regular sine function
-                            #[cfg(not(target_arch = "arm"))]
-                            {
-                                // Set the outer raw_sample
-                                raw_sample = amplitude * phase_with_jitter.sin();
-                            }
-                            
-                            // Apply crossfade if needed
-                            let final_sample = if state.needs_crossfade && state.crossfade_counter > 0 {
-                                let pos = if state.crossfade_counter <= CROSSFADE_FRAMES {
-                                    CROSSFADE_FRAMES - state.crossfade_counter
-                                } else {
-                                    0
-                                };
-                                let crossfaded = state.get_crossfaded_sample(raw_sample, pos);
-                                state.crossfade_counter -= 1;
-                                if state.crossfade_counter == 0 {
-                                    state.needs_crossfade = false;
-                                }
-                                crossfaded
-                            } else {
-                                raw_sample
-                            };
-                            
-                            // Store current sample for zero-crossing detection
-                            state.old_sample = final_sample;
-                            
-                            // Apply additional filtering to prevent high-frequency noise for high frequencies
-                            let filtered_sample = if freq > 10000.0 {
-                                final_sample * (20000.0 - freq) / 10000.0
-                            } else {
-                                final_sample
-                            };
-                            
-                            // Channel-dependent panning to reduce mono summing issues
-                            if channel % 2 == 0 {
-                                left += filtered_sample;
-                            } else {
-                                right += filtered_sample;
-                            }
-                            
-                            // Update phase using smoothed frequency with more careful wrapping
-                            let phase_increment = 2.0 * PI * state.freq.current / sample_rate as f32;
-                            state.phase += phase_increment;
-                            
-                            // Normalize phase to prevent floating point precision issues over time
-                            while state.phase >= 2.0 * PI {
-                                state.phase -= 2.0 * PI;
-                            }
-                            while state.phase < 0.0 {
-                                state.phase += 2.0 * PI;
-                            }
-                        }
-                    }
+                for (channel_output, _) in &results {
+                    left += channel_output[frame].0;
+                    right += channel_output[frame].1;
                 }
 
-                // Apply the dynamic scaling and user gain
                 let frame_offset = frame * 2;
-
-                // Apply the correct volume scaling (gain is 0.001-0.01 range)
-                // When user sets volume to 1 (gain=0.001), the actual gain becomes 0.0001
-                // When user sets volume to 10 (gain=0.01), the actual gain becomes 0.001
-                let corrected_gain = gain * VOLUME_CORRECTION;
-
-                // Use corrected gain with dynamic scaling
-                buffer[frame_offset] = (left * dynamic_scale * corrected_gain).clamp(-0.95, 0.95);
-                buffer[frame_offset + 1] = (right * dynamic_scale * corrected_gain).clamp(-0.95, 0.95);
+                buffer[frame_offset] = (left * gain).clamp(-0.95, 0.95);
+                buffer[frame_offset + 1] = (right * gain).clamp(-0.95, 0.95);
             }
 
             // At the end of processing, store last buffer values for next time on Pi
