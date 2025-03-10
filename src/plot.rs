@@ -95,12 +95,6 @@ impl MyApp {
             egui::Color32::from_rgb(255, 255, 0),
         ];
 
-        // Set initial values for resynth_config to match defaults
-        if let Ok(mut config) = resynth_config.lock() {
-            config.gain = 0.001;     // Volume = 1 on our 0-10 scale
-            config.smoothing = 0.5;  // Default smoothing value
-        }
-
         let instance = MyApp {
             spectrum,
             fft_config,
@@ -334,17 +328,17 @@ impl eframe::App for MyApp {
             
             // 4) Volume and Smoothing row + Crosstalk checkbox + Frequency Scale
             ui.horizontal(|ui| {
-                // Volume slider (renamed from Gain)
+                // Volume slider (exactly matching update rate slider pattern)
                 ui.label("Volume:");
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                    // Create a temporary display value 0-10 that maps to gain 0-0.01
-                    let mut volume_display = (resynth_config.gain / 0.001).round() as i32;
-                    if ui.add(egui::Slider::new(&mut volume_display, 0..=10)).changed() {
-                        // Map the display value back to actual gain value
-                        resynth_config.gain = volume_display as f32 * 0.001;
-                    }
+                    ui.add(
+                        egui::Slider::new(&mut resynth_config.gain, 0.01..=10.0)
+                            .logarithmic(true)
+                            .text(""),
+                    );
                 }
-                
+             
+            
                 ui.separator();
                 
                 // Add Frequency Scale control right after Volume
@@ -446,7 +440,7 @@ impl eframe::App for MyApp {
                             .logarithmic(true)
                     );
                 }
-            });
+            }); 
 
             // Handle max frequency adjustment if buffer size changed
             if size_changed {
@@ -515,12 +509,6 @@ impl eframe::App for MyApp {
                 if needs_update {
                     self.update_buffer_size(DEFAULT_BUFFER_SIZE);
                 }
-                
-                let mut resynth_config = self.resynth_config.lock().unwrap();
-                resynth_config.gain = 0.001;  // Volume = 1 on our 0-10 scale
-                resynth_config.smoothing = 0.5;  // Default smoothing value
-                resynth_config.freq_scale = 1.0;  // Reset frequency scale to normal
-                resynth_config.update_rate = 1.0;  // Reset update rate to default
                 
                 reset_clicked = true;
             }
