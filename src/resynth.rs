@@ -9,62 +9,15 @@ use crate::plot::SpectrumApp;
 use crate::fft_analysis::NUM_PARTIALS;
 use rayon::prelude::*;  // Add at top with other imports
 
-// Add Pi-specific constants
-#[cfg(target_arch = "arm")]
-const CROSSFADE_THRESHOLD: f32 = 10.0; // More conservative for Pi
-#[cfg(target_arch = "arm")]
-const ATTACK_TIME: f32 = 0.05; // Longer attack for Pi (50ms)
-#[cfg(target_arch = "arm")]
-const RELEASE_TIME: f32 = 0.08; // Longer release for Pi (80ms)
-
-// For non-Pi platforms
-#[cfg(not(target_arch = "arm"))]
-const CROSSFADE_THRESHOLD: f32 = 20.0;
-#[cfg(not(target_arch = "arm"))]
-const ATTACK_TIME: f32 = 0.02; 
-#[cfg(not(target_arch = "arm"))]
-const RELEASE_TIME: f32 = 0.03;
-
-const MIN_ENVELOPE_VALUE: f32 = 0.001;
-
-const SMOOTHING_FACTOR: f32 = 0.97; // Higher = smoother but slower response
-
-// Adjust global gain scaling values for Pi and other systems
-#[cfg(target_arch = "arm")]
-const GAIN_SCALING: f32 = 0.4; // Less aggressive gain reduction for Pi
-#[cfg(not(target_arch = "arm"))]
-const GAIN_SCALING: f32 = 0.5; // Less aggressive gain reduction for other systems
-
-// Adjust the limiter threshold to engage earlier
-const LIMIT_THRESHOLD: f32 = 0.85; // Higher threshold means less limiting
-const LIMIT_STRENGTH: f32 = 0.4; // Lower strength for more transparent limiting (was 0.8)
-
-// Modify the Pi-specific filtering to be less aggressive
-#[cfg(target_arch = "arm")]
-const MIN_PARTIAL_AMP: f32 = 0.002; // Less aggressive filtering for quiet partials
-
-// Dynamic gain scaling based on partial activity
-const BASE_GAIN_SCALING: f32 = 0.2; // Base level gain scaling
-const DYNAMIC_SCALING_FACTOR: f32 = 0.8; // How much to scale based on active partials
-
-// Phase cancellation prevention
-const PHASE_JITTER: f32 = 0.01; // Small amount of phase randomization to prevent perfect cancellation
-
-// Keep these constants at the module level
-const VOLUME_CORRECTION: f32 = 0.2; // Doubled from 0.1 to make max volume twice as loud
-
-// Modify the envelope handling for more robust cross-buffer continuity
-#[cfg(target_arch = "arm")]
-const ENVELOPE_SLOPE_LIMIT: f32 = 0.01; // Limit how quickly envelopes can change per sample
-
-#[cfg(target_arch = "arm")]
-const DC_FILTER_COEFF: f32 = 0.995; // DC blocking filter coefficient
-
-// Add these constants at the top with the other constants
-const ZERO_CROSSING_THRESHOLD: f32 = 0.01; // How close to zero is considered a crossing
-const CROSSFADE_FRAMES: usize = 32; // Number of frames to crossfade between significant changes
-const PHASE_RESET_THRESHOLD: f32 = 5.0; // Hz difference that triggers phase reset consideration
-const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
+// Constants used in the code
+const CROSSFADE_THRESHOLD: f32 = 20.0;  // Used in SmoothParam::large_change()
+const ATTACK_TIME: f32 = 0.02;          // Used in envelope calculations
+const RELEASE_TIME: f32 = 0.03;         // Used in envelope calculations
+const MIN_ENVELOPE_VALUE: f32 = 0.001;  // Used in envelope calculations
+const ZERO_CROSSING_THRESHOLD: f32 = 0.01;  // Used in is_at_zero_crossing()
+const CROSSFADE_FRAMES: usize = 64;     // Used in prepare_crossfade()
+const PHASE_RESET_THRESHOLD: f32 = 5.0;  // Used in needs_phase_reset()
+const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Used in ResynthConfig default
 
 #[derive(Clone)]
 struct SmoothParam {
@@ -85,8 +38,12 @@ impl SmoothParam {
     fn update(&mut self, target: f32, smoothing: f32) {
         self.prev_target = self.target;
         self.target = target;
-        let factor = smoothing * smoothing;
-        self.current = self.current * factor + target * (1.0 - factor);
+        if smoothing == 0.0 {
+            self.current = target;  // Direct update, no smoothing calculation
+        } else {
+            let factor = smoothing * smoothing;
+            self.current = self.current * factor + target * (1.0 - factor);
+        }
     }
     
     fn large_change(&self) -> bool {
@@ -242,9 +199,24 @@ impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
             gain: 0.01,
-            smoothing: 0.99,
+            smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SynthInstance {
+    partial_states: Vec<Vec<PartialState>>,
+    fade_level: f32,  // 0.0 to 1.0 for crossfading
+}
+
+impl SynthInstance {
+    fn new(num_channels: usize) -> Self {
+        Self {
+            partial_states: vec![vec![PartialState::new(); NUM_PARTIALS]; num_channels],
+            fade_level: 0.0,
         }
     }
 }
@@ -256,6 +228,119 @@ pub fn start_resynth_thread(
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
 ) {
+    // Create two synthesis instances
+    let mut current_synth = SynthInstance::new(spectrum_app.lock().unwrap().clone_absolute_data().len());
+    let mut next_synth = current_synth.clone();
+    let mut is_crossfading = false;
+    let mut crossfade_samples_remaining = 0;
+    let mut last_update = std::time::Instant::now();
+
+    // Helper function to generate a frame of audio
+    fn generate_frame(synth: &mut SynthInstance, frame: usize, sample_rate: f64) -> (f32, f32) {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        
+        for (channel, states) in synth.partial_states.iter_mut().enumerate() {
+            for state in states {
+                if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
+                    let amplitude = (state.amp.current / 100.0) * state.envelope;
+                    let sample = amplitude * state.phase.sin();
+                    
+                    // Update phase for next sample
+                    state.phase += 2.0 * PI * state.freq.current / sample_rate as f32;
+                    if state.phase >= 2.0 * PI {
+                        state.phase -= 2.0 * PI;
+                    }
+                    
+                    if channel % 2 == 0 {
+                        left += sample;
+                    } else {
+                        right += sample;
+                    }
+                }
+            }
+        }
+        (left, right)
+    }
+
+    let callback = move |args: pa::OutputStreamCallbackArgs<f32>| {
+        let buffer = args.buffer;
+        let frames = buffer.len() / 2;
+        
+        // Get config values
+        let config_lock = config.lock().unwrap();
+        let gain = config_lock.gain;
+        let update_rate = config_lock.update_rate;
+        let crossfade_duration = (update_rate * 0.25 * sample_rate as f32) as usize;
+        
+        // Check if it's time to update
+        let should_update = last_update.elapsed().as_secs_f32() >= update_rate;
+        
+        if should_update {
+            last_update = std::time::Instant::now();
+            
+            // Debug print FFT data
+            let partials = spectrum_app.lock().unwrap().clone_absolute_data();
+            info!("Got FFT data: {} channels", partials.len());
+            for (ch, channel_data) in partials.iter().enumerate() {
+                info!("Channel {}: {} partials", ch, channel_data.len());
+                for &(freq, amp) in channel_data.iter().take(3) {  // Print first 3 partials
+                    info!("  Freq: {:.1}, Amp: {:.1}", freq, amp);
+                }
+            }
+            
+            is_crossfading = true;
+            crossfade_samples_remaining = crossfade_duration;
+            
+            // Update next_synth with new FFT data
+            let partials = spectrum_app.lock().unwrap().clone_absolute_data();
+            next_synth = SynthInstance::new(partials.len());
+            
+            // Actually update the synthesis parameters with new data
+            for (channel, channel_partials) in partials.iter().enumerate() {
+                for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
+                    let state = &mut next_synth.partial_states[channel][i];
+                    state.freq.current = freq * config_lock.freq_scale;
+                    state.amp.current = amp;
+                    state.envelope = if amp > 0.0 { 1.0 } else { 0.0 };
+                    // Keep phase continuous from current synth
+                    state.phase = current_synth.partial_states[channel][i].phase;
+                }
+            }
+        }
+
+        if is_crossfading {
+            // Generate audio from both instances and crossfade
+            let fade_out = (crossfade_samples_remaining as f32 / crossfade_duration as f32).max(0.0);
+            let fade_in = 1.0 - fade_out;
+
+            for frame in 0..frames {
+                let (old_left, old_right) = generate_frame(&mut current_synth, frame, sample_rate);
+                let (new_left, new_right) = generate_frame(&mut next_synth, frame, sample_rate);
+
+                buffer[frame * 2] = (old_left * fade_out + new_left * fade_in) * gain;
+                buffer[frame * 2 + 1] = (old_right * fade_out + new_right * fade_in) * gain;
+            }
+
+            if crossfade_samples_remaining > frames {
+                crossfade_samples_remaining -= frames;
+            } else {
+                crossfade_samples_remaining = 0;
+                is_crossfading = false;
+                current_synth = next_synth.clone();
+            }
+        } else {
+            // Normal synthesis from current instance
+            for frame in 0..frames {
+                let (left, right) = generate_frame(&mut current_synth, frame, sample_rate);
+                buffer[frame * 2] = left * gain;
+                buffer[frame * 2 + 1] = right * gain;
+            }
+        }
+
+        pa::Continue
+    };
+
     thread::spawn(move || {
         let pa = match pa::PortAudio::new() {
             Ok(pa) => pa,
@@ -279,341 +364,7 @@ pub fn start_resynth_thread(
             if cfg!(target_arch = "arm") { 1024 } else { 512 },
         );
 
-        // Initialize partial states for smoothing
-        let num_channels = spectrum_app.lock().unwrap().clone_absolute_data().len();
-        let mut partial_states = vec![vec![PartialState::new(); NUM_PARTIALS]; num_channels];
-        
-        // Calculate attack and release samples
-        let attack_samples = (ATTACK_TIME * sample_rate as f32) as usize;
-        let release_samples = (RELEASE_TIME * sample_rate as f32) as usize;
-
-        // Add a buffer state tracker for the Pi
-        #[cfg(target_arch = "arm")]
-        let mut last_buffer_state: Vec<(f32, f32)> = vec![(0.0, 0.0); 2]; // Left/right values from end of last buffer
-        
-        // Add these variables inside the function instead
-        #[cfg(target_arch = "arm")]
-        let mut prev_left = 0.0f32;
-        #[cfg(target_arch = "arm")]
-        let mut prev_right = 0.0f32;
-        
-        let mut stream = match pa.open_non_blocking_stream(settings, move |args: pa::OutputStreamCallbackArgs<f32>| {
-            static mut LAST_UPDATE: Option<std::time::Instant> = None;
-            
-            let buffer = args.buffer;
-            let frames = buffer.len() / 2;
-            
-            let partials = spectrum_app.lock().unwrap().clone_absolute_data();
-            let config_lock = config.lock().unwrap();
-            let gain = config_lock.gain;
-            let smoothing = config_lock.smoothing;
-            let freq_scale = config_lock.freq_scale;
-            let update_rate = config_lock.update_rate;
-
-            buffer.fill(0.0);
-
-            // Check if it's time to update
-            let now = std::time::Instant::now();
-            let should_update = unsafe {
-                if let Some(last) = LAST_UPDATE {
-                    if now.duration_since(last).as_secs_f32() >= update_rate {
-                        LAST_UPDATE = Some(now);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    LAST_UPDATE = Some(now);
-                    true
-                }
-            };
-            
-            if !should_update {
-                // Just continue playing current state
-                for frame in 0..frames {
-                    let frame_offset = frame * 2;
-                    // Continue synthesizing with current states
-                    let mut left = 0.0f32;
-                    let mut right = 0.0f32;
-                    
-                    for (channel, channel_states) in partial_states.iter_mut().enumerate() {
-                        for state in channel_states.iter_mut() {
-                            if state.is_active {
-                                let sample = state.amp.current * state.phase.sin() * state.envelope;
-                                state.phase += 2.0 * PI * state.freq.current / sample_rate as f32;
-                                if state.phase >= 2.0 * PI {
-                                    state.phase -= 2.0 * PI;
-                                }
-                                
-                                if channel % 2 == 0 {
-                                    left += sample;
-                                } else {
-                                    right += sample;
-                                }
-                            }
-                        }
-                    }
-                    
-                    buffer[frame_offset] = (left * gain).clamp(-0.95, 0.95);
-                    buffer[frame_offset + 1] = (right * gain).clamp(-0.95, 0.95);
-                }
-                return pa::Continue;
-            }
-
-            // At the beginning of processing, apply special handling for buffer boundaries on Pi
-            #[cfg(target_arch = "arm")]
-            {
-                // Apply a small crossfade between buffer boundaries
-                if frames > 0 {
-                    // Start with the last values from previous buffer and fade to new values
-                    buffer[0] = last_buffer_state[0].0;
-                    buffer[1] = last_buffer_state[0].1;
-                    
-                    // For first few frames, do a quick crossfade from last buffer
-                    let crossfade_frames = frames.min(16); // Max 16 frames for crossfade
-                    for frame in 1..crossfade_frames {
-                        let ratio = frame as f32 / crossfade_frames as f32;
-                        // Blend previous buffer end with current buffer start
-                        buffer[frame*2] = buffer[frame*2] * ratio + last_buffer_state[0].0 * (1.0-ratio);
-                        buffer[frame*2+1] = buffer[frame*2+1] * ratio + last_buffer_state[0].1 * (1.0-ratio);
-                    }
-                }
-            }
-
-            // Process channels in parallel and collect results
-            let results: Vec<(Vec<(f32, f32)>, Vec<PartialState>)> = partials.par_iter().enumerate()
-                .map(|(channel, channel_partials)| {
-                    // Clone states for this channel
-                    let mut channel_states = partial_states[channel].clone();
-                    let mut frame_outputs = Vec::with_capacity(frames);
-                    
-                    for frame in 0..frames {
-                        let mut frame_left = 0.0f32;
-                        let mut frame_right = 0.0f32;
-
-                        for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                            let state = &mut channel_states[i];
-                            
-                            // Check if we need to prepare for crossfade due to significant change
-                            let freq_change = (freq * freq_scale - state.freq.current).abs();
-                            let amp_change = (amp - state.amp.current).abs();
-                            
-                            if (freq_change > PHASE_RESET_THRESHOLD || amp_change > 0.5) && 
-                               state.is_active && state.crossfade_counter == 0 {
-                                state.prepare_crossfade(frames);
-                                // Store current state for crossfade
-                                for f in 0..state.crossfade_counter {
-                                    let phase_pos = state.phase + (f as f32 * 2.0 * PI * state.freq.current / sample_rate as f32);
-                                    let sample = state.amp.current * phase_pos.sin() * state.envelope;
-                                    state.store_sample(sample, f);
-                                }
-                            }
-                            
-                            // Update smoothed parameters
-                            state.freq.update(freq * freq_scale, smoothing);
-                            state.amp.update(amp, smoothing);
-                            
-                            // Apply more aggressive filtering on Pi
-                            #[cfg(target_arch = "arm")]
-                            {
-                                // Filter out very quiet partials, but with a lower threshold
-                                if state.amp.target < MIN_PARTIAL_AMP && state.amp.current < MIN_PARTIAL_AMP * 2.0 {
-                                    state.amp.current = 0.0;
-                                    state.amp.target = 0.0;
-                                    continue;
-                                }
-                                
-                                // Less aggressive frequency smoothing
-                                if state.freq.large_change() {
-                                    state.freq.current = state.freq.current * 0.85 + state.freq.target * 0.15;
-                                }
-                            }
-                            
-                            // Update envelope for attack/release
-                            state.update_envelope(sample_rate as f32, attack_samples, release_samples);
-                            
-                            // Check if we need to reset phase (for large frequency changes)
-                            if state.needs_phase_reset() {
-                                // Record the time of this frequency change
-                                state.last_freq_change = frame as f32;
-                                
-                                // Only reset phase at zero crossings to minimize pops
-                                let phase_mod = state.phase % (2.0 * PI);
-                                if phase_mod < ZERO_CROSSING_THRESHOLD || 
-                                   (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD || 
-                                   phase_mod > (2.0 * PI - ZERO_CROSSING_THRESHOLD) {
-                                    // Reset to nearest zero crossing
-                                    if phase_mod < ZERO_CROSSING_THRESHOLD {
-                                        state.phase = state.phase - phase_mod;
-                                    } else if (phase_mod - PI).abs() < ZERO_CROSSING_THRESHOLD {
-                                        state.phase = state.phase - (phase_mod - PI);
-                                    } else {
-                                        state.phase = state.phase + (2.0 * PI - phase_mod);
-                                    }
-                                }
-                            }
-
-                            if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
-                                // Scale amplitude from 0-100 to 0.0-1.0 range
-                                let amplitude = if state.is_active {
-                                    (state.amp.current / 100.0) * state.envelope
-                                } else {
-                                    (state.amp.current / 100.0) * state.envelope
-                                };
-                                
-                                // Slight phase jitter to prevent perfect cancellation between partials
-                                let phase_with_jitter = state.phase + (PHASE_JITTER * (i as f32 * 0.1));
-                                
-                                // Define raw_sample outside the cfg blocks
-                                let raw_sample: f32;
-                                
-                                // On Pi, simplify the oscillator to reduce computational load
-                                #[cfg(target_arch = "arm")]
-                                {
-                                    // Less expensive sine approximation for Pi
-                                    let phase_sin = if phase_with_jitter < PI {
-                                        (1.57079632679 - phase_with_jitter) * (phase_with_jitter)
-                                    } else {
-                                        (phase_with_jitter - 4.71238898038) * (phase_with_jitter - 3.14159265359) 
-                                    };
-                                    
-                                    // Set the outer raw_sample
-                                    raw_sample = amplitude * phase_sin;
-                                }
-                                
-                                // On other platforms, use the regular sine function
-                                #[cfg(not(target_arch = "arm"))]
-                                {
-                                    // Set the outer raw_sample
-                                    raw_sample = amplitude * phase_with_jitter.sin();
-                                }
-                                
-                                // Apply crossfade if needed
-                                let final_sample = if state.needs_crossfade && state.crossfade_counter > 0 {
-                                    let pos = if state.crossfade_counter <= CROSSFADE_FRAMES {
-                                        CROSSFADE_FRAMES - state.crossfade_counter
-                                    } else {
-                                        0
-                                    };
-                                    let crossfaded = state.get_crossfaded_sample(raw_sample, pos);
-                                    state.crossfade_counter -= 1;
-                                    if state.crossfade_counter == 0 {
-                                        state.needs_crossfade = false;
-                                    }
-                                    crossfaded
-                                } else {
-                                    raw_sample
-                                };
-                                
-                                // Store current sample for zero-crossing detection
-                                state.old_sample = final_sample;
-                                
-                                // Apply additional filtering to prevent high-frequency noise for high frequencies
-                                let filtered_sample = if freq > 10000.0 {
-                                    final_sample * (20000.0 - freq) / 10000.0
-                                } else {
-                                    final_sample
-                                };
-                                
-                                // Channel-dependent panning to reduce mono summing issues
-                                if channel % 2 == 0 {
-                                    frame_left += filtered_sample;
-                                } else {
-                                    frame_right += filtered_sample;
-                                }
-                                
-                                // Update phase using smoothed frequency with more careful wrapping
-                                let phase_increment = 2.0 * PI * state.freq.current / sample_rate as f32;
-                                state.phase += phase_increment;
-                                
-                                // Normalize phase to prevent floating point precision issues over time
-                                while state.phase >= 2.0 * PI {
-                                    state.phase -= 2.0 * PI;
-                                }
-                                while state.phase < 0.0 {
-                                    state.phase += 2.0 * PI;
-                                }
-                            }
-                        }
-                        frame_outputs.push((frame_left, frame_right));
-                    }
-                    (frame_outputs, channel_states)
-                }).collect();
-
-            // Update states after parallel processing
-            for (channel, (_, states)) in results.iter().enumerate() {
-                // Check if states have changed significantly before updating
-                let mut needs_update = false;
-                for (i, new_state) in states.iter().enumerate() {
-                    let old_state = &partial_states[channel][i];
-                    if (new_state.freq.current - old_state.freq.current).abs() > 0.1 ||
-                       (new_state.amp.current - old_state.amp.current).abs() > 0.01 {
-                        needs_update = true;
-                        break;
-                    }
-                }
-                
-                if needs_update {
-                    // Store old states for crossfade
-                    let old_states = partial_states[channel].clone();
-                    partial_states[channel] = states.clone();
-                    
-                    // Prepare crossfade for all active partials in this channel
-                    for (i, state) in partial_states[channel].iter_mut().enumerate() {
-                        if state.is_active || old_states[i].is_active {
-                            state.prepare_crossfade(frames);
-                            state.crossfade_buffer = old_states[i].crossfade_buffer.clone();
-                        }
-                    }
-                }
-            }
-
-            // Combine results and write to buffer
-            for frame in 0..frames {
-                let mut left = 0.0f32;
-                let mut right = 0.0f32;
-                
-                for (channel_output, _) in &results {
-                    left += channel_output[frame].0;
-                    right += channel_output[frame].1;
-                }
-
-                let frame_offset = frame * 2;
-                buffer[frame_offset] = (left * gain).clamp(-0.95, 0.95);
-                buffer[frame_offset + 1] = (right * gain).clamp(-0.95, 0.95);
-            }
-
-            // At the end of processing, store last buffer values for next time on Pi
-            #[cfg(target_arch = "arm")]
-            {
-                if frames > 0 {
-                    // Store last values for next buffer
-                    last_buffer_state[0].0 = buffer[(frames-1)*2];
-                    last_buffer_state[0].1 = buffer[(frames-1)*2+1];
-                }
-            }
-            
-            // Before final output, add DC filtering for Pi
-            #[cfg(target_arch = "arm")]
-            {
-                // We need to iterate through all frames for DC filtering
-                for frame in 0..frames {
-                    let frame_offset = frame * 2;
-                    
-                    // Simple DC blocking filter for left channel
-                    let filtered_left = buffer[frame_offset] - prev_left + (DC_FILTER_COEFF * prev_left);
-                    prev_left = filtered_left;
-                    buffer[frame_offset] = filtered_left;
-                    
-                    // Simple DC blocking filter for right channel
-                    let filtered_right = buffer[frame_offset + 1] - prev_right + (DC_FILTER_COEFF * prev_right);
-                    prev_right = filtered_right;
-                    buffer[frame_offset + 1] = filtered_right;
-                }
-            }
-            
-            pa::Continue
-        }) {
+        let mut stream = match pa.open_non_blocking_stream(settings, callback) {
             Ok(stream) => stream,
             Err(e) => {
                 error!("Failed to open output stream: {}", e);

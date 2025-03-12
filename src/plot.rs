@@ -332,7 +332,7 @@ impl eframe::App for MyApp {
                 ui.label("Volume:");
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
                     ui.add(
-                        egui::Slider::new(&mut resynth_config.gain, 0.01..=10.0)
+                        egui::Slider::new(&mut resynth_config.gain, 0.01..=2.0)
                             .logarithmic(true)
                             .text(""),
                     );
