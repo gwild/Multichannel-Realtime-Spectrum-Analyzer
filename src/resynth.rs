@@ -41,8 +41,10 @@ impl SmoothParam {
         if smoothing == 0.0 {
             self.current = target;  // Direct update, no smoothing calculation
         } else {
-            let factor = smoothing * smoothing;
-            self.current = self.current * factor + target * (1.0 - factor);
+            // High smoothing = more weight on current value
+            let old_weight = smoothing;           // Keep more of old value when smoothing is high
+            let new_weight = 1.0 - smoothing;     // Take less of new value when smoothing is high
+            self.current = self.current * old_weight + target * new_weight;
         }
     }
     
@@ -289,24 +291,29 @@ pub fn start_resynth_thread(
                 }
             }
             
-            is_crossfading = true;
-            crossfade_samples_remaining = crossfade_duration;
+            // Clone current synth to preserve smoothing state
+            next_synth = current_synth.clone();
             
-            // Update next_synth with new FFT data
+            // Update with new FFT data
             let partials = spectrum_app.lock().unwrap().clone_absolute_data();
-            next_synth = SynthInstance::new(partials.len());
-            
-            // Actually update the synthesis parameters with new data
             for (channel, channel_partials) in partials.iter().enumerate() {
                 for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
                     let state = &mut next_synth.partial_states[channel][i];
-                    state.freq.current = freq * config_lock.freq_scale;
-                    state.amp.current = amp;
-                    state.envelope = if amp > 0.0 { 1.0 } else { 0.0 };
-                    // Keep phase continuous from current synth
-                    state.phase = current_synth.partial_states[channel][i].phase;
+                    state.freq.update(freq * config_lock.freq_scale, config_lock.smoothing);
+                    state.amp.update(amp, config_lock.smoothing);
+                    
+                    // Update envelope with smoothing instead of direct assignment
+                    let target_envelope = if amp > 0.0 { 1.0 } else { 0.0 };
+                    state.envelope = if config_lock.smoothing == 0.0 {
+                        target_envelope
+                    } else {
+                        state.envelope * config_lock.smoothing + target_envelope * (1.0 - config_lock.smoothing)
+                    };
                 }
             }
+            
+            is_crossfading = true;
+            crossfade_samples_remaining = crossfade_duration;
         }
 
         if is_crossfading {
