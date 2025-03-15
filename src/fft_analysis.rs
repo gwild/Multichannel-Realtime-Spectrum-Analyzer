@@ -333,8 +333,14 @@ pub fn compute_spectrum(
         .enumerate()
         .map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
-            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt() / 4.0;  // Divide by 4 after sqrt
-            (frequency, magnitude)
+            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+            // Convert to dB with floor at 0, matching Python
+            let db = if magnitude > 1e-10 {
+                20.0 * (magnitude + 1e-10).log10()
+            } else {
+                0.0
+            };
+            (frequency, db.max(0.0))
         })
         .collect();
 
