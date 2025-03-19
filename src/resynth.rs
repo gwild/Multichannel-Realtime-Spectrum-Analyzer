@@ -17,7 +17,7 @@ const MIN_ENVELOPE_VALUE: f32 = 0.001;  // Used in envelope calculations
 const ZERO_CROSSING_THRESHOLD: f32 = 0.01;  // Used in is_at_zero_crossing()
 const CROSSFADE_FRAMES: usize = 64;     // Used in prepare_crossfade()
 const PHASE_RESET_THRESHOLD: f32 = 5.0;  // Used in needs_phase_reset()
-const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Used in ResynthConfig default
+pub const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Used in ResynthConfig default
 
 #[derive(Clone)]
 struct SmoothParam {

@@ -16,6 +16,7 @@ use crate::fft_analysis::WindowType;  // Add at top with other imports
 use crate::fft_analysis::{apply_window, extract_channel_data};
 use realfft::RealFftPlanner;
 use crate::resynth::ResynthConfig;  // Add this import
+use crate::resynth::DEFAULT_UPDATE_RATE;
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -467,15 +468,19 @@ impl eframe::App for MyApp {
                     
                     // Reset FFT config
                     fft_config.min_frequency = MIN_FREQ;
-                    fft_config.max_frequency = 1400.0;  // Changed from MAX_FREQ to explicit 1400.0
+                    fft_config.max_frequency = 1400.0;
                     fft_config.magnitude_threshold = 6.0;
-                    fft_config.min_freq_spacing = 20.0;  // Changed from 1.0 to 20.0
-                    fft_config.window_type = WindowType::Hanning;  // Changed from BlackmanHarris to Hanning
+                    fft_config.min_freq_spacing = 20.0;
+                    fft_config.window_type = WindowType::Hanning;
                     
                     // Reset crosstalk settings
-                    fft_config.crosstalk_enabled = false;  // Disable crosstalk by default
-                    fft_config.crosstalk_threshold = 0.5;  // Reset threshold to middle value
-                    fft_config.crosstalk_reduction = 0.5;  // Reset reduction to middle value
+                    fft_config.crosstalk_enabled = false;
+                    fft_config.crosstalk_threshold = 0.5;
+                    fft_config.crosstalk_reduction = 0.5;
+                    fft_config.harmonic_tolerance = 0.03;
+                    fft_config.root_freq_min = 20.0;
+                    fft_config.root_freq_max = (DEFAULT_BUFFER_SIZE as f32 / 4.0);
+                    fft_config.freq_match_distance = 5.0;
                     
                     // Only change frames_per_buffer if platform requires it
                     let new_frames = if cfg!(target_os = "linux") {
@@ -484,29 +489,28 @@ impl eframe::App for MyApp {
                         512   // Default for other platforms
                     };
                     
-                    // Only update if different to avoid unnecessary restarts
                     if old_frames != new_frames {
                         fft_config.frames_per_buffer = new_frames;
-                        debug!("Frames per buffer changed from {} to {}", old_frames, new_frames);
                     }
                 }
                 
+                // Reset resynth config
+                {
+                    let mut resynth_config = self.resynth_config.lock().unwrap();
+                    resynth_config.gain = 0.01;
+                    resynth_config.smoothing = 0.0;
+                    resynth_config.freq_scale = 1.0;
+                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;
+                }
+                
+                // Reset display settings
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
                 self.show_line_plot = true;
                 
-                // Calculate optimal size based on current sample rate
-                let sample_rate = 48000.0f64;
-                let optimal_size = calculate_optimal_buffer_size(sample_rate);
-                
-                // Fix: Get current size without holding the lock during update
-                let needs_update = {
-                    let current_size = *self.buffer_size.lock().unwrap();
-                    current_size != DEFAULT_BUFFER_SIZE
-                };
-                
-                if needs_update {
+                // Reset buffer size
+                if *self.buffer_size.lock().unwrap() != DEFAULT_BUFFER_SIZE {
                     self.update_buffer_size(DEFAULT_BUFFER_SIZE);
                 }
                 
