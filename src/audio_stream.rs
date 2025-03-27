@@ -234,14 +234,14 @@ pub fn build_input_stream(
     
     // Get frames_per_buffer from FFTConfig if available
     let frames_per_buffer = if cfg!(target_os = "linux") {
-        1024u32  // Larger buffer for Linux stability
+        2048u32  // Increased from 1024 for more stability
     } else {
         match sample_rate as u32 {
-            48000 => 512u32,
-            44100 => 512u32,
-            96000 => 1024u32,
+            48000 => 1024u32,  // Increased from 512
+            44100 => 1024u32,  // Increased from 512
+            96000 => 2048u32,  // Increased from 1024
             _ => {
-                let mut base_size = 512u32;
+                let mut base_size = 1024u32;  // Increased base size
                 while base_size * 2 <= (sample_rate / 50.0) as u32 {
                     base_size *= 2;
                 }
@@ -261,7 +261,7 @@ pub fn build_input_stream(
     let latency = if cfg!(target_os = "linux") {
         device_info.default_high_input_latency  // Use higher latency on Linux
     } else {
-        device_info.default_low_input_latency.min(0.005)
+        device_info.default_low_input_latency.min(0.010)  // Increased from 0.005
     };
 
     let input_params = pa::StreamParameters::<f32>::new(

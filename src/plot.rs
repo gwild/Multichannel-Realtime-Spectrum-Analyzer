@@ -106,7 +106,7 @@ impl MyApp {
             y_scale: 80.0,
             alpha: 255,
             bar_width: 5.0,
-            show_line_plot: true,
+            show_line_plot: false,
             last_repaint: Instant::now(),
             shutdown_flag,
         };
@@ -497,7 +497,7 @@ impl eframe::App for MyApp {
                 // Reset resynth config
                 {
                     let mut resynth_config = self.resynth_config.lock().unwrap();
-                    resynth_config.gain = 0.01;
+                    resynth_config.gain = 0.25;
                     resynth_config.smoothing = 0.0;
                     resynth_config.freq_scale = 1.0;
                     resynth_config.update_rate = DEFAULT_UPDATE_RATE;
@@ -507,7 +507,7 @@ impl eframe::App for MyApp {
                 self.y_scale = 80.0;
                 self.alpha = 255;
                 self.bar_width = 5.0;
-                self.show_line_plot = true;
+                self.show_line_plot = false;
                 
                 // Reset buffer size
                 if *self.buffer_size.lock().unwrap() != DEFAULT_BUFFER_SIZE {
