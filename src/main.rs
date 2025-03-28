@@ -225,12 +225,14 @@ fn run() -> Result<()> {
     let running = Arc::new(AtomicBool::new(false));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let stream_ready = Arc::new(AtomicBool::new(false));
+    let shutdown_complete = Arc::new(AtomicBool::new(false));
 
     let audio_buffer_clone = Arc::clone(&audio_buffer);
     let selected_channels_clone = selected_channels.clone();
     let buffer_size_clone = Arc::clone(&buffer_size);
     let shutdown_flag_audio = Arc::clone(&shutdown_flag);
     let stream_ready_audio = Arc::clone(&stream_ready);
+    let shutdown_complete_audio = Arc::clone(&shutdown_complete);
 
     // Add before thread creation
     let resynth_config = Arc::new(Mutex::new(ResynthConfig::default()));
@@ -320,6 +322,7 @@ fn run() -> Result<()> {
             stream_ready_audio,
             fft_config_clone,
         );
+        shutdown_complete_audio.store(true, Ordering::SeqCst);
     });
 
     // Start FFT processing thread only after stream is ready
@@ -375,25 +378,25 @@ fn run() -> Result<()> {
     info!("Setting shutdown flag...");
     shutdown_flag.store(true, Ordering::SeqCst);
 
-    // Wait for threads to finish
-    if let Ok(_) = audio_thread.join() {
-        info!("Audio thread terminated successfully");
-    } else {
-        warn!("Audio thread may not have terminated cleanly");
+    // Wait for threads to finish with timeout
+    let timeout = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+
+    while start.elapsed() < timeout {
+        if shutdown_complete.load(Ordering::SeqCst) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 
-    if let Ok(_) = fft_thread.join() {
-        info!("FFT thread terminated successfully");
-    } else {
-        warn!("FFT thread may not have terminated cleanly");
+    // Clean up PortAudio
+    if let Ok(pa) = pa::PortAudio::new() {
+        if let Err(e) = pa.terminate() {
+            warn!("Error terminating PortAudio: {}", e);
+        }
     }
 
-    if let Ok(_) = resynth_thread.join() {
-        info!("Resynthesis thread terminated successfully");
-    } else {
-        warn!("Resynthesis thread may not have terminated cleanly");
-    }
-
+    info!("Application shutdown complete.");
     Ok(())
 }
 
