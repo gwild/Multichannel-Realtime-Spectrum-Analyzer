@@ -139,18 +139,18 @@ pub fn start_fft_processing(
                 spectrum.update_partials(results.clone());  // Clone for GUI
             }
 
-            // Write raw results directly to shared memory
+            // Reintroduce the direct-write approach:
             if let Some(shared) = &mut shared_partials {
                 // Create buffer with exact binary layout
                 let num_channels = results.len();
                 let partials_per_channel = results.first().map(|c| c.len()).unwrap_or(0);
-                
+
                 let mut buffer = Vec::with_capacity(8 + num_channels * partials_per_channel * 8);
-                
+
                 // Write header: u32 channels, u32 partials_per_channel
                 buffer.extend_from_slice(&(num_channels as u32).to_le_bytes());
                 buffer.extend_from_slice(&(partials_per_channel as u32).to_le_bytes());
-                
+
                 // Write raw data exactly as it exists in memory
                 for channel in &results {
                     for &(freq, amp) in channel {
@@ -158,16 +158,17 @@ pub fn start_fft_processing(
                         buffer.extend_from_slice(&amp.to_le_bytes());
                     }
                 }
-                
+
                 // Direct byte-for-byte write to shared memory
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .write(true)
-                    .open(&shared.path)  // REMOVED .truncate(true)
+                    .open(&shared.path)
                 {
                     file.set_len(buffer.len() as u64).unwrap();  // Resize file to exact data size
                     file.write_all(&buffer).unwrap();
                 }
-                
+
+                // Optionally update shared.data
                 shared.data = results.clone();
             }
 
