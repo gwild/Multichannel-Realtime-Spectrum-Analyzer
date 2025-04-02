@@ -573,8 +573,14 @@ impl eframe::App for MyApp {
                             .enumerate()
                             .map(|(i, &complex_val)| {
                                 let freq = i as f64 * freq_step as f64;
-                                let mag = ((complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt() / 4.0) as f64;
-                                [freq, mag]
+                                // Convert to dB scale matching the bar chart
+                                let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+                                let db = if magnitude > 1e-10 {
+                                    20.0 * (magnitude + 1e-10).log10()
+                                } else {
+                                    0.0
+                                };
+                                [freq, db.max(0.0) as f64]  // Match bar chart dB scaling
                             })
                             .collect();
 
