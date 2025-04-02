@@ -16,6 +16,7 @@ use std::io::Write;  // For write_all
 use crate::SharedMemory;  // Import the struct from main.rs
 use bincode;
 use serde_json;
+use std::sync::mpsc::{channel, Sender, Receiver};
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
@@ -67,6 +68,58 @@ macro_rules! crosstalk_info {
     }
 }
 
+// Add a new struct to hold both types of FFT data
+pub struct FFTData {
+    partials: Vec<Vec<(f32, f32)>>,
+    line_data: Vec<Vec<(f32, f32)>>,
+}
+
+/// Computes both partial data and full FFT line data
+fn compute_all_fft_data(
+    all_channel_data: &[Vec<f32>],
+    channel_index: usize,
+    sample_rate: u32, 
+    config: &FFTConfig,
+) -> (Vec<(f32, f32)>, Vec<(f32, f32)>) {
+    let signal = &all_channel_data[channel_index];
+    
+    // Apply window to signal
+    let windowed_signal = apply_window(&signal, config.window_type);
+
+    // Perform FFT
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(windowed_signal.len());
+    let mut indata = windowed_signal;
+    let mut spectrum = fft.make_output_vec();
+    
+    if let Err(e) = fft.process(&mut indata, &mut spectrum) {
+        error!("FFT computation error: {:?}", e);
+        return (vec![(0.0, 0.0); NUM_PARTIALS], Vec::new());
+    }
+
+    // Convert to dB scale
+    let freq_step = sample_rate as f32 / signal.len() as f32;
+    let line_data: Vec<(f32, f32)> = spectrum
+        .par_iter()
+        .enumerate()
+        .map(|(i, &complex_val)| {
+            let frequency = i as f32 * freq_step;
+            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+            let db = if magnitude > 1e-10 {
+                20.0 * (magnitude + 1e-10).log10()
+            } else {
+                0.0
+            };
+            (frequency, db.max(0.0))
+        })
+        .collect();
+
+    // Compute partials using existing logic
+    let partials = compute_spectrum(all_channel_data, channel_index, sample_rate, config, None);
+
+    (partials, line_data)
+}
+
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
     audio_buffer: Arc<RwLock<CircularBuffer>>,
@@ -75,13 +128,8 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
-    shared_partials: Option<SharedMemory>,
+    mut shared_partials: Option<SharedMemory>,
 ) {
-    let _prev_results = vec![vec![(0.0, 0.0); NUM_PARTIALS]; selected_channels.len()];
-
-    // At start of function, make shared_partials mutable
-    let mut shared_partials = shared_partials.clone();  // Make mutable to allow assignment
-
     while !shutdown_flag.load(Ordering::Relaxed) {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let buffer_clone = {
@@ -94,33 +142,30 @@ pub fn start_fft_processing(
                 .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
                 .collect();
 
-            // Get crosstalk settings from config
             let config = fft_config.lock().unwrap();
-            let crosstalk_enabled = config.crosstalk_enabled;
-            let crosstalk_threshold = config.crosstalk_threshold;
-            let crosstalk_reduction = config.crosstalk_reduction;
             
-            // Process each channel independently first to get spectra
-            let mut all_channels_spectra: Vec<Vec<(f32, f32)>> = Vec::new();
+            // Process each channel to get both partial and line data
+            let mut all_channels_partials = Vec::new();
+            let mut all_channels_line_data = Vec::new();
             
             for (channel_index, _) in selected_channels.iter().enumerate() {
-                let spectrum = compute_spectrum(
+                let (partials, line_data) = compute_all_fft_data(
                     &channel_buffers,
                     channel_index,     
                     sample_rate, 
-                    &*config,
-                    None
+                    &config
                 );
                 
-                all_channels_spectra.push(spectrum);
+                all_channels_partials.push(partials);
+                all_channels_line_data.push(line_data);
             }
-            
-            // Now apply frequency-domain crosstalk filtering if enabled
-            let all_channels_results = if crosstalk_enabled {
+
+            // Apply crosstalk filtering if enabled
+            let results = if config.crosstalk_enabled {
                 filter_crosstalk_frequency_domain(
-                    &mut all_channels_spectra,
-                    crosstalk_threshold,
-                    crosstalk_reduction,
+                    &mut all_channels_partials,
+                    config.crosstalk_threshold,
+                    config.crosstalk_reduction,
                     config.harmonic_tolerance,
                     config.root_freq_min,
                     config.root_freq_max,
@@ -128,18 +173,16 @@ pub fn start_fft_processing(
                     sample_rate
                 )
             } else {
-                all_channels_spectra
+                all_channels_partials
             };
 
-            // After results is updated with new FFT data
-            let results = all_channels_results;  // Get the new results
-
-            // Then update GUI
+            // Update GUI with both types of data
             if let Ok(mut spectrum) = spectrum_app.lock() {
-                spectrum.update_partials(results.clone());  // Clone for GUI
+                spectrum.update_partials(results.clone());
+                spectrum.update_fft_line_data(all_channels_line_data);
             }
 
-            // Reintroduce the direct-write approach:
+            // Handle shared memory updates as before
             if let Some(shared) = &mut shared_partials {
                 // Create buffer with exact binary layout
                 let num_channels = results.len();
@@ -171,9 +214,6 @@ pub fn start_fft_processing(
                 // Optionally update shared.data
                 shared.data = results.clone();
             }
-
-            // Give other threads more time to run
-            thread::sleep(Duration::from_millis(10));
         }));
 
         if let Err(e) = result {
@@ -183,9 +223,12 @@ pub fn start_fft_processing(
             error!("Failed to allocate FFT buffer");
             warn!("Buffer size mismatch, adjusting...");
         }
+
+        thread::sleep(Duration::from_millis(10));
     }
     info!("FFT processing thread shutting down.");
 }
+
 /// Extracts data for a specific channel from the interleaved buffer.
 pub fn extract_channel_data(buffer: &[f32], channel: usize, num_channels: usize) -> Vec<f32> {
     buffer

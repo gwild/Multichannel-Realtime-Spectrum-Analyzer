@@ -25,6 +25,7 @@ pub struct SpectrumApp {
     partial_textures: Vec<Option<egui::TextureHandle>>,
     freq_axis_lines: Vec<Vec<[f32; 2]>>,
     num_channels: usize,
+    fft_line_data: Vec<Vec<(f32, f32)>>,  // Add this field
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -35,6 +36,7 @@ impl SpectrumApp {
             partial_textures: vec![None; num_channels],
             freq_axis_lines: vec![vec![]; 2],
             num_channels,
+            fft_line_data: Vec::new(),  // Initialize empty
         }
     }
 
@@ -56,6 +58,14 @@ impl SpectrumApp {
     /// Get a copy of the current spectral data in absolute values (matching GUI display)
     pub fn clone_absolute_data(&self) -> Vec<Vec<(f32, f32)>> {
         self.absolute_values.clone()
+    }
+
+    pub fn update_fft_line_data(&mut self, data: Vec<Vec<(f32, f32)>>) {
+        self.fft_line_data = data;
+    }
+
+    pub fn get_fft_line_data(&self) -> &Vec<Vec<(f32, f32)>> {
+        &self.fft_line_data
     }
 }
 
@@ -552,44 +562,20 @@ impl eframe::App for MyApp {
 
             // Line plots without legend names - more memory efficient
             let all_line_plots: Vec<egui::plot::Line> = if self.show_line_plot {
-                (0..absolute_values.len())
-                    .map(|channel| {
-                        let fft_config = self.fft_config.lock().unwrap();
-                        let buffer = self.audio_buffer.read().unwrap();
-                        let buffer_data = buffer.clone_data();
-                        
-                        let channel_data = extract_channel_data(&buffer_data, channel, fft_config.num_channels);
-                        let windowed = apply_window(&channel_data, fft_config.window_type);
-                        
-                        let mut planner = RealFftPlanner::<f32>::new();
-                        let fft = planner.plan_fft_forward(windowed.len());
-                        let mut spectrum = fft.make_output_vec();
-                        let _ = fft.process(&mut windowed.clone(), &mut spectrum);
-                        
-                        let freq_step = 48000.0 / windowed.len() as f32;
-                        let points: Vec<[f64; 2]> = spectrum
-                            .iter()
-                            .take((fft_config.max_frequency as f32 / freq_step) as usize)
-                            .enumerate()
-                            .map(|(i, &complex_val)| {
-                                let freq = i as f64 * freq_step as f64;
-                                // Convert to dB scale matching the bar chart
-                                let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
-                                let db = if magnitude > 1e-10 {
-                                    20.0 * (magnitude + 1e-10).log10()
-                                } else {
-                                    0.0
-                                };
-                                [freq, db.max(0.0) as f64]  // Match bar chart dB scaling
-                            })
-                            .collect();
+                let spectrum = self.spectrum.lock().unwrap();
+                let fft_data = spectrum.get_fft_line_data();
+                
+                fft_data.iter().enumerate().map(|(channel, points)| {
+                    let color = self.colors[channel % self.colors.len()]
+                        .linear_multiply(self.alpha as f32 / 255.0);
 
-                        let color = self.colors[channel % self.colors.len()]
-                            .linear_multiply(self.alpha as f32 / 255.0);
-
-                        egui::plot::Line::new(points).color(color)
-                    })
-                    .collect()
+                    egui::plot::Line::new(
+                        points.iter()
+                            .map(|&(freq, mag)| [freq as f64, mag as f64])
+                            .collect::<Vec<[f64; 2]>>()
+                    )
+                    .color(color)
+                }).collect()
             } else {
                 Vec::new()
             };

@@ -1,14 +1,20 @@
 use rayon::prelude::*;
 
 pub struct SpectralDisplay {
-    channels: Vec<Vec<(f32, f32)>>
+    channels: Vec<Vec<(f32, f32)>>,
+    fft_line_data: Vec<Vec<(f32, f32)>>,
 }
 
 impl SpectralDisplay {
     pub fn new(channels: &[Vec<(f32, f32)>]) -> Self {
         Self {
-            channels: channels.to_vec()
+            channels: channels.to_vec(),
+            fft_line_data: Vec::new(),
         }
+    }
+
+    pub fn update_fft_data(&mut self, fft_data: Vec<Vec<(f32, f32)>>) {
+        self.fft_line_data = fft_data;
     }
 
     pub fn format_all(&self) -> Vec<String> {
