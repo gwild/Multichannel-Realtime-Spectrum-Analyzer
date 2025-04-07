@@ -1,4 +1,5 @@
 use rayon::prelude::*;
+use log::warn;
 
 pub struct SpectralDisplay {
     channels: Vec<Vec<(f32, f32)>>,
@@ -14,6 +15,9 @@ impl SpectralDisplay {
     }
 
     pub fn update_fft_data(&mut self, fft_data: Vec<Vec<(f32, f32)>>) {
+        if fft_data.is_empty() {
+            warn!("Received empty fft_data! This may indicate a problem reading from the audio stream.");
+        }
         self.fft_line_data = fft_data;
     }
 

@@ -14,9 +14,6 @@ use std::f32::consts::PI;
 use crate::utils::DEFAULT_BUFFER_SIZE; // Make sure to import the constant
 use std::io::Write;  // For write_all
 use crate::SharedMemory;  // Import the struct from main.rs
-use bincode;
-use serde_json;
-use std::sync::mpsc::{channel, Sender, Receiver};
 
 pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
 
