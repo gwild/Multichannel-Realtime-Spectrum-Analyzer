@@ -274,7 +274,7 @@ fn run() -> Result<()> {
         let shared_memory_path = format!("/dev/shm/{}", shmem_name);
         let file = std::fs::File::create(&shared_memory_path)?;
         file.set_len(4 * 1024 * 1024)?;
-        println!("SHMEM_READY:{}", shmem_name);
+        println!("SHMEM_READY:{}:{}", shmem_name, selected_channels.len());
         
         Some(SharedMemory {
             data: Vec::new(),

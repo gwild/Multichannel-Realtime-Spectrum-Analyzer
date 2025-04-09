@@ -179,36 +179,37 @@ pub fn start_fft_processing(
                 spectrum.update_fft_line_data(all_channels_line_data);
             }
 
-            // Handle shared memory updates as before
+            // Handle shared memory updates
             if let Some(shared) = &mut shared_partials {
-                // Create buffer with exact binary layout
                 let num_channels = results.len();
-                let partials_per_channel = results.first().map(|c| c.len()).unwrap_or(0);
+                
+                // Each channel has 12 partials, each partial has freq+amp (8 bytes)
+                let buffer_size = num_channels * 12 * 8;  // Should be 4 * 12 * 8 = 384 bytes
+                let mut buffer = Vec::with_capacity(buffer_size);
 
-                let mut buffer = Vec::with_capacity(8 + num_channels * partials_per_channel * 8);
-
-                // Write header: u32 channels, u32 partials_per_channel
-                buffer.extend_from_slice(&(num_channels as u32).to_le_bytes());
-                buffer.extend_from_slice(&(partials_per_channel as u32).to_le_bytes());
-
-                // Write raw data exactly as it exists in memory
-                for channel in &results {
-                    for &(freq, amp) in channel {
+                // Write all partials for each channel
+                for channel_data in &results {
+                    // Ensure exactly 12 partials per channel
+                    for i in 0..12 {
+                        let (freq, amp) = if i < channel_data.len() {
+                            channel_data[i]
+                        } else {
+                            (0.0, 0.0)  // Pad with zeros if less than 12 partials
+                        };
                         buffer.extend_from_slice(&freq.to_le_bytes());
                         buffer.extend_from_slice(&amp.to_le_bytes());
                     }
                 }
 
-                // Direct byte-for-byte write to shared memory
+                // Write to shared memory file
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .write(true)
                     .open(&shared.path)
                 {
-                    file.set_len(buffer.len() as u64).unwrap();  // Resize file to exact data size
+                    file.set_len(buffer.len() as u64).unwrap();
                     file.write_all(&buffer).unwrap();
                 }
 
-                // Optionally update shared.data
                 shared.data = results.clone();
             }
         }));
