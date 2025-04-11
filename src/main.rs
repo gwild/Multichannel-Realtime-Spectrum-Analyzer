@@ -267,14 +267,18 @@ fn run() -> Result<()> {
 
     let selected_output_device = output_devices[output_device_index];
 
+    // After device selection but before starting threads:
+    let control_path = "/dev/shm/audio_control";
+    let mut control_file = std::fs::File::create(&control_path)?;
+    writeln!(control_file, "{}\n{}", std::process::id(), selected_channels.len())?;
+
     // Create shared memory without mutex BEFORE threads start
     let shared_partials = if std::env::args().any(|arg| arg == "--gui-ipc") {
         info!("Starting in GUI+IPC mode");
-        let shmem_name = format!("audio_streaming_partials_{}", std::process::id());
+        let shmem_name = "audio_peaks";
         let shared_memory_path = format!("/dev/shm/{}", shmem_name);
         let file = std::fs::File::create(&shared_memory_path)?;
         file.set_len(4 * 1024 * 1024)?;
-        println!("SHMEM_READY:{}:{}", shmem_name, selected_channels.len());
         
         Some(SharedMemory {
             data: Vec::new(),
