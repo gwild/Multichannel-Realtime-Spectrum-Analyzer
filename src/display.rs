@@ -25,9 +25,19 @@ impl SpectralDisplay {
         self.channels.par_iter()
             .enumerate()
             .map(|(channel, values)| {
-                let magnitudes = values.par_iter()
-                    .map(|&(freq, raw_val)| {
-                        format!("({:.2}, {:.0})", freq, raw_val)
+                // Always format exactly 12 values
+                let magnitudes = (0..12)
+                    .map(|i| {
+                        if i < values.len() {
+                            let (freq, raw_val) = values[i];
+                            if raw_val > 0.0 {
+                                format!("({:.2}, {:.0})", freq, raw_val)
+                            } else {
+                                "(0.00, 0)".to_string()
+                            }
+                        } else {
+                            "(0.00, 0)".to_string()
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join(", ");

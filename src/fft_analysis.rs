@@ -179,12 +179,12 @@ pub fn start_fft_processing(
                 spectrum.update_fft_line_data(all_channels_line_data);
             }
 
-            // Handle shared memory updates
+            // Handle shared memory updates - use exact same data as GUI
             if let Some(shared) = &mut shared_partials {
                 let num_channels = results.len();
                 
                 // Each channel has 12 partials, each partial has freq+amp (8 bytes)
-                let buffer_size = num_channels * 12 * 8;  // Should be 4 * 12 * 8 = 384 bytes
+                let buffer_size = num_channels * 12 * 8;
                 let mut buffer = Vec::with_capacity(buffer_size);
 
                 // Write all partials for each channel
@@ -206,8 +206,12 @@ pub fn start_fft_processing(
                     .write(true)
                     .open(&shared.path)
                 {
-                    file.set_len(buffer.len() as u64).unwrap();
-                    file.write_all(&buffer).unwrap();
+                    if let Err(e) = file.set_len(buffer.len() as u64) {
+                        error!("Failed to set shared memory size: {:?}", e);
+                    }
+                    if let Err(e) = file.write_all(&buffer) {
+                        error!("Failed to write to shared memory: {:?}", e);
+                    }
                 }
 
                 shared.data = results.clone();
@@ -217,9 +221,6 @@ pub fn start_fft_processing(
         if let Err(e) = result {
             error!("FFT computation failed: {:?}", e);
             warn!("Panic in FFT thread: {:?}", e);
-            
-            error!("Failed to allocate FFT buffer");
-            warn!("Buffer size mismatch, adjusting...");
         }
 
         thread::sleep(Duration::from_millis(10));
@@ -368,59 +369,64 @@ pub fn compute_spectrum(
         return vec![(0.0, 0.0); NUM_PARTIALS];
     }
 
-    // 3. Convert to absolute magnitudes and scale
+    // 3. First collect all valid magnitudes above threshold
     let freq_step = sample_rate as f32 / signal.len() as f32;
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum
         .par_iter()
         .enumerate()
-        .map(|(i, &complex_val)| {
+        .filter_map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
             let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
-            // Convert to dB with floor at 0, matching Python
-            let db = if magnitude > 1e-10 {
-                20.0 * (magnitude + 1e-10).log10()
+            
+            // Only compute dB if magnitude is significant
+            if magnitude > 1e-10 {
+                let db = 20.0 * magnitude.log10();
+                // Only include if above threshold and in frequency range
+                if db > config.magnitude_threshold as f32 &&
+                   frequency >= config.min_frequency as f32 && 
+                   frequency <= config.max_frequency as f32 {
+                    Some((frequency, db))
+                } else {
+                    None
+                }
             } else {
-                0.0
-            };
-            (frequency, db.max(0.0))
+                None
+            }
         })
         .collect();
 
-    // 4. Apply frequency thresholds
-    all_magnitudes.retain(|&(freq, _)| {
-        freq >= config.min_frequency as f32 && freq <= config.max_frequency as f32
-    });
+    // 4. If no peaks above threshold, return array of zeros
+    if all_magnitudes.is_empty() {
+        return vec![(0.0, 0.0); NUM_PARTIALS];
+    }
 
-    // 5. Apply magnitude threshold
-    all_magnitudes.retain(|&(_, magnitude)| {
-        magnitude >= config.magnitude_threshold as f32
-    });
+    // 5. Sort by frequency (ascending)
+    all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // 6. Sort by magnitude to get top partials
-    all_magnitudes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // After sorting by magnitude but before truncating:
-    let mut filtered_magnitudes = Vec::new();
+    // 6. Apply minimum frequency spacing while maintaining frequency order
+    let mut filtered_magnitudes: Vec<(f32, f32)> = Vec::with_capacity(NUM_PARTIALS);
     for &mag in all_magnitudes.iter() {
-        if filtered_magnitudes.iter().all(|&prev: &(f32, f32)| 
-            (mag.0 - prev.0).abs() >= config.min_freq_spacing as f32) {
+        if filtered_magnitudes.is_empty() {
             filtered_magnitudes.push(mag);
+        } else {
+            let last_freq = filtered_magnitudes.last().unwrap().0;
+            if (mag.0 - last_freq).abs() >= config.min_freq_spacing as f32 {
+                filtered_magnitudes.push(mag);
+            }
         }
         if filtered_magnitudes.len() >= NUM_PARTIALS {
             break;
         }
     }
-    all_magnitudes = filtered_magnitudes;
 
-    // 7. Sort by frequency for display
-    all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 8. Pad with zeros if needed
-    while all_magnitudes.len() < NUM_PARTIALS {
-        all_magnitudes.push((0.0, 0.0));
+    // 7. Create final result vector with proper padding
+    let mut result = Vec::with_capacity(NUM_PARTIALS);
+    result.extend(filtered_magnitudes);
+    while result.len() < NUM_PARTIALS {
+        result.push((0.0, 0.0));
     }
 
-    all_magnitudes
+    result
 }
 
 /// Window function types
