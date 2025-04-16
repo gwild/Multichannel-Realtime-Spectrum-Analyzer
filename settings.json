@@ -1,7 +1,0 @@
-{
-    "rust-analyzer.server.extraEnv": {
-        "RUSTC_WRAPPER": ""
-    },
-    "rust-analyzer.checkOnSave.enable": false,
-    "rust-analyzer.checkOnSave.command": "clippy"
-}
