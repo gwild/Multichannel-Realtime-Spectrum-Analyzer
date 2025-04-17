@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
 use log::{info, error};
 use crate::plot::SpectrumApp;
-use crate::fft_analysis::NUM_PARTIALS;
+use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use rayon::prelude::*;  // Add at top with other imports
 
 // Constants used in the code
@@ -212,13 +212,36 @@ impl Default for ResynthConfig {
 struct SynthInstance {
     partial_states: Vec<Vec<PartialState>>,
     fade_level: f32,  // 0.0 to 1.0 for crossfading
+    num_partials: usize,  // Add num_partials field
 }
 
 impl SynthInstance {
     fn new(num_channels: usize) -> Self {
         Self {
-            partial_states: vec![vec![PartialState::new(); NUM_PARTIALS]; num_channels],
+            partial_states: vec![vec![PartialState::new(); DEFAULT_NUM_PARTIALS]; num_channels],
             fade_level: 0.0,
+            num_partials: DEFAULT_NUM_PARTIALS,
+        }
+    }
+    
+    // Add method to update number of partials if needed
+    fn update_num_partials(&mut self, new_num_partials: usize) {
+        if self.num_partials == new_num_partials {
+            return; // No change needed
+        }
+        
+        // Update the stored value
+        self.num_partials = new_num_partials;
+        
+        // Resize all channel's partial_states arrays
+        for channel_states in self.partial_states.iter_mut() {
+            if channel_states.len() < new_num_partials {
+                // Need to add more partials
+                channel_states.resize_with(new_num_partials, PartialState::new);
+            } else if channel_states.len() > new_num_partials {
+                // Need to remove some partials
+                channel_states.truncate(new_num_partials);
+            }
         }
     }
 }
@@ -230,8 +253,24 @@ pub fn start_resynth_thread(
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    // Create two synthesis instances
-    let mut current_synth = SynthInstance::new(spectrum_app.lock().unwrap().clone_absolute_data().len());
+    // Get current number of partials and channels from spectrum_app
+    let (num_channels, num_partials) = {
+        let spec_app = spectrum_app.lock().unwrap();
+        (spec_app.clone_absolute_data().len(), 
+         if !spec_app.clone_absolute_data().is_empty() {
+             spec_app.clone_absolute_data()[0].len()
+         } else {
+             DEFAULT_NUM_PARTIALS
+         })
+    };
+    
+    // Create two synthesis instances with the correct number of partials
+    let mut current_synth = SynthInstance {
+        partial_states: vec![vec![PartialState::new(); num_partials]; num_channels],
+        fade_level: 0.0,
+        num_partials,
+    };
+    
     let mut next_synth = current_synth.clone();
     let mut is_crossfading = false;
     let mut crossfade_samples_remaining = 0;
@@ -296,19 +335,36 @@ pub fn start_resynth_thread(
             
             // Update with new FFT data
             let partials = spectrum_app.lock().unwrap().clone_absolute_data();
+            
+            // Update number of partials if needed
+            if !partials.is_empty() && !partials[0].is_empty() {
+                let new_num_partials = partials[0].len();
+                if next_synth.num_partials != new_num_partials {
+                    next_synth.update_num_partials(new_num_partials);
+                }
+            }
+            
             for (channel, channel_partials) in partials.iter().enumerate() {
+                // Add new channels if needed
+                while next_synth.partial_states.len() <= channel {
+                    next_synth.partial_states.push(vec![PartialState::new(); next_synth.num_partials]);
+                }
+                
                 for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                    let state = &mut next_synth.partial_states[channel][i];
-                    state.freq.update(freq * config_lock.freq_scale, config_lock.smoothing);
-                    state.amp.update(amp, config_lock.smoothing);
-                    
-                    // Update envelope with smoothing instead of direct assignment
-                    let target_envelope = if amp > 0.0 { 1.0 } else { 0.0 };
-                    state.envelope = if config_lock.smoothing == 0.0 {
-                        target_envelope
-                    } else {
-                        state.envelope * config_lock.smoothing + target_envelope * (1.0 - config_lock.smoothing)
-                    };
+                    // Make sure we don't go out of bounds with the partials
+                    if i < next_synth.partial_states[channel].len() {
+                        let state = &mut next_synth.partial_states[channel][i];
+                        state.freq.update(freq * config_lock.freq_scale, config_lock.smoothing);
+                        state.amp.update(amp, config_lock.smoothing);
+                        
+                        // Update envelope with smoothing instead of direct assignment
+                        let target_envelope = if amp > 0.0 { 1.0 } else { 0.0 };
+                        state.envelope = if config_lock.smoothing == 0.0 {
+                            target_envelope
+                        } else {
+                            state.envelope * config_lock.smoothing + target_envelope * (1.0 - config_lock.smoothing)
+                        };
+                    }
                 }
             }
             

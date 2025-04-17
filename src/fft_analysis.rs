@@ -14,8 +14,7 @@ use std::f32::consts::PI;
 use crate::utils::DEFAULT_BUFFER_SIZE; // Make sure to import the constant
 use std::io::Write;  // For write_all
 use crate::SharedMemory;  // Import the struct from main.rs
-
-pub const NUM_PARTIALS: usize = 12;  // Keep original 12 partials
+use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
 
 /// Configuration struct for FFT settings.
 pub struct FFTConfig {
@@ -34,6 +33,7 @@ pub struct FFTConfig {
     pub root_freq_min: f32,  // Add this (default: 20.0)
     pub root_freq_max: f32,  // Add this (default: DEFAULT_BUFFER_SIZE / 4)
     pub freq_match_distance: f32,  // Maximum Hz difference to consider frequencies as matching
+    pub num_partials: usize,  // Add configurable number of partials
 }
 
 impl Default for FFTConfig {
@@ -53,6 +53,7 @@ impl Default for FFTConfig {
             root_freq_max: (DEFAULT_BUFFER_SIZE as f32 / 4.0),
             freq_match_distance: 5.0,
             window_type: WindowType::Hanning,
+            num_partials: DEFAULT_NUM_PARTIALS, // Use default value from main.rs
         }
     }
 }
@@ -91,7 +92,7 @@ fn compute_all_fft_data(
     
     if let Err(e) = fft.process(&mut indata, &mut spectrum) {
         error!("FFT computation error: {:?}", e);
-        return (vec![(0.0, 0.0); NUM_PARTIALS], Vec::new());
+        return (vec![(0.0, 0.0); config.num_partials], Vec::new());
     }
 
     // Convert to dB scale
@@ -182,19 +183,20 @@ pub fn start_fft_processing(
             // Handle shared memory updates - use exact same data as GUI
             if let Some(shared) = &mut shared_partials {
                 let num_channels = results.len();
+                let num_partials = config.num_partials;
                 
-                // Each channel has 12 partials, each partial has freq+amp (8 bytes)
-                let buffer_size = num_channels * 12 * 8;
+                // Each channel has num_partials partials, each partial has freq+amp (8 bytes)
+                let buffer_size = num_channels * num_partials * 8;
                 let mut buffer = Vec::with_capacity(buffer_size);
 
                 // Write all partials for each channel
                 for channel_data in &results {
-                    // Ensure exactly 12 partials per channel
-                    for i in 0..12 {
+                    // Ensure exactly num_partials partials per channel
+                    for i in 0..num_partials {
                         let (freq, amp) = if i < channel_data.len() {
                             channel_data[i]
                         } else {
-                            (0.0, 0.0)  // Pad with zeros if less than 12 partials
+                            (0.0, 0.0)  // Pad with zeros if less than num_partials
                         };
                         buffer.extend_from_slice(&freq.to_le_bytes());
                         buffer.extend_from_slice(&amp.to_le_bytes());
@@ -366,7 +368,7 @@ pub fn compute_spectrum(
     
     if let Err(e) = fft.process(&mut indata, &mut spectrum) {
         error!("FFT computation error: {:?}", e);
-        return vec![(0.0, 0.0); NUM_PARTIALS];
+        return vec![(0.0, 0.0); config.num_partials];
     }
 
     // 3. First collect all valid magnitudes above threshold
@@ -397,14 +399,14 @@ pub fn compute_spectrum(
 
     // 4. If no peaks above threshold, return array of zeros
     if all_magnitudes.is_empty() {
-        return vec![(0.0, 0.0); NUM_PARTIALS];
+        return vec![(0.0, 0.0); config.num_partials];
     }
 
     // 5. Sort by frequency (ascending)
     all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // 6. Apply minimum frequency spacing while maintaining frequency order
-    let mut filtered_magnitudes: Vec<(f32, f32)> = Vec::with_capacity(NUM_PARTIALS);
+    let mut filtered_magnitudes: Vec<(f32, f32)> = Vec::with_capacity(config.num_partials);
     for &mag in all_magnitudes.iter() {
         if filtered_magnitudes.is_empty() {
             filtered_magnitudes.push(mag);
@@ -414,15 +416,15 @@ pub fn compute_spectrum(
                 filtered_magnitudes.push(mag);
             }
         }
-        if filtered_magnitudes.len() >= NUM_PARTIALS {
+        if filtered_magnitudes.len() >= config.num_partials {
             break;
         }
     }
 
     // 7. Create final result vector with proper padding
-    let mut result = Vec::with_capacity(NUM_PARTIALS);
+    let mut result = Vec::with_capacity(config.num_partials);
     result.extend(filtered_magnitudes);
-    while result.len() < NUM_PARTIALS {
+    while result.len() < config.num_partials {
         result.push((0.0, 0.0));
     }
 

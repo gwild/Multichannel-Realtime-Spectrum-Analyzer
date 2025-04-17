@@ -33,6 +33,16 @@ pub struct SharedMemory {
     path: String,
 }
 
+pub struct ResynthConfig {
+    pub gain: f32,
+    pub smoothing: f32,
+    pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
+    pub update_rate: f32, // How often to update synthesis (in seconds)
+}
+
+// Add a new constant to replace hardcoded 12 throughout code
+pub const DEFAULT_NUM_PARTIALS: usize = 12;
+
 fn main() {
     // Keep your existing --enable-logs code, but also respect RUST_LOG if set
     // If no RUST_LOG is set and user passes --enable-logs, default to your old logic
@@ -192,6 +202,22 @@ fn run() -> Result<()> {
     }
     info!("Selected channels: {:?}", selected_channels);
 
+    // Add prompt for number of partials here
+    println!("Enter number of partials to detect per channel (default is {}): ", DEFAULT_NUM_PARTIALS);
+    user_input.clear();
+    io::stdin().read_line(&mut user_input)?;
+    let num_partials = if user_input.trim().is_empty() {
+        DEFAULT_NUM_PARTIALS
+    } else {
+        user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid number of partials"))?
+            .max(1) // Ensure at least 1 partial
+            .min(24) // Reasonable upper limit
+    };
+    info!("Using {} partials per channel", num_partials);
+
     let buffer_size = Arc::new(Mutex::new(DEFAULT_BUFFER_SIZE));
     let audio_buffer = Arc::new(RwLock::new(CircularBuffer::new(
         DEFAULT_BUFFER_SIZE,
@@ -219,6 +245,7 @@ fn run() -> Result<()> {
     // Override only what needs to be different from defaults
     config.num_channels = selected_channels.len();
     config.frames_per_buffer = frames_per_buffer;
+    config.num_partials = num_partials;
 
     let fft_config = Arc::new(Mutex::new(config));
 
@@ -270,7 +297,7 @@ fn run() -> Result<()> {
     // After device selection but before starting threads:
     let control_path = "/dev/shm/audio_control";
     let mut control_file = std::fs::File::create(&control_path)?;
-    writeln!(control_file, "{}\n{}", std::process::id(), selected_channels.len())?;
+    writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
 
     // Create shared memory without mutex BEFORE threads start
     let shared_partials = if std::env::args().any(|arg| arg == "--gui-ipc") {

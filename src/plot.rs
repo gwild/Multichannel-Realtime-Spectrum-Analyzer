@@ -17,6 +17,7 @@ use crate::fft_analysis::{apply_window, extract_channel_data};
 use realfft::RealFftPlanner;
 use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
+use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -25,6 +26,7 @@ pub struct SpectrumApp {
     partial_textures: Vec<Option<egui::TextureHandle>>,
     freq_axis_lines: Vec<Vec<[f32; 2]>>,
     num_channels: usize,
+    num_partials: usize,  // Add num_partials field
     fft_line_data: Vec<Vec<(f32, f32)>>,  // Add this field
 }
 
@@ -32,10 +34,11 @@ pub struct SpectrumApp {
 impl SpectrumApp {
     pub fn new(num_channels: usize) -> Self {
         SpectrumApp {
-            absolute_values: vec![vec![(0.0, 0.0); 12]; num_channels],
+            absolute_values: vec![vec![(0.0, 0.0); DEFAULT_NUM_PARTIALS]; num_channels],  // Use DEFAULT_NUM_PARTIALS
             partial_textures: vec![None; num_channels],
             freq_axis_lines: vec![vec![]; 2],
             num_channels,
+            num_partials: DEFAULT_NUM_PARTIALS,  // Initialize with default
             fft_line_data: Vec::new(),  // Initialize empty
         }
     }
@@ -43,6 +46,11 @@ impl SpectrumApp {
     pub fn update_partials(&mut self, partials: Vec<Vec<(f32, f32)>>) {
         let num_channels = partials.len();
         self.absolute_values = partials;
+        
+        // Update num_partials if needed (assuming all channels have same number of partials)
+        if !self.absolute_values.is_empty() {
+            self.num_partials = self.absolute_values[0].len();
+        }
         
         // Resize textures array to match channel count
         self.partial_textures.resize_with(num_channels, || None);
@@ -636,3 +644,28 @@ pub fn run_native(
 }
 
 // Total line count: 259
+
+// Update the format_all method in display.rs to use the configured number of partials
+pub mod display_utils {
+    // This helper function formats partials with any number of partials
+    pub fn format_partials(values: &Vec<(f32, f32)>, num_partials: usize) -> String {
+        // Format exactly num_partials values
+        let magnitudes = (0..num_partials)
+            .map(|i| {
+                if i < values.len() {
+                    let (freq, raw_val) = values[i];
+                    if raw_val > 0.0 {
+                        format!("({:.2}, {:.0})", freq, raw_val)
+                    } else {
+                        "(0.00, 0)".to_string()
+                    }
+                } else {
+                    "(0.00, 0)".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        
+        magnitudes
+    }
+}
