@@ -33,13 +33,6 @@ pub struct SharedMemory {
     path: String,
 }
 
-pub struct ResynthConfig {
-    pub gain: f32,
-    pub smoothing: f32,
-    pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
-    pub update_rate: f32, // How often to update synthesis (in seconds)
-}
-
 // Add a new constant to replace hardcoded 12 throughout code
 pub const DEFAULT_NUM_PARTIALS: usize = 12;
 
