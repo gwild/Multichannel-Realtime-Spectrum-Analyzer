@@ -296,7 +296,7 @@ impl eframe::App for MyApp {
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
                     ui.label("Min Freq Spacing:");
-                    ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=80.0).text("Hz"));
+                    ui.add(egui::Slider::new(&mut fft_config.min_freq_spacing, 0.0..=500.0).text("Hz"));
                 }
                 
                 // Window Type section
