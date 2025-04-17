@@ -207,7 +207,6 @@ fn run() -> Result<()> {
             .parse::<usize>()
             .map_err(|_| anyhow!("Invalid number of partials"))?
             .max(1) // Ensure at least 1 partial
-            .min(24) // Reasonable upper limit
     };
     info!("Using {} partials per channel", num_partials);
 
@@ -218,14 +217,15 @@ fn run() -> Result<()> {
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
     let frames_per_buffer = if cfg!(target_os = "linux") {
-        1024u32  // Larger buffer for Linux stability
+        2048u32  // Larger buffer for Linux stability
     } else {
         match selected_sample_rate as u32 {
-            48000 => 512u32,
-            44100 => 512u32,
-            96000 => 1024u32,
+            48000 => 1024u32,   // Increased for better frequency resolution
+            44100 => 1024u32,   // Increased for better frequency resolution
+            96000 => 2048u32,   // Increased for higher frequency analysis
+            192000 => 4096u32,  // Added option for very high sample rates
             _ => {
-                let mut base_size = 512u32;  // Start with minimum
+                let mut base_size = 1024u32;  // Increased base size
                 while base_size * 2 <= (selected_sample_rate / 50.0) as u32 {
                     base_size *= 2;
                 }

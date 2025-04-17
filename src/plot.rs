@@ -134,7 +134,7 @@ impl MyApp {
         // is correct on startup, if current max_frequency exceeds nyquist_limit.
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
-            let nyquist_limit = (*buffer_s as f64 / 2.0).min(20000.0);
+            let nyquist_limit = (*buffer_s as f64 / 2.0).min(MAX_FREQ);
 
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
@@ -257,11 +257,11 @@ impl eframe::App for MyApp {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
                     ui.label("Min Frequency:");
-                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, 10.0..=200.0).text("Hz"));
+                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, MIN_FREQ..=200.0).text("Hz"));
                     
                     ui.label("Max Frequency:");
                     let buffer_size = *self.buffer_size.lock().unwrap();
-                    let nyquist_limit = (buffer_size as f64 / 2.0).min(20000.0);
+                    let nyquist_limit = (buffer_size as f64 / 2.0).min(MAX_FREQ);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
                     ui.label("Magnitude Threshold:");
@@ -327,12 +327,7 @@ impl eframe::App for MyApp {
                                 fft_config.window_type = WindowType::Kaiser(beta);
                             }
                         }
-                    }
-
-                    ui.separator();
-                    
-                    // Then Show FFT checkbox
-                    ui.checkbox(&mut self.show_line_plot, "Show FFT");
+                }
             });
 
             // 3) Sliders for Y scale, alpha, bar width
@@ -343,8 +338,13 @@ impl eframe::App for MyApp {
                 ui.add(egui::Slider::new(&mut self.alpha, 0..=255).text(""));
                 ui.label("Bar Width:");
                 ui.add(egui::Slider::new(&mut self.bar_width, 1.0..=10.0).text(""));
+                
+                ui.separator();
+                
+                // Show FFT checkbox moved from row 2 to here
+                ui.checkbox(&mut self.show_line_plot, "Show FFT");
             });
-            
+
             // 4) Volume and Smoothing row + Crosstalk checkbox + Frequency Scale
             ui.horizontal(|ui| {
                 // Volume slider (exactly matching update rate slider pattern)

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
 use std::f32::consts::PI;
-use crate::utils::DEFAULT_BUFFER_SIZE; // Make sure to import the constant
+use crate::utils::{DEFAULT_BUFFER_SIZE, MAX_FREQ, MIN_FREQ}; // Update imports
 use std::io::Write;  // For write_all
 use crate::SharedMemory;  // Import the struct from main.rs
 use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
@@ -39,8 +39,8 @@ pub struct FFTConfig {
 impl Default for FFTConfig {
     fn default() -> Self {
         Self {
-            min_frequency: 20.0,
-            max_frequency:  (DEFAULT_BUFFER_SIZE as f64 / 4.0),
+            min_frequency: MIN_FREQ,
+            max_frequency: MAX_FREQ,
             magnitude_threshold: 6.0, 
             min_freq_spacing: 20.0,
             num_channels: 1,
