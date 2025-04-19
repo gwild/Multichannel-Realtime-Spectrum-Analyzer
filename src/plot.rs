@@ -600,6 +600,7 @@ impl eframe::App for MyApp {
                 .include_x(max_freq as f64)
                 .include_y(0.0)
                 .include_y(self.y_scale as f64)
+                .x_axis_formatter(|value, _range| format!("{} Hz", value as i32))
                 .show(ui, |plot_ui| {
                     // Draw both bar charts and line plots
                     for bar_chart in all_bar_charts {
@@ -616,7 +617,7 @@ impl eframe::App for MyApp {
                 // ui.label("Channel Results:");
                 let display = SpectralDisplay::new(&absolute_values);
                 for line in display.format_all() {
-                    ui.label(line);
+                    ui.label(egui::RichText::new(line).size(8.0));
                 }
             });
         });

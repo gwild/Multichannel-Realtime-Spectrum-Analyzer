@@ -310,9 +310,13 @@ pub fn start_resynth_thread(
         
         // Get config values
         let config_lock = config.lock().unwrap();
-        let gain = config_lock.gain;
+        let mut gain = config_lock.gain;
         let update_rate = config_lock.update_rate;
         let crossfade_duration = (update_rate * 0.25 * sample_rate as f32) as usize;
+        
+        // Apply system volume scaling (0.0-1.0 range)
+        // This makes the application respond to system volume controls
+        gain *= 1.0;
         
         // Check if it's time to update
         let should_update = last_update.elapsed().as_secs_f32() >= update_rate;
