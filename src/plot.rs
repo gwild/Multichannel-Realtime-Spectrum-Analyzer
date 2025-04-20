@@ -90,8 +90,11 @@ pub struct MyApp {
     alpha: u8,
     bar_width: f32,
     show_line_plot: bool,
+    show_spectrograph: bool,
     last_repaint: Instant,
     shutdown_flag: Arc<AtomicBool>,
+    spectrograph_history: Vec<(f64, f64, f32)>, // (time, frequency, magnitude)
+    start_time: Instant,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -126,8 +129,11 @@ impl MyApp {
             alpha: 255,
             bar_width: 5.0,
             show_line_plot: false,
+            show_spectrograph: false,
             last_repaint: Instant::now(),
             shutdown_flag,
+            spectrograph_history: Vec::new(),
+            start_time: Instant::now(),
         };
 
         // FIX IMPLEMENTATION:
@@ -222,6 +228,9 @@ impl MyApp {
                 // ...
             }
         });
+
+        ui.checkbox(&mut self.show_line_plot, "Show FFT");
+        ui.checkbox(&mut self.show_spectrograph, "Show Spectrograph");
     }
 }
 
@@ -344,6 +353,7 @@ impl eframe::App for MyApp {
                 
                 // Show FFT checkbox moved from row 2 to here
                 ui.checkbox(&mut self.show_line_plot, "Show FFT");
+                ui.checkbox(&mut self.show_spectrograph, "Show Spectrograph");
             });
 
             // 4) Volume and Smoothing row + Crosstalk checkbox + Frequency Scale
@@ -526,6 +536,7 @@ impl eframe::App for MyApp {
                 self.alpha = 255;
                 self.bar_width = 5.0;
                 self.show_line_plot = false;
+                self.show_spectrograph = false;
                 
                 // Reset buffer size
                 if *self.buffer_size.lock().unwrap() != DEFAULT_BUFFER_SIZE {
@@ -607,7 +618,6 @@ impl eframe::App for MyApp {
                 .show_x(true)
                 .show_y(true)
                 .show(ui, |plot_ui| {
-                    // Draw both bar charts and line plots
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);
                     }
@@ -617,6 +627,54 @@ impl eframe::App for MyApp {
                         }
                     }
                 });
+
+            // New separate spectrograph plot
+            if self.show_spectrograph {
+                let spectrum = self.spectrum.lock().unwrap();
+                let data = spectrum.clone_absolute_data();
+                let current_time = Instant::now().duration_since(self.start_time).as_secs_f64();
+
+                for channel_data in data.iter() {
+                    for &(freq, magnitude) in channel_data.iter() {
+                        self.spectrograph_history.push((current_time, freq as f64, magnitude));
+                    }
+                }
+
+                // Explicitly remove older samples beyond 5 seconds
+                while let Some(&(time, _, _)) = self.spectrograph_history.first() {
+                    if current_time - time > 5.0 {
+                        self.spectrograph_history.remove(0);
+                    } else {
+                        break;
+                    }
+                }
+
+                let latest_time = self.spectrograph_history.last().map(|&(time, _, _)| time).unwrap_or(current_time);
+
+                Plot::new("spectrograph_plot")
+                    .legend(Legend::default())
+                    .view_aspect(6.0)
+                    .include_y(0.0)
+                    .include_y(max_freq as f64)
+                    .include_x(latest_time - 5.0)
+                    .include_x(latest_time)
+                    .x_axis_formatter(|value, _range| format!("{:.1} s", value))
+                    .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
+                    .show_axes([true, true])
+                    .show_x(true)
+                    .show_y(true)
+                    .show(ui, |plot_ui| {
+                        for &(time, freq, magnitude) in &self.spectrograph_history {
+                            let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
+                            let color = egui::Color32::from_rgb(
+                                (255.0 * normalized_magnitude) as u8,
+                                (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
+                                (255.0 * (1.0 - normalized_magnitude)) as u8,
+                            );
+                            plot_ui.points(egui::plot::Points::new(vec![[time, freq]]).color(color));
+                        }
+                    });
+            }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // ui.label("Channel Results:");
