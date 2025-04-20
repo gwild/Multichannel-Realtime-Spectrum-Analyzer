@@ -19,7 +19,13 @@ use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use egui::widgets::plot::uniform_grid_spacer;
+use std::collections::VecDeque;
+use std::collections::BTreeMap;
 
+struct SpectrographSlice {
+    time: f64,
+    data: Vec<(f64, f32)>, // (frequency, magnitude)
+}
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 pub struct SpectrumApp {
@@ -93,7 +99,7 @@ pub struct MyApp {
     show_spectrograph: bool,
     last_repaint: Instant,
     shutdown_flag: Arc<AtomicBool>,
-    spectrograph_history: Vec<(f64, f64, f32)>, // (time, frequency, magnitude)
+    spectrograph_history: VecDeque<SpectrographSlice>,
     start_time: Instant,
 }
 
@@ -132,7 +138,7 @@ impl MyApp {
             show_spectrograph: false,
             last_repaint: Instant::now(),
             shutdown_flag,
-            spectrograph_history: Vec::new(),
+            spectrograph_history: VecDeque::new(),
             start_time: Instant::now(),
         };
 
@@ -253,7 +259,7 @@ impl eframe::App for MyApp {
         }
 
         // Force continuous updates every 100 ms
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(16)); // ~60 FPS
 
         ctx.set_visuals(egui::Visuals::dark());
 
@@ -628,53 +634,68 @@ impl eframe::App for MyApp {
                     }
                 });
 
-            // New separate spectrograph plot
-            if self.show_spectrograph {
+            // Optimized spectrograph update logic
+            let current_time = Instant::now().duration_since(self.start_time).as_secs_f64();
+            let data = {
                 let spectrum = self.spectrum.lock().unwrap();
-                let data = spectrum.clone_absolute_data();
-                let current_time = Instant::now().duration_since(self.start_time).as_secs_f64();
+                spectrum.clone_absolute_data()
+            };
 
-                for channel_data in data.iter() {
-                    for &(freq, magnitude) in channel_data.iter() {
-                        self.spectrograph_history.push((current_time, freq as f64, magnitude));
-                    }
+            let mut slice_data = Vec::new();
+            for channel_data in data.iter() {
+                for &(freq, magnitude) in channel_data.iter() {
+                    slice_data.push((freq as f64, magnitude));
                 }
+            }
 
-                // Explicitly remove older samples beyond 5 seconds
-                while let Some(&(time, _, _)) = self.spectrograph_history.first() {
-                    if current_time - time > 5.0 {
-                        self.spectrograph_history.remove(0);
-                    } else {
-                        break;
-                    }
+            let is_new_data = self.spectrograph_history.back().map_or(true, |last| last.data != slice_data);
+            if is_new_data || self.spectrograph_history.is_empty() {
+                self.spectrograph_history.push_back(SpectrographSlice {
+                    time: current_time,
+                    data: slice_data,
+                });
+            } else {
+                if let Some(last) = self.spectrograph_history.back() {
+                    self.spectrograph_history.push_back(SpectrographSlice {
+                        time: current_time,
+                        data: last.data.clone(),
+                    });
                 }
+            }
 
-                let latest_time = self.spectrograph_history.last().map(|&(time, _, _)| time).unwrap_or(current_time);
+            while let Some(front) = self.spectrograph_history.front() {
+                if current_time - front.time > 5.0 {
+                    self.spectrograph_history.pop_front();
+                } else {
+                    break;
+                }
+            }
 
-                Plot::new("spectrograph_plot")
-                    .legend(Legend::default())
-                    .view_aspect(6.0)
-                    .include_y(0.0)
-                    .include_y(max_freq as f64)
-                    .include_x(latest_time - 5.0)
-                    .include_x(latest_time)
-                    .x_axis_formatter(|value, _range| format!("{:.1} s", value))
-                    .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
-                    .show_axes([true, true])
-                    .show_x(true)
-                    .show_y(true)
-                    .show(ui, |plot_ui| {
-                        for &(time, freq, magnitude) in &self.spectrograph_history {
+            Plot::new("spectrograph_plot")
+                .legend(Legend::default())
+                .view_aspect(6.0)
+                .include_y(0.0)
+                .include_y(max_freq as f64)
+                .include_x(current_time - 5.0)
+                .include_x(current_time)
+                .x_axis_formatter(|value, _range| format!("{:.1} s", value))
+                .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
+                .show_axes([true, true])
+                .show_x(true)
+                .show_y(true)
+                .show(ui, |plot_ui| {
+                    for slice in &self.spectrograph_history {
+                        for &(freq, magnitude) in &slice.data {
                             let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
                             let color = egui::Color32::from_rgb(
                                 (255.0 * normalized_magnitude) as u8,
                                 (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
                                 (255.0 * (1.0 - normalized_magnitude)) as u8,
                             );
-                            plot_ui.points(egui::plot::Points::new(vec![[time, freq]]).color(color));
+                            plot_ui.points(egui::plot::Points::new(vec![[slice.time, freq]]).color(color).radius(2.0));
                         }
-                    });
-            }
+                    }
+                });
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // ui.label("Channel Results:");
