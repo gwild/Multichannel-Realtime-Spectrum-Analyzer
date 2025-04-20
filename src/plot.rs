@@ -1,7 +1,7 @@
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 use std::sync::{Arc, Mutex};
 use eframe::egui;
-use egui::plot::{Plot, BarChart};
+use egui::plot::{Plot, BarChart, Legend};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
@@ -18,6 +18,7 @@ use realfft::RealFftPlanner;
 use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
+use egui::widgets::plot::uniform_grid_spacer;
 
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -265,7 +266,7 @@ impl eframe::App for MyApp {
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
                     ui.label("Magnitude Threshold:");
-                    ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=30.0));
+                    ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=60.0));
                 });
             }
 
@@ -351,8 +352,7 @@ impl eframe::App for MyApp {
                 ui.label("Volume:");
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
                     ui.add(
-                        egui::Slider::new(&mut resynth_config.gain, 0.01..=2.0)
-                            .logarithmic(true)
+                        egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0)
                             .text(""),
                     );
                 }
@@ -594,13 +594,18 @@ impl eframe::App for MyApp {
             };
 
             Plot::new("spectrum_plot")
-                .legend(egui::plot::Legend::default())
+                .legend(Legend::default())
                 .view_aspect(6.0)
                 .include_x(0.0)
                 .include_x(max_freq as f64)
                 .include_y(0.0)
                 .include_y(self.y_scale as f64)
                 .x_axis_formatter(|value, _range| format!("{} Hz", value as i32))
+                .y_axis_formatter(|value, _range| format!("{} dB", value as i32))
+                .y_grid_spacer(uniform_grid_spacer(|_input| [10.0, 20.0, 50.0]))
+                .show_axes([true, true])
+                .show_x(true)
+                .show_y(true)
                 .show(ui, |plot_ui| {
                     // Draw both bar charts and line plots
                     for bar_chart in all_bar_charts {
