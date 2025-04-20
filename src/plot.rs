@@ -22,9 +22,9 @@ use egui::widgets::plot::uniform_grid_spacer;
 use std::collections::VecDeque;
 use std::collections::BTreeMap;
 
-struct SpectrographSlice {
-    time: f64,
-    data: Vec<(f64, f32)>, // (frequency, magnitude)
+pub struct SpectrographSlice {
+    pub time: f64,
+    pub data: Vec<(f64, f32)>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -99,8 +99,8 @@ pub struct MyApp {
     show_spectrograph: bool,
     last_repaint: Instant,
     shutdown_flag: Arc<AtomicBool>,
-    spectrograph_history: VecDeque<SpectrographSlice>,
-    start_time: Instant,
+    spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
+    start_time: Arc<Instant>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -112,6 +112,8 @@ impl MyApp {
         audio_buffer: Arc<RwLock<CircularBuffer>>,
         resynth_config: Arc<Mutex<ResynthConfig>>,
         shutdown_flag: Arc<AtomicBool>,
+        spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
+        start_time: Arc<Instant>,
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -138,8 +140,8 @@ impl MyApp {
             show_spectrograph: false,
             last_repaint: Instant::now(),
             shutdown_flag,
-            spectrograph_history: VecDeque::new(),
-            start_time: Instant::now(),
+            spectrograph_history,
+            start_time,
         };
 
         // FIX IMPLEMENTATION:
@@ -635,41 +637,11 @@ impl eframe::App for MyApp {
                 });
 
             // Optimized spectrograph update logic
-            let current_time = Instant::now().duration_since(self.start_time).as_secs_f64();
-            let data = {
-                let spectrum = self.spectrum.lock().unwrap();
-                spectrum.clone_absolute_data()
+            let current_time = Instant::now().duration_since(self.start_time.as_ref().clone()).as_secs_f64();
+            let max_freq = {
+                let fft = self.fft_config.lock().unwrap();
+                fft.max_frequency
             };
-
-            let mut slice_data = Vec::new();
-            for channel_data in data.iter() {
-                for &(freq, magnitude) in channel_data.iter() {
-                    slice_data.push((freq as f64, magnitude));
-                }
-            }
-
-            let is_new_data = self.spectrograph_history.back().map_or(true, |last| last.data != slice_data);
-            if is_new_data || self.spectrograph_history.is_empty() {
-                self.spectrograph_history.push_back(SpectrographSlice {
-                    time: current_time,
-                    data: slice_data,
-                });
-            } else {
-                if let Some(last) = self.spectrograph_history.back() {
-                    self.spectrograph_history.push_back(SpectrographSlice {
-                        time: current_time,
-                        data: last.data.clone(),
-                    });
-                }
-            }
-
-            while let Some(front) = self.spectrograph_history.front() {
-                if current_time - front.time > 5.0 {
-                    self.spectrograph_history.pop_front();
-                } else {
-                    break;
-                }
-            }
 
             Plot::new("spectrograph_plot")
                 .legend(Legend::default())
@@ -684,7 +656,8 @@ impl eframe::App for MyApp {
                 .show_x(true)
                 .show_y(true)
                 .show(ui, |plot_ui| {
-                    for slice in &self.spectrograph_history {
+                    let history = self.spectrograph_history.lock().unwrap();
+                    for slice in history.iter() {
                         for &(freq, magnitude) in &slice.data {
                             let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
                             let color = egui::Color32::from_rgb(

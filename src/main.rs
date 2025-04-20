@@ -26,6 +26,9 @@ use crate::plot::MyApp;
 use std::ffi::CString;
 use std::thread;
 use std::time::Duration;
+use std::collections::VecDeque;
+use crate::plot::SpectrographSlice;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct SharedMemory {
@@ -310,6 +313,10 @@ fn run() -> Result<()> {
 
     // Pass shared_partials to FFT thread
     let shared_partials_clone = shared_partials.clone();
+    let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::new()));
+    let spectrograph_history_fft = Arc::clone(&spectrograph_history);
+    let start_time = Arc::new(Instant::now());
+    let start_time_fft = Arc::clone(&start_time);
     let fft_thread = std::thread::spawn({
         let audio_buffer = Arc::clone(&audio_buffer);
         let fft_config = Arc::clone(&fft_config);
@@ -317,6 +324,8 @@ fn run() -> Result<()> {
         let selected_channels = selected_channels.clone();
         let shutdown_flag_fft = Arc::clone(&shutdown_flag);
         let shared_partials_clone = shared_partials_clone.clone();
+        let spectrograph_history = spectrograph_history_fft;
+        let start_time = start_time_fft;
 
         move || {
             fft_analysis::start_fft_processing(
@@ -327,6 +336,8 @@ fn run() -> Result<()> {
                 selected_sample_rate as u32,
                 shutdown_flag_fft,
                 shared_partials_clone,
+                Some(spectrograph_history),
+                Some(start_time),
             );
         }
     });
@@ -382,6 +393,8 @@ fn run() -> Result<()> {
         audio_buffer.clone(),
         resynth_config.clone(),
         shutdown_flag.clone(),
+        spectrograph_history.clone(),
+        start_time.clone(),
     );
 
     let native_options = NativeOptions {

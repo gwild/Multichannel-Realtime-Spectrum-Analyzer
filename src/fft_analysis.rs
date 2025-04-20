@@ -15,6 +15,9 @@ use crate::utils::{DEFAULT_BUFFER_SIZE, MAX_FREQ, MIN_FREQ}; // Update imports
 use std::io::Write;  // For write_all
 use crate::SharedMemory;  // Import the struct from main.rs
 use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
+use crate::plot::SpectrographSlice;
+use std::collections::VecDeque;
+use std::time::Instant;
 
 /// Configuration struct for FFT settings.
 pub struct FFTConfig {
@@ -127,6 +130,8 @@ pub fn start_fft_processing(
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
     mut shared_partials: Option<SharedMemory>,
+    spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
+    start_time: Option<Arc<Instant>>,
 ) {
     while !shutdown_flag.load(Ordering::Relaxed) {
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -217,6 +222,29 @@ pub fn start_fft_processing(
                 }
 
                 shared.data = results.clone();
+            }
+
+            if let Some(history) = &spectrograph_history {
+                let mut history = history.lock().unwrap();
+                let current_time = if let Some(start_time) = &start_time {
+                    Instant::now().duration_since(start_time.as_ref().clone()).as_secs_f64()
+                } else {
+                    0.0
+                };
+                let mut slice_data = Vec::new();
+                for channel_data in results.iter() {
+                    for &(freq, magnitude) in channel_data.iter() {
+                        slice_data.push((freq as f64, magnitude));
+                    }
+                }
+                history.push_back(SpectrographSlice { time: current_time, data: slice_data });
+                while let Some(front) = history.front() {
+                    if current_time - front.time > 5.0 {
+                        history.pop_front();
+                    } else {
+                        break;
+                    }
+                }
             }
         }));
 
