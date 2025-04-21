@@ -5,7 +5,7 @@ use egui::plot::{Plot, BarChart, Legend};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
-use log::{info, debug};
+use log::{info, debug, log_enabled, Level};
 use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
@@ -688,15 +688,16 @@ impl eframe::App for MyApp {
                                 t += expected_update_interval;
                             }
                         }
+                        if log_enabled!(Level::Debug) {
+                            let history = self.spectrograph_history.lock().unwrap();
+                            if history.len() >= 2 {
+                                let last = history.back().unwrap();
+                                let prev = history.iter().rev().nth(1).unwrap();
+                                let dt = last.time - prev.time;
+                                debug!("[DEBUG] Δt between last slices: {:.4} s", dt);
+                            }
+                        }
                     });
-                // Add a debug label for time difference between last two slices
-                let history = self.spectrograph_history.lock().unwrap();
-                if history.len() >= 2 {
-                    let last = history.back().unwrap();
-                    let prev = history.iter().rev().nth(1).unwrap();
-                    let dt = last.time - prev.time;
-                    ui.label(format!("[DEBUG] Δt between last slices: {:.4} s", dt));
-                }
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
