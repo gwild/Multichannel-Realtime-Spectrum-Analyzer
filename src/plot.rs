@@ -643,32 +643,61 @@ impl eframe::App for MyApp {
                 fft.max_frequency
             };
 
-            Plot::new("spectrograph_plot")
-                .legend(Legend::default())
-                .view_aspect(6.0)
-                .include_y(0.0)
-                .include_y(max_freq as f64)
-                .include_x(current_time - 5.0)
-                .include_x(current_time)
-                .x_axis_formatter(|value, _range| format!("{:.1} s", value))
-                .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
-                .show_axes([true, true])
-                .show_x(true)
-                .show_y(true)
-                .show(ui, |plot_ui| {
-                    let history = self.spectrograph_history.lock().unwrap();
-                    for slice in history.iter() {
-                        for &(freq, magnitude) in &slice.data {
-                            let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
-                            let color = egui::Color32::from_rgb(
-                                (255.0 * normalized_magnitude) as u8,
-                                (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
-                                (255.0 * (1.0 - normalized_magnitude)) as u8,
-                            );
-                            plot_ui.points(egui::plot::Points::new(vec![[slice.time, freq]]).color(color).radius(2.0));
+            if self.show_spectrograph {
+                Plot::new("spectrograph_plot")
+                    .legend(Legend::default())
+                    .view_aspect(6.0)
+                    .include_y(0.0)
+                    .include_y(max_freq as f64)
+                    .include_x(current_time - 5.0)
+                    .include_x(current_time)
+                    .x_axis_formatter(|value, _range| format!("{:.1} s", value))
+                    .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
+                    .show_axes([true, true])
+                    .show_x(true)
+                    .show_y(true)
+                    .show(ui, |plot_ui| {
+                        let history = self.spectrograph_history.lock().unwrap();
+                        let mut last_slice: Option<&SpectrographSlice> = None;
+                        for slice in history.iter() {
+                            for &(freq, magnitude) in &slice.data {
+                                let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
+                                let color = egui::Color32::from_rgb(
+                                    (255.0 * normalized_magnitude) as u8,
+                                    (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
+                                    (255.0 * (1.0 - normalized_magnitude)) as u8,
+                                );
+                                plot_ui.points(egui::plot::Points::new(vec![[slice.time, freq]]).color(color).radius(2.0));
+                            }
+                            last_slice = Some(slice);
                         }
-                    }
-                });
+                        // Hold last slice at current_time if needed
+                        let expected_update_interval = 0.02; // 20ms
+                        if let Some(slice) = last_slice {
+                            let mut t = slice.time + expected_update_interval;
+                            while t < current_time {
+                                for &(freq, magnitude) in &slice.data {
+                                    let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
+                                    let color = egui::Color32::from_rgb(
+                                        (255.0 * normalized_magnitude) as u8,
+                                        (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
+                                        (255.0 * (1.0 - normalized_magnitude)) as u8,
+                                    );
+                                    plot_ui.points(egui::plot::Points::new(vec![[t, freq]]).color(color).radius(2.0));
+                                }
+                                t += expected_update_interval;
+                            }
+                        }
+                    });
+                // Add a debug label for time difference between last two slices
+                let history = self.spectrograph_history.lock().unwrap();
+                if history.len() >= 2 {
+                    let last = history.back().unwrap();
+                    let prev = history.iter().rev().nth(1).unwrap();
+                    let dt = last.time - prev.time;
+                    ui.label(format!("[DEBUG] Δt between last slices: {:.4} s", dt));
+                }
+            }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // ui.label("Channel Results:");

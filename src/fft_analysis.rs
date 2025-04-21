@@ -237,14 +237,17 @@ pub fn start_fft_processing(
                         slice_data.push((freq as f64, magnitude));
                     }
                 }
-                history.push_back(SpectrographSlice { time: current_time, data: slice_data });
-                while let Some(front) = history.front() {
-                    if current_time - front.time > 5.0 {
-                        history.pop_front();
-                    } else {
-                        break;
+                let display_interval = 0.016; // 16ms, for 60Hz display
+                if let Some(last) = history.back() {
+                    let last_time = last.time;
+                    let last_data = last.data.clone();
+                    let mut t = last_time + display_interval;
+                    while t < current_time {
+                        history.push_back(SpectrographSlice { time: t, data: last_data.clone() });
+                        t += display_interval;
                     }
                 }
+                history.push_back(SpectrographSlice { time: current_time, data: slice_data });
             }
         }));
 
@@ -253,7 +256,7 @@ pub fn start_fft_processing(
             warn!("Panic in FFT thread: {:?}", e);
         }
 
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(1));
     }
     info!("FFT processing thread shutting down.");
 }
