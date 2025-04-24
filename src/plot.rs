@@ -21,6 +21,7 @@ use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use egui::widgets::plot::uniform_grid_spacer;
 use std::collections::VecDeque;
 use std::collections::BTreeMap;
+use chrono;
 
 pub struct SpectrographSlice {
     pub time: f64,
@@ -496,7 +497,6 @@ impl eframe::App for MyApp {
             }
 
             // 8) Reset button
-            let mut reset_clicked = false;
             if ui.button("Reset to Defaults").clicked() {
                 {
                     let mut fft_config = self.fft_config.lock().unwrap();
@@ -504,7 +504,7 @@ impl eframe::App for MyApp {
                     
                     // Reset FFT config
                     fft_config.min_frequency = MIN_FREQ;
-                    fft_config.max_frequency = 1400.0;
+                    fft_config.max_frequency = 8192.0;
                     fft_config.magnitude_threshold = 6.0;
                     fft_config.min_freq_spacing = 20.0;
                     fft_config.window_type = WindowType::Hanning;
@@ -515,7 +515,7 @@ impl eframe::App for MyApp {
                     fft_config.crosstalk_reduction = 0.5;
                     fft_config.harmonic_tolerance = 0.03;
                     fft_config.root_freq_min = 20.0;
-                    fft_config.root_freq_max = (DEFAULT_BUFFER_SIZE as f32 / 4.0);
+                    fft_config.root_freq_max = DEFAULT_BUFFER_SIZE as f32 / 4.0;
                     fft_config.freq_match_distance = 5.0;
                     
                     // Only change frames_per_buffer if platform requires it
@@ -550,8 +550,6 @@ impl eframe::App for MyApp {
                 if *self.buffer_size.lock().unwrap() != DEFAULT_BUFFER_SIZE {
                     self.update_buffer_size(DEFAULT_BUFFER_SIZE);
                 }
-                
-                reset_clicked = true;
             }
 
             // 8) Plot logic
@@ -637,64 +635,63 @@ impl eframe::App for MyApp {
                 });
 
             // Optimized spectrograph update logic
-            let current_time = Instant::now().duration_since(self.start_time.as_ref().clone()).as_secs_f64();
+            let current_time = Instant::now();
+            let elapsed = current_time.duration_since(self.start_time.as_ref().clone());
+            let current_timestamp = chrono::Local::now();
+            let start_timestamp = current_timestamp - chrono::Duration::from_std(elapsed).unwrap_or_default();
+            
             let max_freq = {
                 let fft = self.fft_config.lock().unwrap();
                 fft.max_frequency
             };
 
+            // Fixed window of 5 seconds
+            let plot_window_duration = std::time::Duration::from_secs(5);
+            
             if self.show_spectrograph {
                 Plot::new("spectrograph_plot")
                     .legend(Legend::default())
                     .view_aspect(6.0)
                     .include_y(0.0)
                     .include_y(max_freq as f64)
-                    .include_x(current_time - 5.0)
-                    .include_x(current_time)
-                    .x_axis_formatter(|value, _range| format!("{:.1} s", value))
+                    .x_axis_formatter(move |value, _range| {
+                        let timestamp = start_timestamp + chrono::Duration::milliseconds(value as i64);
+                        format!("{}", timestamp.format("%H:%M:%S"))
+                    })
                     .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
                     .show_axes([true, true])
                     .show_x(true)
                     .show_y(true)
                     .show(ui, |plot_ui| {
                         let history = self.spectrograph_history.lock().unwrap();
-                        let mut last_slice: Option<&SpectrographSlice> = None;
-                        for slice in history.iter() {
-                            for &(freq, magnitude) in &slice.data {
-                                let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
-                                let color = egui::Color32::from_rgb(
-                                    (255.0 * normalized_magnitude) as u8,
-                                    (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
-                                    (255.0 * (1.0 - normalized_magnitude)) as u8,
-                                );
-                                plot_ui.points(egui::plot::Points::new(vec![[slice.time, freq]]).color(color).radius(2.0));
-                            }
-                            last_slice = Some(slice);
-                        }
-                        // Hold last slice at current_time if needed
-                        let expected_update_interval = 0.02; // 20ms
-                        if let Some(slice) = last_slice {
-                            let mut t = slice.time + expected_update_interval;
-                            while t < current_time {
-                                for &(freq, magnitude) in &slice.data {
-                                    let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
-                                    let color = egui::Color32::from_rgb(
-                                        (255.0 * normalized_magnitude) as u8,
-                                        (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
-                                        (255.0 * (1.0 - normalized_magnitude)) as u8,
-                                    );
-                                    plot_ui.points(egui::plot::Points::new(vec![[t, freq]]).color(color).radius(2.0));
+                        if !history.is_empty() {
+                            // Get the time range for the plot
+                            let latest_time = elapsed.as_secs_f64();
+                            let earliest_time = (latest_time - plot_window_duration.as_secs_f64()).max(0.0);
+                            
+                            // Update plot bounds
+                            plot_ui.set_plot_bounds(egui::plot::PlotBounds::from_min_max(
+                                [earliest_time * 1000.0, 0.0],  // Convert to milliseconds
+                                [latest_time * 1000.0, max_freq as f64]
+                            ));
+
+                            // Plot only points within the time window
+                            for slice in history.iter() {
+                                if slice.time >= earliest_time && slice.time <= latest_time {
+                                    for &(freq, magnitude) in &slice.data {
+                                        let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
+                                        let color = egui::Color32::from_rgb(
+                                            (255.0 * normalized_magnitude) as u8,
+                                            (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
+                                            (255.0 * (1.0 - normalized_magnitude)) as u8,
+                                        );
+                                        plot_ui.points(
+                                            egui::plot::Points::new(vec![[slice.time * 1000.0, freq as f64]])
+                                                .color(color)
+                                                .radius(2.0)
+                                        );
+                                    }
                                 }
-                                t += expected_update_interval;
-                            }
-                        }
-                        if log_enabled!(Level::Debug) {
-                            let history = self.spectrograph_history.lock().unwrap();
-                            if history.len() >= 2 {
-                                let last = history.back().unwrap();
-                                let prev = history.iter().rev().nth(1).unwrap();
-                                let dt = last.time - prev.time;
-                                debug!("[DEBUG] Δt between last slices: {:.4} s", dt);
                             }
                         }
                     });
