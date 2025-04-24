@@ -71,28 +71,26 @@ impl CircularBuffer {
             return;
         }
 
-        // Calculate complete frames
         let frames = batch_size / self.channels;
         if frames == 0 {
             return;
         }
 
-        // Optimize for common case where we're writing less than buffer size
         if frames <= self.size {
-            // Copy frame by frame to maintain channel interleaving
             for frame in 0..frames {
                 let src_offset = frame * self.channels;
-                let dst_offset = ((self.head + frame) % self.size) * self.channels;
+                let dst_frame = (self.head + frame) % self.size;
+                let dst_offset = dst_frame * self.channels;
                 for ch in 0..self.channels {
                     self.buffer[dst_offset + ch] = values[src_offset + ch];
                 }
             }
         } else {
-            // If batch is larger than buffer, only keep most recent frames
             let start_frame = frames - self.size;
             for frame in 0..self.size {
                 let src_offset = (start_frame + frame) * self.channels;
-                let dst_offset = ((self.head + frame) % self.size) * self.channels;
+                let dst_frame = (self.head + frame) % self.size;
+                let dst_offset = dst_frame * self.channels;
                 for ch in 0..self.channels {
                     self.buffer[dst_offset + ch] = values[src_offset + ch];
                 }
@@ -109,14 +107,13 @@ impl CircularBuffer {
     /// A clone of the entire buffer, maintaining the interleaved structure.
     pub fn clone_data(&self) -> Vec<f32> {
         let mut result = Vec::with_capacity(self.buffer.len());
-        
-        // Copy data starting from head, maintaining channel alignment
+
         for frame in 0..self.size {
             let src_frame = (self.head + frame) % self.size;
             let src_offset = src_frame * self.channels;
             result.extend_from_slice(&self.buffer[src_offset..src_offset + self.channels]);
         }
-        
+
         result
     }
 
