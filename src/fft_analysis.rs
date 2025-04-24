@@ -18,8 +18,14 @@ use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
 use crate::plot::SpectrographSlice;
 use std::collections::VecDeque;
 use std::time::Instant;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+// Change the constant declaration to be public
+pub const MAX_SPECTROGRAPH_HISTORY: usize = 500;
 
 /// Configuration struct for FFT settings.
+#[derive(Debug, Clone, PartialEq)]  // Add Clone derive
 pub struct FFTConfig {
     pub min_frequency: f64,
     pub max_frequency: f64,
@@ -133,30 +139,124 @@ pub fn start_fft_processing(
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
     start_time: Option<Arc<Instant>>,
 ) {
+    // Initialize FFT planner and buffers outside the loop
+    let mut planner = RealFftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(DEFAULT_BUFFER_SIZE);
+    let mut spectrum_buffer = fft.make_output_vec();
+
+    // Cache initial configuration values
+    let initial_config = {
+        let config = fft_config.lock().unwrap();
+        FFTConfig {
+            min_frequency: config.min_frequency,
+            max_frequency: config.max_frequency,
+            magnitude_threshold: config.magnitude_threshold,
+            min_freq_spacing: config.min_freq_spacing,
+            num_channels: config.num_channels,
+            frames_per_buffer: config.frames_per_buffer,
+            crosstalk_threshold: config.crosstalk_threshold,
+            crosstalk_reduction: config.crosstalk_reduction,
+            crosstalk_enabled: config.crosstalk_enabled,
+            harmonic_tolerance: config.harmonic_tolerance,
+            window_type: config.window_type,
+            root_freq_min: config.root_freq_min,
+            root_freq_max: config.root_freq_max,
+            freq_match_distance: config.freq_match_distance,
+            num_partials: config.num_partials,
+        }
+    };
+
+    // Track if config has changed to know when to update cache
+    let mut last_config_hash = {
+        let mut hasher = DefaultHasher::new();
+        initial_config.min_frequency.to_bits().hash(&mut hasher);
+        initial_config.max_frequency.to_bits().hash(&mut hasher);
+        initial_config.magnitude_threshold.to_bits().hash(&mut hasher);
+        initial_config.min_freq_spacing.to_bits().hash(&mut hasher);
+        initial_config.num_channels.hash(&mut hasher);
+        initial_config.frames_per_buffer.hash(&mut hasher);
+        initial_config.crosstalk_threshold.to_bits().hash(&mut hasher);
+        initial_config.crosstalk_reduction.to_bits().hash(&mut hasher);
+        initial_config.crosstalk_enabled.hash(&mut hasher);
+        initial_config.harmonic_tolerance.to_bits().hash(&mut hasher);
+        initial_config.root_freq_min.to_bits().hash(&mut hasher);
+        initial_config.root_freq_max.to_bits().hash(&mut hasher);
+        initial_config.freq_match_distance.to_bits().hash(&mut hasher);
+        initial_config.num_partials.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let mut cached_config = initial_config;
+
     while !shutdown_flag.load(Ordering::Relaxed) {
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let buffer_clone = {
+            let buffer_data = {
                 let buffer = audio_buffer.read().unwrap();
                 buffer.clone_data()
             };
 
-            // Extract channel data
+            // Check if config has changed by comparing hashes
+            let config = fft_config.lock().unwrap();
+            let current_hash = {
+                let mut hasher = DefaultHasher::new();
+                config.min_frequency.to_bits().hash(&mut hasher);
+                config.max_frequency.to_bits().hash(&mut hasher);
+                config.magnitude_threshold.to_bits().hash(&mut hasher);
+                config.min_freq_spacing.to_bits().hash(&mut hasher);
+                config.num_channels.hash(&mut hasher);
+                config.frames_per_buffer.hash(&mut hasher);
+                config.crosstalk_threshold.to_bits().hash(&mut hasher);
+                config.crosstalk_reduction.to_bits().hash(&mut hasher);
+                config.crosstalk_enabled.hash(&mut hasher);
+                config.harmonic_tolerance.to_bits().hash(&mut hasher);
+                config.root_freq_min.to_bits().hash(&mut hasher);
+                config.root_freq_max.to_bits().hash(&mut hasher);
+                config.freq_match_distance.to_bits().hash(&mut hasher);
+                config.num_partials.hash(&mut hasher);
+                hasher.finish()
+            };
+
+            // Only update cached config if values have changed
+            if current_hash != last_config_hash {
+                cached_config = FFTConfig {
+                    min_frequency: config.min_frequency,
+                    max_frequency: config.max_frequency,
+                    magnitude_threshold: config.magnitude_threshold,
+                    min_freq_spacing: config.min_freq_spacing,
+                    num_channels: config.num_channels,
+                    frames_per_buffer: config.frames_per_buffer,
+                    crosstalk_threshold: config.crosstalk_threshold,
+                    crosstalk_reduction: config.crosstalk_reduction,
+                    crosstalk_enabled: config.crosstalk_enabled,
+                    harmonic_tolerance: config.harmonic_tolerance,
+                    window_type: config.window_type,
+                    root_freq_min: config.root_freq_min,
+                    root_freq_max: config.root_freq_max,
+                    freq_match_distance: config.freq_match_distance,
+                    num_partials: config.num_partials,
+                };
+                last_config_hash = current_hash;
+            }
+            drop(config);
+
+            // Use cached_config instead of taking a new lock
+            let num_partials = cached_config.num_partials;
+
+            // Process each channel to get both partial and line data
+            let mut all_channels_partials = Vec::with_capacity(selected_channels.len());
+            let mut all_channels_line_data = Vec::with_capacity(selected_channels.len());
+
+            // Extract channel data once
             let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
-                .map(|(i, _)| extract_channel_data(&buffer_clone, i, selected_channels.len()))
+                .map(|(i, _)| extract_channel_data(&buffer_data, i, selected_channels.len()))
                 .collect();
 
-            let config = fft_config.lock().unwrap();
-            
-            // Process each channel to get both partial and line data
-            let mut all_channels_partials = Vec::new();
-            let mut all_channels_line_data = Vec::new();
-            
             for (channel_index, _) in selected_channels.iter().enumerate() {
                 let (partials, line_data) = compute_all_fft_data(
                     &channel_buffers,
                     channel_index,     
                     sample_rate, 
-                    &config
+                    &cached_config  // Use cached config
                 );
                 
                 all_channels_partials.push(partials);
@@ -164,90 +264,113 @@ pub fn start_fft_processing(
             }
 
             // Apply crosstalk filtering if enabled
-            let results = if config.crosstalk_enabled {
+            let results = if cached_config.crosstalk_enabled {  // Use cached config
                 filter_crosstalk_frequency_domain(
                     &mut all_channels_partials,
-                    config.crosstalk_threshold,
-                    config.crosstalk_reduction,
-                    config.harmonic_tolerance,
-                    config.root_freq_min,
-                    config.root_freq_max,
-                    config.freq_match_distance,
+                    cached_config.crosstalk_threshold,  // Use cached values
+                    cached_config.crosstalk_reduction,
+                    cached_config.harmonic_tolerance,
+                    cached_config.root_freq_min,
+                    cached_config.root_freq_max,
+                    cached_config.freq_match_distance,
                     sample_rate
                 )
             } else {
                 all_channels_partials
             };
 
-            // Update GUI with both types of data
-            if let Ok(mut spectrum) = spectrum_app.lock() {
-                spectrum.update_partials(results.clone());
-                spectrum.update_fft_line_data(all_channels_line_data);
-            }
-
-            // Handle shared memory updates - use exact same data as GUI
-            if let Some(shared) = &mut shared_partials {
-                let num_channels = results.len();
-                let num_partials = config.num_partials;
-                
-                // Each channel has num_partials partials, each partial has freq+amp (8 bytes)
-                let buffer_size = num_channels * num_partials * 8;
+            // Prepare shared memory data before acquiring lock
+            let shared_memory_data = if shared_partials.is_some() {
+                let buffer_size = results.len() * num_partials * 8;
                 let mut buffer = Vec::with_capacity(buffer_size);
-
-                // Write all partials for each channel
+                
                 for channel_data in &results {
-                    // Ensure exactly num_partials partials per channel
                     for i in 0..num_partials {
                         let (freq, amp) = if i < channel_data.len() {
                             channel_data[i]
                         } else {
-                            (0.0, 0.0)  // Pad with zeros if less than num_partials
+                            (0.0, 0.0)
                         };
                         buffer.extend_from_slice(&freq.to_le_bytes());
                         buffer.extend_from_slice(&amp.to_le_bytes());
                     }
                 }
+                Some(buffer)
+            } else {
+                None
+            };
 
-                // Write to shared memory file
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&shared.path)
-                {
-                    if let Err(e) = file.set_len(buffer.len() as u64) {
-                        error!("Failed to set shared memory size: {:?}", e);
-                    }
-                    if let Err(e) = file.write_all(&buffer) {
-                        error!("Failed to write to shared memory: {:?}", e);
-                    }
-                }
-
-                shared.data = results.clone();
+            // Update GUI with minimal lock duration
+            {
+                let mut spectrum = spectrum_app.lock().unwrap();
+                spectrum.update_partials(results.clone());
+                spectrum.update_fft_line_data(all_channels_line_data);
             }
 
+            // Update shared memory with minimal lock duration
+            if let Some(buffer) = shared_memory_data {
+                if let Some(shared) = &mut shared_partials {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&shared.path)
+                    {
+                        let _ = file.set_len(buffer.len() as u64);
+                        let _ = file.write_all(&buffer);
+                    }
+                    shared.data = results.clone();
+                }
+            }
+
+            // Update spectrograph with minimal lock duration
             if let Some(history) = &spectrograph_history {
-                let mut history = history.lock().unwrap();
                 let current_time = if let Some(start_time) = &start_time {
-                    Instant::now().duration_since(start_time.as_ref().clone()).as_secs_f64()
+                    // Ensure we start from 0 seconds when first enabled
+                    let elapsed = Instant::now().duration_since(start_time.as_ref().clone());
+                    if elapsed.as_secs_f64() > 100.0 {
+                        // If time is unreasonably large, likely means timer needs reset
+                        0.0
+                    } else {
+                        elapsed.as_secs_f64()
+                    }
                 } else {
                     0.0
                 };
-                let mut slice_data = Vec::new();
-                for channel_data in results.iter() {
-                    for &(freq, magnitude) in channel_data.iter() {
-                        slice_data.push((freq as f64, magnitude));
+
+                let slice_data: Vec<(f64, f32)> = results.iter()
+                    .flat_map(|channel_data| {
+                        channel_data.iter()
+                            .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
+                            .map(|&(freq, magnitude)| (freq as f64, magnitude))
+                    })
+                    .collect();
+
+                if !slice_data.is_empty() {  // Only add non-empty slices
+                    let mut history = history.lock().unwrap();
+                    
+                    // If this is the first slice after enabling, clear history
+                    if history.is_empty() || current_time < history.front().map(|s| s.time).unwrap_or(f64::MAX) {
+                        history.clear();
+                    }
+                    
+                    // Maintain time order and prevent gaps
+                    if let Some(last) = history.back() {
+                        if current_time > last.time {  // Only add if time is increasing
+                            if history.len() >= MAX_SPECTROGRAPH_HISTORY {
+                                history.pop_front();
+                            }
+                            history.push_back(SpectrographSlice { 
+                                time: current_time, 
+                                data: slice_data 
+                            });
+                        }
+                    } else {
+                        // First slice after clearing
+                        history.push_back(SpectrographSlice { 
+                            time: current_time, 
+                            data: slice_data 
+                        });
                     }
                 }
-                let display_interval = 0.016; // 16ms, for 60Hz display
-                if let Some(last) = history.back() {
-                    let last_time = last.time;
-                    let last_data = last.data.clone();
-                    let mut t = last_time + display_interval;
-                    while t < current_time {
-                        history.push_back(SpectrographSlice { time: t, data: last_data.clone() });
-                        t += display_interval;
-                    }
-                }
-                history.push_back(SpectrographSlice { time: current_time, data: slice_data });
             }
         }));
 

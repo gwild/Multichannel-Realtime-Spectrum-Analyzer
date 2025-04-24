@@ -18,7 +18,7 @@ use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
 use log::{info, error, warn};
 use env_logger;
-use fft_analysis::FFTConfig;
+use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;
 use crate::resynth::{ResynthConfig, start_resynth_thread};
@@ -324,10 +324,14 @@ fn run() -> Result<()> {
         None
     };
 
+    // Before starting the FFT thread, initialize spectrograph history with fixed capacity
+    let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::with_capacity(MAX_SPECTROGRAPH_HISTORY)));
+
+    // Pass the initialized history to the FFT thread
+    let spectrograph_history_fft = Arc::clone(&spectrograph_history);
+
     // Pass shared_partials to FFT thread
     let shared_partials_clone = shared_partials.clone();
-    let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::new()));
-    let spectrograph_history_fft = Arc::clone(&spectrograph_history);
     let start_time = Arc::new(Instant::now());
     let start_time_fft = Arc::clone(&start_time);
     let fft_thread = std::thread::spawn({
