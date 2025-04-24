@@ -4,7 +4,7 @@ use std::time::Duration;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
-use log::{info, error};
+use log::{info, error, trace};
 use crate::plot::SpectrumApp;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use rayon::prelude::*;  // Add at top with other imports
@@ -326,11 +326,12 @@ pub fn start_resynth_thread(
             
             // Debug print FFT data
             let partials = spectrum_app.lock().unwrap().clone_absolute_data();
-            info!("Got FFT data: {} channels", partials.len());
+            // Only log this detailed FFT data at trace level
+            trace!("Got FFT data: {} channels", partials.len());
             for (ch, channel_data) in partials.iter().enumerate() {
-                info!("Channel {}: {} partials", ch, channel_data.len());
+                trace!("Channel {}: {} partials", ch, channel_data.len());
                 for &(freq, amp) in channel_data.iter().take(3) {  // Print first 3 partials
-                    info!("  Freq: {:.1}, Amp: {:.1}", freq, amp);
+                    trace!("  Freq: {:.1}, Amp: {:.1}", freq, amp);
                 }
             }
             

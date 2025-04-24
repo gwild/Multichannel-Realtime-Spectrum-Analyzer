@@ -40,31 +40,44 @@ pub struct SharedMemory {
 pub const DEFAULT_NUM_PARTIALS: usize = 12;
 
 fn main() {
-    // Keep your existing --enable-logs code, but also respect RUST_LOG if set
-    // If no RUST_LOG is set and user passes --enable-logs, default to your old logic
-    // Otherwise, if RUST_LOG is set externally, we respect that
+    // Parse command line arguments for logging
+    let args: Vec<String> = std::env::args().collect();
+    let log_level = if args.contains(&"--error".to_string()) {
+        "error"
+    } else if args.contains(&"--warn".to_string()) {
+        "warn"
+    } else if args.contains(&"--info".to_string()) {
+        "info"
+    } else if args.contains(&"--debug".to_string()) {
+        "debug"
+    } else if args.contains(&"--trace".to_string()) {
+        "trace"
+    } else if args.contains(&"--enable-logs".to_string()) {
+        // Backward compatibility with old flag
+        "info"
+    } else if std::env::var("RUST_LOG").is_ok() {
+        // Keep any manually set RUST_LOG value
+        &std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string())
+    } else {
+        // Default to error level only
+        "error"
+    };
 
-    let logs_enabled_via_arg = std::env::args().any(|arg| arg == "--enable-logs");
-    if logs_enabled_via_arg {
-        // Don't override RUST_LOG if it's already set
-        if std::env::var("RUST_LOG").is_err() {
-            // Default to your old multi-module settings
-            std::env::set_var("RUST_LOG", 
-                "audio_streaming=info,\
-                 audio_streaming::fft_analysis=info,\
-                 audio_streaming::audio_stream=info,\
-                 audio_streaming::pitch_detection=info");
-        }
-    }
-
-    // Init the logger
+    // Set up logging for all modules in the application
+    std::env::set_var("RUST_LOG", format!("audio_streaming={}", log_level));
     env_logger::init();
+
+    // Print logging level information
+    if log_level != "error" {
+        println!("Logging level: {}", log_level);
+        println!("Run with --error, --warn, --info, --debug, or --trace to control verbosity");
+    }
 
     if let Err(e) = run() {
         if std::env::args().any(|arg| arg == "--enable-logs") {
             error!("Application encountered an error: {:?}", e);
         } else {
-            eprintln!("Error: {:?}", e);
+            error!("Application error: {:?}", e);
         }
         std::process::exit(1);
     }

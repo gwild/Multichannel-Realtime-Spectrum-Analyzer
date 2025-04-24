@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use portaudio as pa;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
@@ -413,10 +413,10 @@ pub fn start_sampling_thread(
 ) {
     const RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
-    warn!("start_sampling_thread: about to enter main loop for audio sampling.");
+    debug!("start_sampling_thread: about to enter main loop for audio sampling.");
 
     while !shutdown_flag.load(Ordering::SeqCst) {
-        warn!("start_sampling_thread: inside sampling loop - checking PortAudio stream...");
+        debug!("start_sampling_thread: inside sampling loop - checking PortAudio stream...");
 
         let pa = match pa::PortAudio::new() {
             Ok(pa) => pa,
