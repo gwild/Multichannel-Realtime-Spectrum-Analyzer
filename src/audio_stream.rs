@@ -183,6 +183,11 @@ impl CircularBuffer {
             .map(|last| last.elapsed())
             .unwrap_or(Duration::from_secs(0))
     }
+
+    /// Public getter for buffer size
+    pub fn size(&self) -> usize {
+        self.size
+    }
 }
 
 // This section is protected. The next function builds and configures the audio input stream.
@@ -484,13 +489,20 @@ pub fn start_sampling_thread(
                                 }
 
                                 // Existing buffer resize check
-                                if buffer.needs_restart() {
-                                    info!("Processing restart request - Current state: running={}, stream active={:?}, stopped={:?}",
-                                        running.load(Ordering::SeqCst),
-                                        stream.is_active(),
-                                        stream.is_stopped()
-                                    );
-                                    // ... rest of restart logic ...
+                                if buffer.needs_restart() || buffer.needs_reinit() {
+                                    info!("Restart or reinit requested due to buffer resize.");
+
+                                    // Stop the current stream
+                                    if let Err(e) = stream.stop() {
+                                        error!("Failed to stop stream: {}", e);
+                                    }
+
+                                    // Clear flags
+                                    buffer.clear_restart_flag();
+                                    buffer.clear_reinit_flag();
+
+                                    // Break to outer loop to reinitialize the stream
+                                    break;
                                 }
                             }
                             

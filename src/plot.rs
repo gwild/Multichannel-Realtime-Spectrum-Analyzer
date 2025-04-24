@@ -22,6 +22,10 @@ use egui::widgets::plot::uniform_grid_spacer;
 use std::collections::VecDeque;
 use std::collections::BTreeMap;
 use chrono;
+use egui::TextStyle;
+use egui::FontId;
+use egui::FontFamily;
+use egui::Color32;
 
 pub struct SpectrographSlice {
     pub time: f64,
@@ -102,6 +106,7 @@ pub struct MyApp {
     shutdown_flag: Arc<AtomicBool>,
     spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
     start_time: Arc<Instant>,
+    sample_rate: f64,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -115,6 +120,7 @@ impl MyApp {
         shutdown_flag: Arc<AtomicBool>,
         spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
         start_time: Arc<Instant>,
+        sample_rate: f64,
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -143,6 +149,7 @@ impl MyApp {
             shutdown_flag,
             spectrograph_history,
             start_time,
+            sample_rate,
         };
 
         // FIX IMPLEMENTATION:
@@ -198,6 +205,24 @@ impl MyApp {
         if let Ok(mut buffer) = self.audio_buffer.write() {
             buffer.resize(validated_size);
         }
+
+        // Clear spectrograph history and reset start time when buffer size changes
+        if let Ok(mut history) = self.spectrograph_history.lock() {
+            let slices_per_second = self.sample_rate / validated_size as f64;
+            let history_len = (5.0 * slices_per_second).ceil() as usize;
+            // Trim or extend, but do not clear
+            while history.len() > history_len {
+                history.pop_front();
+            }
+            // No need to extend; VecDeque will grow as needed
+        }
+        *Arc::make_mut(&mut self.start_time) = Instant::now();
+
+        // Explicitly reset plot bounds by requesting a repaint
+        self.last_repaint = Instant::now();
+
+        // Explicitly log the clearing action for debugging with structured context
+        info!("Spectrograph history trimmed and start time reset due to buffer size change (new size: {})", validated_size);
     }
 
     // Helper method to get the current nyquist limit
@@ -610,6 +635,16 @@ impl eframe::App for MyApp {
                 fft.max_frequency
             };
 
+            // Move the style modification outside the closure to avoid borrowing conflicts
+            ui.style_mut().text_styles.insert(
+                TextStyle::Monospace,
+                FontId::new(14.0, FontFamily::Proportional)
+            );
+            ui.style_mut().text_styles.insert(
+                TextStyle::Body,
+                FontId::new(14.0, FontFamily::Proportional)
+            );
+
             Plot::new("spectrum_plot")
                 .legend(Legend::default())
                 .view_aspect(6.0)
@@ -619,10 +654,22 @@ impl eframe::App for MyApp {
                 .include_y(self.y_scale as f64)
                 .x_axis_formatter(|value, _range| format!("{} Hz", value as i32))
                 .y_axis_formatter(|value, _range| format!("{} dB", value as i32))
-                .y_grid_spacer(uniform_grid_spacer(|_input| [10.0, 20.0, 50.0]))
+                .y_grid_spacer(uniform_grid_spacer(|_input| [5.0, 10.0, 20.0]))  // More frequent grid lines
                 .show_axes([true, true])
                 .show_x(true)
                 .show_y(true)
+                .allow_drag(false)
+                .allow_zoom(false)
+                .allow_scroll(false)
+                .allow_boxed_zoom(false)
+                .allow_double_click_reset(false)
+                .label_formatter(|name, value| {
+                    if !name.is_empty() {
+                        format!("{}: {:.1} Hz, {:.1} dB", name, value.x, value.y)
+                    } else {
+                        String::new()
+                    }
+                })
                 .show(ui, |plot_ui| {
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);
@@ -635,47 +682,63 @@ impl eframe::App for MyApp {
                 });
 
             // Optimized spectrograph update logic
-            let current_time = Instant::now();
-            let elapsed = current_time.duration_since(self.start_time.as_ref().clone());
-            let current_timestamp = chrono::Local::now();
-            let start_timestamp = current_timestamp - chrono::Duration::from_std(elapsed).unwrap_or_default();
-            
-            let max_freq = {
-                let fft = self.fft_config.lock().unwrap();
-                fft.max_frequency
-            };
-
-            // Fixed window of 5 seconds
-            let plot_window_duration = std::time::Duration::from_secs(5);
-            
             if self.show_spectrograph {
+                let current_time = Instant::now();
+                let current_timestamp = chrono::Local::now();
+                let elapsed = current_time.duration_since(self.start_time.as_ref().clone());
+                let start_timestamp = current_timestamp - chrono::Duration::from_std(elapsed).unwrap_or_default();
+                
+                // Get the oldest timestamp from the history
+                let (earliest_time, latest_time) = {
+                    let history = self.spectrograph_history.lock().unwrap();
+                    if let Some(oldest) = history.front() {
+                        let oldest_time = oldest.time;
+                        (oldest_time, oldest_time + 5.0) // Show 5 seconds from oldest timestamp
+                    } else {
+                        let current = elapsed.as_secs_f64();
+                        (current, current + 5.0)
+                    }
+                };
+                
+                let max_freq = {
+                    let fft = self.fft_config.lock().unwrap();
+                    let buffer_size = *self.buffer_size.lock().unwrap();
+                    (fft.max_frequency as f32).min(buffer_size as f32 / 2.0)
+                };
+
                 Plot::new("spectrograph_plot")
                     .legend(Legend::default())
                     .view_aspect(6.0)
                     .include_y(0.0)
                     .include_y(max_freq as f64)
                     .x_axis_formatter(move |value, _range| {
-                        let timestamp = start_timestamp + chrono::Duration::milliseconds(value as i64);
+                        let timestamp = start_timestamp + chrono::Duration::milliseconds((value * 1000.0) as i64);
                         format!("{}", timestamp.format("%H:%M:%S"))
                     })
                     .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
                     .show_axes([true, true])
                     .show_x(true)
                     .show_y(true)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .allow_scroll(false)
+                    .allow_boxed_zoom(false)
+                    .allow_double_click_reset(false)
+                    .label_formatter(|name, value| {
+                        if !name.is_empty() {
+                            format!("{}: {:.1} Hz, {:.1} s", name, value.y, value.x)
+                        } else {
+                            String::new()
+                        }
+                    })
                     .show(ui, |plot_ui| {
                         let history = self.spectrograph_history.lock().unwrap();
                         if !history.is_empty() {
-                            // Get the time range for the plot
-                            let latest_time = elapsed.as_secs_f64();
-                            let earliest_time = (latest_time - plot_window_duration.as_secs_f64()).max(0.0);
-                            
-                            // Update plot bounds
                             plot_ui.set_plot_bounds(egui::plot::PlotBounds::from_min_max(
-                                [earliest_time * 1000.0, 0.0],  // Convert to milliseconds
+                                [earliest_time * 1000.0, 0.0],
                                 [latest_time * 1000.0, max_freq as f64]
                             ));
 
-                            // Plot only points within the time window
                             for slice in history.iter() {
                                 if slice.time >= earliest_time && slice.time <= latest_time {
                                     for &(freq, magnitude) in &slice.data {

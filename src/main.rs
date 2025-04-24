@@ -412,6 +412,7 @@ fn run() -> Result<()> {
         shutdown_flag.clone(),
         spectrograph_history.clone(),
         start_time.clone(),
+        selected_sample_rate,
     );
 
     let native_options = NativeOptions {

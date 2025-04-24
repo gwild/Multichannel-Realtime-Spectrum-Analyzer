@@ -137,11 +137,12 @@ pub fn start_fft_processing(
     shutdown_flag: Arc<AtomicBool>,
     mut shared_partials: Option<SharedMemory>,
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
-    start_time: Option<Arc<Instant>>,
+    mut start_time: Option<Arc<Instant>>,
 ) {
     // Initialize FFT planner and buffers outside the loop
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(DEFAULT_BUFFER_SIZE);
+    let mut current_buffer_size = DEFAULT_BUFFER_SIZE;
+    let mut fft = planner.plan_fft_forward(current_buffer_size);
     let mut spectrum_buffer = fft.make_output_vec();
 
     // Cache initial configuration values
@@ -190,6 +191,31 @@ pub fn start_fft_processing(
 
     while !shutdown_flag.load(Ordering::Relaxed) {
         let result = catch_unwind(AssertUnwindSafe(|| {
+            let buffer_size = {
+                let buffer = audio_buffer.read().unwrap();
+                buffer.size()  // Use the new public getter method
+            };
+
+            // Reinitialize FFT planner if buffer size changed
+            if buffer_size != current_buffer_size {
+                fft = planner.plan_fft_forward(buffer_size);
+                spectrum_buffer = fft.make_output_vec();
+                current_buffer_size = buffer_size;
+
+                // Explicitly refresh the start_time reference
+                if let Some(new_start_time) = &mut start_time {
+                    *Arc::make_mut(new_start_time) = Instant::now();
+                    info!("FFT planner and start_time reinitialized due to buffer size change (new size: {})", buffer_size);
+                }
+
+                // Clear spectrograph history explicitly
+                if let Some(history) = &spectrograph_history {
+                    if let Ok(mut history) = history.lock() {
+                        history.clear();
+                    }
+                }
+            }
+
             let buffer_data = {
                 let buffer = audio_buffer.read().unwrap();
                 buffer.clone_data()
@@ -323,54 +349,32 @@ pub fn start_fft_processing(
 
             // Update spectrograph with minimal lock duration
             if let Some(history) = &spectrograph_history {
-                let current_time = if let Some(start_time) = &start_time {
-                    // Ensure we start from 0 seconds when first enabled
-                    let elapsed = Instant::now().duration_since(start_time.as_ref().clone());
-                    if elapsed.as_secs_f64() > 100.0 {
-                        // If time is unreasonably large, likely means timer needs reset
-                        0.0
-                    } else {
-                        elapsed.as_secs_f64()
-                    }
-                } else {
-                    0.0
+                let elapsed = start_time.as_ref().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                let slice = SpectrographSlice {
+                    time: elapsed,
+                    data: results.iter()
+                        .flat_map(|channel_data| {
+                            channel_data.iter()
+                                .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
+                                .map(|&(freq, magnitude)| (freq as f64, magnitude))
+                        })
+                        .collect(),
                 };
 
-                let slice_data: Vec<(f64, f32)> = results.iter()
-                    .flat_map(|channel_data| {
-                        channel_data.iter()
-                            .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
-                            .map(|&(freq, magnitude)| (freq as f64, magnitude))
-                    })
-                    .collect();
-
-                if !slice_data.is_empty() {  // Only add non-empty slices
-                    let mut history = history.lock().unwrap();
-                    
-                    // If this is the first slice after enabling, clear history
-                    if history.is_empty() || current_time < history.front().map(|s| s.time).unwrap_or(f64::MAX) {
-                        history.clear();
-                    }
-                    
-                    // Maintain time order and prevent gaps
-                    if let Some(last) = history.back() {
-                        if current_time > last.time {  // Only add if time is increasing
-                            if history.len() >= MAX_SPECTROGRAPH_HISTORY {
-                                history.pop_front();
-                            }
-                            history.push_back(SpectrographSlice { 
-                                time: current_time, 
-                                data: slice_data 
-                            });
-                        }
+                let mut history = history.lock().unwrap();
+                
+                // Keep history size within limits
+                let latest_time = slice.time;
+                while let Some(front) = history.front() {
+                    if latest_time - front.time > 5.0 {
+                        history.pop_front();
                     } else {
-                        // First slice after clearing
-                        history.push_back(SpectrographSlice { 
-                            time: current_time, 
-                            data: slice_data 
-                        });
+                        break;
                     }
                 }
+                
+                // Always add new data
+                history.push_back(slice);
             }
         }));
 
