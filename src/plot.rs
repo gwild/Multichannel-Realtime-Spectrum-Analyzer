@@ -107,6 +107,7 @@ pub struct MyApp {
     spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
     start_time: Arc<Instant>,
     sample_rate: f64,
+    show_results: bool,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -150,6 +151,7 @@ impl MyApp {
             spectrograph_history,
             start_time,
             sample_rate,
+            show_results: true,
         };
 
         // FIX IMPLEMENTATION:
@@ -243,8 +245,6 @@ impl MyApp {
                 .logarithmic(true)
         );
 
-        // ... any other UI code ...
-
         // 6) Advanced Crosstalk controls
         ui.horizontal(|ui| {
             let mut fft_config = self.fft_config.lock().unwrap();
@@ -258,13 +258,12 @@ impl MyApp {
                     egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
                         .logarithmic(true)
                 );
-
-                // ...
             }
         });
 
         ui.checkbox(&mut self.show_line_plot, "Show FFT");
         ui.checkbox(&mut self.show_spectrograph, "Show Spectrograph");
+        ui.checkbox(&mut self.show_results, "Show Results");
     }
 }
 
@@ -278,7 +277,7 @@ impl eframe::App for MyApp {
         true
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Throttling: Limit repaint to at most 10 times per second (every 100 ms)
         let now = Instant::now();
         if now.duration_since(self.last_repaint) >= Duration::from_millis(100) {
@@ -388,6 +387,8 @@ impl eframe::App for MyApp {
                 // Show FFT checkbox moved from row 2 to here
                 ui.checkbox(&mut self.show_line_plot, "Show FFT");
                 ui.checkbox(&mut self.show_spectrograph, "Show Spectrograph");
+                ui.checkbox(&mut self.show_results, "Show Results");
+                ui.separator();
             });
 
             // 4) Volume and Smoothing row + Crosstalk checkbox + Frequency Scale
@@ -671,6 +672,28 @@ impl eframe::App for MyApp {
                     }
                 })
                 .show(ui, |plot_ui| {
+                    // 1. Clone the current style so we can mutate safely (compatible with older egui versions)
+                    let mut style = (*plot_ui.ctx().style()).clone();
+
+                    // 2. Adjust the desired text style (Body)
+                    if let Some(body_style) = style.text_styles.get_mut(&TextStyle::Body) {
+                        *body_style = FontId::new(14.0, FontFamily::Proportional);
+                    }
+
+                    // 3. Override the main text color (axis labels, etc.) with pure white for maximum contrast
+                    style.visuals.override_text_color = Some(Color32::WHITE);
+                    
+                    // 4. Make sure widget foreground strokes are also bright for readability
+                    style.visuals.widgets.noninteractive.fg_stroke.color = Color32::WHITE;
+                    style.visuals.widgets.inactive.fg_stroke.color = Color32::WHITE;
+                    style.visuals.widgets.hovered.fg_stroke.color = Color32::WHITE;
+                    style.visuals.widgets.active.fg_stroke.color = Color32::WHITE;
+                    style.visuals.widgets.open.fg_stroke.color = Color32::WHITE;
+                    
+                    // 5. Apply the modified style back to the context
+                    plot_ui.ctx().set_style(style);
+                    
+                    // Plot the data using the new style
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);
                     }
@@ -761,13 +784,36 @@ impl eframe::App for MyApp {
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // ui.label("Channel Results:");
-                let display = SpectralDisplay::new(&absolute_values);
-                for line in display.format_all() {
-                    ui.label(egui::RichText::new(line).size(8.0));
+                if self.show_results {
+                    let display = SpectralDisplay::new(&absolute_values);
+                    for line in display.format_all() {
+                        ui.label(egui::RichText::new(line).size(8.0));
+                    }
                 }
             });
         });
+
+        // === Dynamic window resizing ===
+        // Base height when only control panel is visible (no results text)
+        let mut desired_height = 360.0;
+
+        // Add extra space when optional panels are enabled
+        if self.show_spectrograph {
+            desired_height += 170.0; // Spectrograph plot
+        }
+        if self.show_results {
+            desired_height += 160.0; // Text results panel (slightly more for padding)
+        }
+
+        // Only adjust height, preserve the original width from initial window setup
+        let current_height = frame.info().window_info.size.y;
+        
+        // Apply resize if height difference is significant (avoid loop jitter)
+        if (desired_height - current_height).abs() > 4.0 {
+            // Use set_window_size but keep original width (from NativeOptions)
+            let width = 1024.0; //frame.info().window_info.size.x;
+            frame.set_window_size(egui::vec2(width, desired_height));
+        }
     }
 }
 
