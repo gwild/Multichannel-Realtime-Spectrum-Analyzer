@@ -793,27 +793,9 @@ impl eframe::App for MyApp {
             });
         });
 
-        // === Dynamic window resizing ===
-        // Base height when only control panel is visible (no results text)
-        let mut desired_height = 360.0;
-
-        // Add extra space when optional panels are enabled
-        if self.show_spectrograph {
-            desired_height += 170.0; // Spectrograph plot
-        }
-        if self.show_results {
-            desired_height += 160.0; // Text results panel (slightly more for padding)
-        }
-
-        // Only adjust height, preserve the original width from initial window setup
-        let current_height = frame.info().window_info.size.y;
-        
-        // Apply resize if height difference is significant (avoid loop jitter)
-        if (desired_height - current_height).abs() > 4.0 {
-            // Use set_window_size but keep original width (from NativeOptions)
-            let width = 1024.0; //frame.info().window_info.size.x;
-            frame.set_window_size(egui::vec2(width, desired_height));
-        }
+        // Instead of dynamic resizing, let the user decide the window size
+        // This avoids issues with different screen resolutions and DPI settings
+        // The window will be scrollable if content doesn't fit
     }
 }
 
