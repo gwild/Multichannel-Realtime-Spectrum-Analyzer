@@ -81,180 +81,177 @@ impl PartialState {
 /// Lock-free synthesis engine
 #[derive(Clone)]
 struct WavetableSynth {
-    // Sine wavetable for efficient synthesis
-    wavetable: Vec<f32>,
-    
-    // Current state for all partials
-    partials: Vec<Vec<PartialState>>,
-    
-    // Sample rate for phase calculation
+    current_wavetables: Vec<Vec<f32>>,
+    next_wavetables: Vec<Vec<f32>>,
+    // Dual phase accumulators per channel
+    curr_phases: Vec<f32>,
+    next_phases: Vec<f32>,
+    root_freqs: Vec<f32>,
+    next_root_freqs: Vec<f32>,
+    sample_counter: usize,
+    crossfade_start_sample: usize,
+    crossfade_end_sample: usize,
+    update_samples: usize,
+    in_crossfade: bool,
     sample_rate: f32,
-    
-    // Pre-allocated output buffer to avoid allocations in audio thread
     output_buffer: Vec<f32>,
-    
-    // Channels for parameter updates - lock-free queue
     update_queue: Arc<ArrayQueue<SynthUpdate>>,
-    
-    // Current parameter values
     current_gain: f32,
-    current_freq_scale: f32,
-    smoothing: f32,  // Add smoothing parameter for crossfade control
+    update_rate: f32,
 }
 
 impl WavetableSynth {
-    fn new(num_channels: usize, num_partials: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
-        // Create sine wavetable
-        let wavetable = (0..WAVETABLE_SIZE)
-            .map(|i| (i as f32 / WAVETABLE_SIZE as f32 * 2.0 * PI).sin())
-            .collect();
-        
-        // Initialize partials
-        let partials = (0..num_channels)
-            .map(|_| (0..num_partials)
-                .map(|_| PartialState::new())
-                .collect())
-            .collect();
-        
-        // Pre-allocate output buffer (stereo by default)
-        let output_buffer = vec![0.0; 2];
-        
-        Self {
-            wavetable,
-            partials,
+    fn resize_state_vectors(&mut self, num_channels: usize) {
+        self.current_wavetables.resize(num_channels, vec![0.0; WAVETABLE_SIZE]);
+        self.next_wavetables.resize(num_channels, vec![0.0; WAVETABLE_SIZE]);
+        self.curr_phases.resize(num_channels, 0.0);
+        self.next_phases.resize(num_channels, 0.0);
+        self.root_freqs.resize(num_channels, 1.0);
+        self.next_root_freqs.resize(num_channels, 1.0);
+        self.output_buffer.resize(num_channels, 0.0);
+    }
+
+    fn new(num_channels: usize, _num_partials: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
+        let mut synth = Self {
+            current_wavetables: vec![],
+            next_wavetables: vec![],
+            curr_phases: vec![],
+            next_phases: vec![],
+            root_freqs: vec![],
+            next_root_freqs: vec![],
+            sample_counter: 0,
+            crossfade_start_sample: 0,
+            crossfade_end_sample: 0,
+            update_samples: 0,
+            in_crossfade: false,
             sample_rate,
-            output_buffer,
+            output_buffer: vec![],
             update_queue,
             current_gain: 0.25,
-            current_freq_scale: 1.0,
-            smoothing: 0.0,  // Add smoothing parameter for crossfade control
-        }
+            update_rate: DEFAULT_UPDATE_RATE,
+        };
+        synth.resize_state_vectors(num_channels);
+        synth.update_samples = (synth.update_rate * sample_rate) as usize;
+        synth.crossfade_start_sample = (synth.update_samples as f32 * 2.0 / 3.0) as usize;
+        synth.crossfade_end_sample = synth.update_samples;
+        synth
     }
-    
-    /// Apply any pending updates
+
+    // Helper: build a wavetable from a set of partials (freq, amp), length = WAVETABLE_SIZE
+    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32) -> Vec<f32> {
+        let mut table = vec![0.0; WAVETABLE_SIZE];
+        // Find the root frequency (first nonzero partial)
+        let f0 = partials.iter().find(|&&(f, a)| f > 0.0 && a > 0.0).map(|&(f, _)| f).unwrap_or(1.0);
+        for i in 0..WAVETABLE_SIZE {
+            let t = i as f32 / WAVETABLE_SIZE as f32; // 0..1
+            for &(freq, amp) in partials {
+                if freq > 0.0 && amp > 0.0 {
+                    let norm_amp = amp / 100.0; // scale dB to linear
+                    // Compose as sum of sines, as if real-time synthesis
+                    table[i] += norm_amp * (2.0 * PI * freq * t / f0).sin();
+                }
+            }
+        }
+        // Normalize to prevent clipping
+        let max = table.iter().cloned().fold(0.0_f32, |a, b| a.abs().max(b.abs()));
+        if max > 1.0 {
+            for v in &mut table {
+                *v /= max;
+            }
+        }
+        table
+    }
+
     fn apply_updates(&mut self) {
-        // Process all available updates, keeping only the most recent
+        let mut new_update = None;
         while let Some(update) = self.update_queue.pop() {
-            // Update global parameters
+            new_update = Some(update);
+        }
+        if let Some(update) = new_update {
             self.current_gain = update.gain;
-            self.current_freq_scale = update.freq_scale;
-            self.smoothing = update.smoothing;
-            
-            // Update partial parameters
-            for (ch, channel_partials) in update.partials.iter().enumerate() {
-                if ch < self.partials.len() {
-                    for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                        if i < self.partials[ch].len() {
-                            let partial = &mut self.partials[ch][i];
-                            
-                            // Store target frequency (with scaling applied)
-                            let target_freq = freq * self.current_freq_scale;
-                            partial.target_freq = target_freq;
-                            
-                            // If smoothing is disabled, immediately update freq
-                            if self.smoothing < 0.001 {
-                                partial.freq = target_freq;
-                                // Calculate phase_delta for direct frequency changes
-                                partial.phase_delta = target_freq * WAVETABLE_SIZE as f32 / self.sample_rate;
-                            }
-                            
-                            // Update amplitude target directly (no smoothing for amplitude)
-                            partial.target_amp = amp / 100.0;  // Convert from dB scale
-                            partial.current_amp = partial.target_amp;
-                        }
-                    }
-                }
+            let update_channels = update.partials.len();
+            if update_channels != self.current_wavetables.len() {
+                self.resize_state_vectors(update_channels);
+            }
+            self.update_samples = (self.update_rate * self.sample_rate) as usize;
+            self.crossfade_start_sample = (self.update_samples as f32 * 2.0 / 3.0) as usize;
+            self.crossfade_end_sample = self.update_samples;
+            self.sample_counter = 0;
+            self.in_crossfade = false;
+            for (ch, ch_partials) in update.partials.iter().enumerate() {
+                self.next_wavetables[ch] = Self::build_wavetable(ch_partials, self.sample_rate);
+                self.next_root_freqs[ch] = ch_partials.iter().find(|&&(f, a)| f > 0.0 && a > 0.0).map(|&(f, _)| f).unwrap_or(1.0);
+                self.next_phases[ch] = 0.0;
             }
         }
     }
-    
-    /// Builds a buffer for resampling when needed
-    fn resample_buffer(_buffer: &mut [f32], _channels: usize) {
-        // Use a simpler processing approach on resource-constrained hardware
-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-        {
-            // Process in bigger chunks for better efficiency
-            for frame in (0.._buffer.len() / _channels).step_by(4) {
-                for ch in 0.._channels {
-                    let idx = frame * _channels + ch;
-                    if idx + 3 * _channels < _buffer.len() {
-                        // Simple lowpass filtering
-                        _buffer[idx] = _buffer[idx] * 0.7 + _buffer[idx + _channels] * 0.3;
-                    }
-                }
-            }
-        }
-    }
-    
-    /// Process a complete buffer of audio
+
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
-        // Early return if buffer is empty or invalid
         if buffer.is_empty() || channels == 0 {
             return;
         }
-
-        // Check if output buffer needs resizing
+        // Always guard output_buffer size
         if self.output_buffer.len() < channels {
             self.output_buffer.resize(channels, 0.0);
         }
-
-        // Apply any pending parameter updates first
         self.apply_updates();
-        
-        // Calculate frames to process
         let frames = buffer.len() / channels;
-        
-        // Calculate frequency crossfade rate based on smoothing parameter
-        let crossfade_rate = if self.smoothing < 0.001 {
-            1.0  // No smoothing = immediate changes
-        } else {
-            self.smoothing
-        };
-        
-        // Process each frame
         for frame in 0..frames {
-            // Clear output buffer
+            let mut crossfade = 0.0;
+            if self.sample_counter >= self.crossfade_start_sample && self.sample_counter < self.crossfade_end_sample {
+                crossfade = (self.sample_counter - self.crossfade_start_sample) as f32 /
+                    (self.crossfade_end_sample - self.crossfade_start_sample) as f32;
+                self.in_crossfade = true;
+            } else if self.sample_counter >= self.crossfade_end_sample {
+                self.current_wavetables = self.next_wavetables.clone();
+                self.root_freqs = self.next_root_freqs.clone();
+                self.curr_phases = self.next_phases.clone();
+                self.sample_counter = 0;
+                self.in_crossfade = false;
+                crossfade = 0.0;
+            }
             for ch in 0..channels {
+                if ch >= self.output_buffer.len() || ch >= self.current_wavetables.len() || ch >= self.next_wavetables.len() || ch >= self.curr_phases.len() || ch >= self.next_phases.len() || ch >= self.root_freqs.len() || ch >= self.next_root_freqs.len() {
+                    continue;
+                }
                 self.output_buffer[ch] = 0.0;
             }
-            
-            // Process all partials
-            for (ch_idx, channel) in self.partials.iter_mut().enumerate() {
-                for partial in channel.iter_mut() {
-                    // Apply frequency smoothing/crossfade if needed
-                    if (partial.freq - partial.target_freq).abs() > 0.01 {
-                        partial.freq = partial.freq * crossfade_rate + partial.target_freq * (1.0 - crossfade_rate);
-                        partial.phase_delta = partial.freq * WAVETABLE_SIZE as f32 / self.sample_rate;
-                    } else {
-                        partial.freq = partial.target_freq;
-                    }
-                    
-                    // Only generate audio if we have a frequency and amplitude
-                    if partial.freq > 0.0 && partial.target_amp > 0.0 {
-                        let idx_f = partial.phase % WAVETABLE_SIZE as f32;
-                        let idx1 = idx_f as usize;
-                        let idx2 = (idx1 + 1) % WAVETABLE_SIZE;
-                        let frac = idx_f - idx1 as f32;
-                        
-                        let sample = self.wavetable[idx1] * (1.0 - frac) + self.wavetable[idx2] * frac;
-                        let output_sample = sample * partial.target_amp;
-                        
-                        let output_ch = ch_idx % channels;
-                        self.output_buffer[output_ch] += output_sample;
-                        
-                        partial.phase = (partial.phase + partial.phase_delta) % WAVETABLE_SIZE as f32;
-                    }
+            for ch in 0..channels {
+                if ch >= self.output_buffer.len() || ch >= self.current_wavetables.len() || ch >= self.next_wavetables.len() || ch >= self.curr_phases.len() || ch >= self.next_phases.len() || ch >= self.root_freqs.len() || ch >= self.next_root_freqs.len() {
+                    continue;
                 }
+                let curr_phase = self.curr_phases[ch];
+                let next_phase = self.next_phases[ch];
+                let idx1 = curr_phase % WAVETABLE_SIZE as f32;
+                let idx1a = idx1 as usize;
+                let idx1b = (idx1a + 1) % WAVETABLE_SIZE;
+                let frac1 = idx1 - idx1a as f32;
+                let curr_sample = self.current_wavetables[ch][idx1a] * (1.0 - frac1) + self.current_wavetables[ch][idx1b] * frac1;
+                let idx2 = next_phase % WAVETABLE_SIZE as f32;
+                let idx2a = idx2 as usize;
+                let idx2b = (idx2a + 1) % WAVETABLE_SIZE;
+                let frac2 = idx2 - idx2a as f32;
+                let next_sample = self.next_wavetables[ch][idx2a] * (1.0 - frac2) + self.next_wavetables[ch][idx2b] * frac2;
+                let sample = if self.in_crossfade {
+                    curr_sample * (1.0 - crossfade) + next_sample * crossfade
+                } else {
+                    curr_sample
+                };
+                self.output_buffer[ch] = sample;
+                let curr_phase_inc = self.root_freqs[ch] * WAVETABLE_SIZE as f32 / self.sample_rate;
+                let next_phase_inc = self.next_root_freqs[ch] * WAVETABLE_SIZE as f32 / self.sample_rate;
+                self.curr_phases[ch] = (curr_phase + curr_phase_inc) % WAVETABLE_SIZE as f32;
+                self.next_phases[ch] = (next_phase + next_phase_inc) % WAVETABLE_SIZE as f32;
             }
-            
-            // Apply gain and write to output buffer with bounds checking
             let frame_start = frame * channels;
             if frame_start + channels <= buffer.len() {
                 for ch in 0..channels {
+                    if ch >= self.output_buffer.len() { continue; }
                     let idx = frame_start + ch;
                     buffer[idx] = (self.output_buffer[ch] * self.current_gain).clamp(-1.0, 1.0);
                 }
             }
+            self.sample_counter += 1;
         }
     }
 }
@@ -290,37 +287,41 @@ pub fn start_resynth_thread(
     
     let _update_thread = thread::spawn(move || {
         let mut last_update = Instant::now();
-        
         while !shutdown_flag_clone.load(Ordering::Relaxed) && update_thread_flag_clone.load(Ordering::Relaxed) {
-            // Get current config
-            if let Ok(config_guard) = config_for_thread.lock() {
-                let update_rate = config_guard.update_rate;
-                let gain = config_guard.gain;
-                let freq_scale = config_guard.freq_scale;
-                let smoothing = config_guard.smoothing;
-                drop(config_guard);
-                
-                if last_update.elapsed().as_secs_f32() >= update_rate {
-                    // Get new partial data and config
-                    if let Ok(spec_guard) = spectrum_app.lock() {
-                        let partials = spec_guard.clone_absolute_data();
-                        drop(spec_guard);
-                        
-                        // Create parameter update
-                        let update = SynthUpdate {
-                            partials,
-                            gain,
-                            freq_scale,
-                            smoothing,
-                        };
-                        
-                        // Submit update to the queue
-                        let _ = update_queue_clone.push(update);
-                        last_update = Instant::now();
-                    }
+            // Clone config and spectrum data with minimal lock duration
+            let (partials, gain, freq_scale, smoothing, update_rate) = {
+                let (partials, gain, freq_scale, smoothing, update_rate);
+                if let Ok(config_guard) = config_for_thread.lock() {
+                    gain = config_guard.gain;
+                    freq_scale = config_guard.freq_scale;
+                    smoothing = config_guard.smoothing;
+                    update_rate = config_guard.update_rate;
+                } else {
+                    gain = 0.25;
+                    freq_scale = 1.0;
+                    smoothing = 0.0;
+                    update_rate = DEFAULT_UPDATE_RATE;
                 }
+                if let Ok(spec_guard) = spectrum_app.lock() {
+                    partials = spec_guard.clone_absolute_data();
+                } else {
+                    partials = Vec::new();
+                }
+                (partials, gain, freq_scale, smoothing, update_rate)
+            };
+            // Only do heavy computation (wavetable build, etc.) after releasing locks
+            if last_update.elapsed().as_secs_f32() >= update_rate {
+                // Create parameter update
+                let update = SynthUpdate {
+                    partials,
+                    gain,
+                    freq_scale,
+                    smoothing,
+                };
+                // Submit update to the queue
+                let _ = update_queue_clone.push(update);
+                last_update = Instant::now();
             }
-            
             thread::sleep(Duration::from_millis(20));
         }
     });
