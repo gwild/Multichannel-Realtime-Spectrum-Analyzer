@@ -208,6 +208,12 @@ impl MyApp {
             buffer.resize(validated_size);
         }
 
+        // Signal resynth thread to restart due to buffer size change
+        if let Ok(resynth_config) = self.resynth_config.lock() {
+            resynth_config.needs_restart.store(true, Ordering::SeqCst);
+            info!("Signaled resynthesis thread to restart due to buffer size change");
+        }
+
         // Clear spectrograph history and reset start time when buffer size changes
         if let Ok(mut history) = self.spectrograph_history.lock() {
             let slices_per_second = self.sample_rate / validated_size as f64;

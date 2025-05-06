@@ -3,17 +3,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::RefCell;
 use portaudio as pa;
 use log::{info, error};
 use crate::plot::SpectrumApp;
 use crate::DEFAULT_NUM_PARTIALS;
 use crossbeam_queue::ArrayQueue;
+use anyhow::{Result, Error, anyhow};
 
-// Constants for audio performance
-const OUTPUT_BUFFER_SIZE: usize = 2048;  // Increased for better stability
-const UPDATE_RING_SIZE: usize = 4;
-const WAVETABLE_SIZE: usize = 4096;  // Size of wavetable for sine synthesis
-pub const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Default update rate in seconds
+// Constants for audio performance - with optimized values for JACK
+#[cfg(target_os = "linux")]
+const OUTPUT_BUFFER_SIZE: usize = 8192;  // Much larger for Linux/JACK compatibility
+
+#[cfg(not(target_os = "linux"))]
+const OUTPUT_BUFFER_SIZE: usize = 4096;  // Smaller on non-Linux platforms
+
+const UPDATE_RING_SIZE: usize = 8;       // Increased for smoother updates
+const WAVETABLE_SIZE: usize = 4096;      // Size of wavetable for sine synthesis
+pub const DEFAULT_UPDATE_RATE: f32 = 3.0; // Even higher to reduce CPU load for JACK
 
 /// Configuration for resynthesis
 pub struct ResynthConfig {
@@ -21,6 +28,7 @@ pub struct ResynthConfig {
     pub smoothing: f32,
     pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
     pub update_rate: f32, // How often to update synthesis (in seconds)
+    pub needs_restart: Arc<AtomicBool>,  // Flag to signal when stream needs to restart
 }
 
 impl Default for ResynthConfig {
@@ -30,6 +38,7 @@ impl Default for ResynthConfig {
             smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,
+            needs_restart: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -44,6 +53,7 @@ struct SynthUpdate {
 }
 
 /// State for a single partial
+#[derive(Clone)]
 struct PartialState {
     freq: f32,               // Current frequency
     target_freq: f32,        // Target frequency 
@@ -69,6 +79,7 @@ impl PartialState {
 }
 
 /// Lock-free synthesis engine
+#[derive(Clone)]
 struct WavetableSynth {
     // Sine wavetable for efficient synthesis
     wavetable: Vec<f32>,
@@ -157,27 +168,47 @@ impl WavetableSynth {
         }
     }
     
+    /// Builds a buffer for resampling when needed
+    fn resample_buffer(_buffer: &mut [f32], _channels: usize) {
+        // Use a simpler processing approach on resource-constrained hardware
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        {
+            // Process in bigger chunks for better efficiency
+            for frame in (0.._buffer.len() / _channels).step_by(4) {
+                for ch in 0.._channels {
+                    let idx = frame * _channels + ch;
+                    if idx + 3 * _channels < _buffer.len() {
+                        // Simple lowpass filtering
+                        _buffer[idx] = _buffer[idx] * 0.7 + _buffer[idx + _channels] * 0.3;
+                    }
+                }
+            }
+        }
+    }
+    
     /// Process a complete buffer of audio
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
+        // Early return if buffer is empty or invalid
+        if buffer.is_empty() || channels == 0 {
+            return;
+        }
+
+        // Check if output buffer needs resizing
+        if self.output_buffer.len() < channels {
+            self.output_buffer.resize(channels, 0.0);
+        }
+
         // Apply any pending parameter updates first
         self.apply_updates();
         
         // Calculate frames to process
         let frames = buffer.len() / channels;
         
-        // Ensure output buffer is large enough
-        if self.output_buffer.len() < channels {
-            self.output_buffer.resize(channels, 0.0);
-        }
-        
         // Calculate frequency crossfade rate based on smoothing parameter
-        // - When smoothing = 0, crossfade_rate = 1.0 (immediate change)
-        // - When smoothing = 0.9999, crossfade_rate is very small (slow change)
         let crossfade_rate = if self.smoothing < 0.001 {
             1.0  // No smoothing = immediate changes
         } else {
-            // Use direct smoothing value which matches the original behavior better
-            self.smoothing  // Original code used this value directly
+            self.smoothing
         };
         
         // Process each frame
@@ -192,44 +223,37 @@ impl WavetableSynth {
                 for partial in channel.iter_mut() {
                     // Apply frequency smoothing/crossfade if needed
                     if (partial.freq - partial.target_freq).abs() > 0.01 {
-                        // Original crossfade formula that matches Python implementation
-                        // Higher smoothing = slower transition
                         partial.freq = partial.freq * crossfade_rate + partial.target_freq * (1.0 - crossfade_rate);
-                        
-                        // Recalculate phase_delta based on current frequency
                         partial.phase_delta = partial.freq * WAVETABLE_SIZE as f32 / self.sample_rate;
                     } else {
-                        // Close enough to target - snap to exact value
                         partial.freq = partial.target_freq;
                     }
                     
                     // Only generate audio if we have a frequency and amplitude
                     if partial.freq > 0.0 && partial.target_amp > 0.0 {
-                        // Fast wavetable lookup with linear interpolation
                         let idx_f = partial.phase % WAVETABLE_SIZE as f32;
                         let idx1 = idx_f as usize;
                         let idx2 = (idx1 + 1) % WAVETABLE_SIZE;
                         let frac = idx_f - idx1 as f32;
                         
-                        // Linear interpolation between adjacent wavetable samples
                         let sample = self.wavetable[idx1] * (1.0 - frac) + self.wavetable[idx2] * frac;
-                        
-                        // Apply amplitude and add to output
                         let output_sample = sample * partial.target_amp;
                         
-                        // Distribute to stereo channels (simple panning)
                         let output_ch = ch_idx % channels;
                         self.output_buffer[output_ch] += output_sample;
                         
-                        // Update phase accumulator for next sample
                         partial.phase = (partial.phase + partial.phase_delta) % WAVETABLE_SIZE as f32;
                     }
                 }
             }
             
-            // Apply gain and write to output buffer
-            for ch in 0..channels {
-                buffer[frame * channels + ch] = (self.output_buffer[ch] * self.current_gain).clamp(-1.0, 1.0);
+            // Apply gain and write to output buffer with bounds checking
+            let frame_start = frame * channels;
+            if frame_start + channels <= buffer.len() {
+                for ch in 0..channels {
+                    let idx = frame_start + ch;
+                    buffer[idx] = (self.output_buffer[ch] * self.current_gain).clamp(-1.0, 1.0);
+                }
             }
         }
     }
@@ -255,31 +279,25 @@ pub fn start_resynth_thread(
     };
     
     // Create synthesis engine and shared queue between threads
-    let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2)); // Extra capacity to avoid blocking
+    let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2));
     
-    // Create and initialize synth directly; no mutex needed for audio thread
-    let mut synth = WavetableSynth::new(
-        num_channels, 
-        num_partials,
-        sample_rate as f32,
-        Arc::clone(&update_queue)
-    );
-    
-    // Clone for update thread
-    let update_queue_clone = Arc::clone(&update_queue);
+    // Create update thread to feed the synth with new analysis data
+    let update_thread_flag = Arc::new(AtomicBool::new(true));
+    let update_thread_flag_clone = Arc::clone(&update_thread_flag);
     let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+    let update_queue_clone = Arc::clone(&update_queue);
+    let config_for_thread = Arc::clone(&config);
     
-    // Update thread to feed the synth with new analysis data
     let _update_thread = thread::spawn(move || {
         let mut last_update = Instant::now();
         
-        while !shutdown_flag_clone.load(Ordering::Relaxed) {
+        while !shutdown_flag_clone.load(Ordering::Relaxed) && update_thread_flag_clone.load(Ordering::Relaxed) {
             // Get current config
-            if let Ok(config_guard) = config.lock() {
+            if let Ok(config_guard) = config_for_thread.lock() {
                 let update_rate = config_guard.update_rate;
                 let gain = config_guard.gain;
                 let freq_scale = config_guard.freq_scale;
-                let smoothing = config_guard.smoothing;  // Add smoothing parameter for crossfade control
+                let smoothing = config_guard.smoothing;
                 drop(config_guard);
                 
                 if last_update.elapsed().as_secs_f32() >= update_rate {
@@ -293,7 +311,7 @@ pub fn start_resynth_thread(
                             partials,
                             gain,
                             freq_scale,
-                            smoothing,  // Add smoothing parameter for crossfade control
+                            smoothing,
                         };
                         
                         // Submit update to the queue
@@ -303,63 +321,162 @@ pub fn start_resynth_thread(
                 }
             }
             
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(20));
         }
     });
-    
-    // Set up PortAudio
-    let pa = match pa::PortAudio::new() {
-        Ok(pa) => pa,
-        Err(e) => {
-            error!("Failed to initialize PortAudio: {}", e);
-            return;
+
+    // Main thread that handles audio stream lifecycle
+    std::thread::spawn(move || {
+        let mut current_stream: Option<pa::Stream<pa::NonBlocking, pa::Output<f32>>> = None;
+        let mut last_restart_time = Instant::now();
+        let mut consecutive_errors = 0;
+        
+        // Store the restart flag for checking
+        let needs_restart = Arc::clone(&config.lock().unwrap().needs_restart);
+        
+        // Main loop continues until shutdown
+        while !shutdown_flag.load(Ordering::Relaxed) {
+            // Check if we need to restart
+            let needs_restart_now = needs_restart.load(Ordering::Relaxed) || current_stream.is_none();
+            
+            // Debounce restarts with exponential backoff
+            let backoff_time = if consecutive_errors > 0 {
+                Duration::from_millis((500 * consecutive_errors as u64).min(5000))
+            } else {
+                Duration::from_millis(500)
+            };
+            
+            if needs_restart_now && last_restart_time.elapsed() < backoff_time {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            
+            // Handle restart case
+            if needs_restart_now {
+                info!("Restarting audio stream...");
+                
+                // Clean up existing stream if any
+                if let Some(mut stream) = current_stream.take() {
+                    let _ = stream.stop();
+                    // Add small delay after stopping the stream
+                    thread::sleep(Duration::from_millis(100));
+                }
+                
+                // Mark restart handled
+                needs_restart.store(false, Ordering::Relaxed);
+                last_restart_time = Instant::now();
+                
+                // Setup new stream with retry logic
+                match setup_audio_stream(
+                    device_index,
+                    sample_rate,
+                    Arc::clone(&update_queue),
+                    num_channels,
+                    num_partials
+                ) {
+                    Ok(stream) => {
+                        current_stream = Some(stream);
+                        consecutive_errors = 0;
+                        info!("Audio stream restarted successfully");
+                    },
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        error!("Failed to restart audio stream (attempt {}): {}", consecutive_errors, e);
+                        // Let the next iteration handle the retry
+                        continue;
+                    }
+                }
+            }
+            
+            // Check stream health if we have one
+            if let Some(ref stream) = current_stream {
+                if let Err(e) = stream.is_active() {
+                    error!("Stream health check failed: {}, will restart", e);
+                    current_stream = None;
+                    consecutive_errors += 1;
+                }
+            }
+            
+            // Sleep a bit before next check
+            thread::sleep(Duration::from_millis(100));
         }
-    };
+        
+        // Shutdown - stop stream if it exists
+        if let Some(mut stream) = current_stream {
+            let _ = stream.stop();
+        }
+        
+        // Stop the update thread
+        update_thread_flag.store(false, Ordering::Relaxed);
+        info!("Resynthesis thread shutting down");
+    });
+}
+
+/// Sets up a PortAudio output stream with the given parameters
+fn setup_audio_stream(
+    device_index: pa::DeviceIndex,
+    sample_rate: f64, 
+    update_queue: Arc<ArrayQueue<SynthUpdate>>,
+    num_channels: usize,
+    num_partials: usize
+) -> Result<pa::Stream<pa::NonBlocking, pa::Output<f32>>, anyhow::Error> {
+    // Initialize PortAudio
+    let pa = pa::PortAudio::new()?;
     
+    // Get device info
+    let device_info = pa.device_info(device_index)?;
+    
+    // Create output parameters
     let output_params = pa::StreamParameters::<f32>::new(
         device_index,
         2, // Stereo output
         true,
-        0.1 // Higher latency for stability
+        device_info.default_low_output_latency
     );
     
-    let settings = pa::OutputStreamSettings::new(
+    // Choose a supported sample rate
+    let supported_sample_rate = match pa.is_output_format_supported(output_params, sample_rate) {
+        Ok(_) => sample_rate,
+        Err(_) => {
+            // Try common sample rates
+            let fallback_sample_rates = [44100.0, 48000.0, 96000.0, 192000.0];
+            let supported_rate = fallback_sample_rates
+                .iter()
+                .find(|&&rate| pa.is_output_format_supported(output_params, rate).is_ok())
+                .copied()
+                .unwrap_or(44100.0);
+            
+            info!("Sample rate {} not supported, using {} instead", sample_rate, supported_rate);
+            supported_rate
+        }
+    };
+    
+    // Create output settings
+    let settings = pa::stream::OutputSettings::new(
         output_params,
-        sample_rate,
+        supported_sample_rate,
         OUTPUT_BUFFER_SIZE as u32
     );
     
-    // Create audio callback - capturing synth by value
+    // Create synthesizer for the callback
+    let synth_for_callback = std::cell::RefCell::new(WavetableSynth::new(
+        num_channels, 
+        num_partials,
+        supported_sample_rate as f32,
+        update_queue
+    ));
+    
+    // Create callback function
     let callback = move |args: pa::OutputStreamCallbackArgs<f32>| {
-        // Process directly without any locks
+        // Use borrow_mut() to get mutable access
+        let mut synth = synth_for_callback.borrow_mut();
         synth.process_buffer(args.buffer, 2); // 2 = stereo
         pa::Continue
     };
     
-    // Open stream
-    let mut stream = match pa.open_non_blocking_stream(settings, callback) {
-        Ok(stream) => stream,
-        Err(e) => {
-            error!("Failed to open output stream: {}", e);
-            return;
-        }
-    };
+    // Open and start the stream
+    let mut stream = pa.open_non_blocking_stream(settings, callback)?;
+    stream.start()?;
     
-    // Start stream
-    if let Err(e) = stream.start() {
-        error!("Failed to start output stream: {}", e);
-        return;
-    }
-    
-    // Wait for shutdown
-    while !shutdown_flag.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(100));
-    }
-    
-    // Cleanup
-    if let Err(e) = stream.stop() {
-        error!("Error stopping stream: {}", e);
-    }
-    
-    info!("Resynthesis thread shutting down");
+    Ok(stream)
 } 
