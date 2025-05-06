@@ -1,195 +1,21 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
-use log::{info, error, trace};
+use log::{info, error};
 use crate::plot::SpectrumApp;
-use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
-use rayon::prelude::*;  // Add at top with other imports
+use crate::DEFAULT_NUM_PARTIALS;
+use crossbeam_queue::ArrayQueue;
 
-// Constants used in the code
-const CROSSFADE_THRESHOLD: f32 = 20.0;  // Used in SmoothParam::large_change()
-const ATTACK_TIME: f32 = 0.02;          // Used in envelope calculations
-const RELEASE_TIME: f32 = 0.03;         // Used in envelope calculations
-const MIN_ENVELOPE_VALUE: f32 = 0.001;  // Used in envelope calculations
-const ZERO_CROSSING_THRESHOLD: f32 = 0.01;  // Used in is_at_zero_crossing()
-const CROSSFADE_FRAMES: usize = 64;     // Used in prepare_crossfade()
-const PHASE_RESET_THRESHOLD: f32 = 5.0;  // Used in needs_phase_reset()
-pub const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Used in ResynthConfig default
+// Constants for audio performance
+const OUTPUT_BUFFER_SIZE: usize = 2048;  // Increased for better stability
+const UPDATE_RING_SIZE: usize = 4;
+const WAVETABLE_SIZE: usize = 4096;  // Size of wavetable for sine synthesis
+pub const DEFAULT_UPDATE_RATE: f32 = 1.0;   // Default update rate in seconds
 
-#[derive(Clone)]
-struct SmoothParam {
-    current: f32,
-    target: f32,
-    prev_target: f32, // Track previous target for detecting large changes
-}
-
-impl SmoothParam {
-    fn new(value: f32) -> Self {
-        Self {
-            current: value,
-            target: value,
-            prev_target: value,
-        }
-    }
-
-    fn update(&mut self, target: f32, smoothing: f32) {
-        self.prev_target = self.target;
-        self.target = target;
-        if smoothing == 0.0 {
-            self.current = target;  // Direct update, no smoothing calculation
-        } else {
-            // High smoothing = more weight on current value
-            let old_weight = smoothing;           // Keep more of old value when smoothing is high
-            let new_weight = 1.0 - smoothing;     // Take less of new value when smoothing is high
-            self.current = self.current * old_weight + target * new_weight;
-        }
-    }
-    
-    fn large_change(&self) -> bool {
-        (self.target - self.prev_target).abs() > CROSSFADE_THRESHOLD
-    }
-}
-
-#[derive(Clone)]
-struct PartialState {
-    freq: SmoothParam,
-    amp: SmoothParam,
-    phase: f32,
-    crossfade_counter: usize,
-    is_active: bool,
-    envelope: f32,
-    old_sample: f32, // Previous sample for zero-crossing detection
-    needs_crossfade: bool, // Flag to indicate when crossfading is needed
-    crossfade_buffer: Vec<f32>, // Buffer to store old samples for crossfading
-    last_freq_change: f32, // Track when the last significant frequency change occurred
-}
-
-impl PartialState {
-    fn new() -> Self {
-        Self {
-            freq: SmoothParam::new(0.0),
-            amp: SmoothParam::new(0.0),
-            phase: 0.0,
-            crossfade_counter: 0,
-            is_active: false,
-            envelope: 0.0,
-            old_sample: 0.0,
-            needs_crossfade: false,
-            crossfade_buffer: vec![0.0; CROSSFADE_FRAMES],
-            last_freq_change: 0.0,
-        }
-    }
-    
-    // Determine if phase needs reset due to large frequency change
-    fn needs_phase_reset(&self) -> bool {
-        // Only consider phase reset if the frequency change is significant
-        (self.freq.target - self.freq.prev_target).abs() > PHASE_RESET_THRESHOLD
-    }
-
-    // Check if we're at or near a zero crossing
-    fn is_at_zero_crossing(&self, current_sample: f32) -> bool {
-        // Zero crossing occurs when samples change sign or are very close to zero
-        (self.old_sample * current_sample <= 0.0) || 
-        current_sample.abs() < ZERO_CROSSING_THRESHOLD
-    }
-
-    // Prepare for crossfade when significant changes occur
-    fn prepare_crossfade(&mut self, frames: usize) {
-        self.needs_crossfade = true;
-        self.crossfade_counter = frames.min(CROSSFADE_FRAMES).max(1);
-        // Ensure buffer is the right size
-        if self.crossfade_buffer.len() < self.crossfade_counter {
-            self.crossfade_buffer.resize(self.crossfade_counter, 0.0);
-        }
-    }
-
-    // Store a sample in the crossfade buffer
-    fn store_sample(&mut self, sample: f32, position: usize) {
-        if position < self.crossfade_buffer.len() && position < CROSSFADE_FRAMES {
-            self.crossfade_buffer[position] = sample;
-        }
-    }
-
-    // Get a crossfaded sample
-    fn get_crossfaded_sample(&self, new_sample: f32, position: usize) -> f32 {
-        if !self.needs_crossfade || position >= self.crossfade_counter {
-            return new_sample;
-        }
-        
-        let old_sample = if position < self.crossfade_buffer.len() {
-            self.crossfade_buffer[position]
-        } else {
-            0.0
-        };
-        
-        // Apply smooth crossfade curve (cosine interpolation)
-        let ratio = position as f32 / self.crossfade_counter as f32;
-        let crossfade_gain = 0.5 - 0.5 * (ratio * std::f32::consts::PI).cos();
-        old_sample * (1.0 - crossfade_gain) + new_sample * crossfade_gain
-    }
-
-    // Update envelope based on amplitude changes for smooth attack/release
-    fn update_envelope(&mut self, sample_rate: f32, attack_samples: usize, release_samples: usize) {
-        // Calculate smoother envelope curves using exponential approach
-        if self.amp.target > 0.001 {
-            // Partial is active or becoming active
-            if !self.is_active {
-                // Start attack phase
-                self.is_active = true;
-                self.crossfade_counter = attack_samples;
-                // If this is a new partial, ensure envelope starts from very low value
-                if self.envelope < MIN_ENVELOPE_VALUE {
-                    self.envelope = MIN_ENVELOPE_VALUE;
-                }
-            }
-            
-            // Update envelope during attack - use exponential curve for smoother attack
-            if self.crossfade_counter > 0 {
-                // Exponential attack curve - starts slow, then accelerates
-                let progress = 1.0 - (self.crossfade_counter as f32 / attack_samples as f32);
-                let target = progress * progress; // Quadratic curve for smoother attack
-                
-                // Gradually approach target with smoothing
-                self.envelope = self.envelope * 0.9 + target * 0.1;
-                self.envelope = self.envelope.min(1.0);
-                self.crossfade_counter -= 1;
-            } else if self.envelope < 0.999 {
-                // Continue smoothly approaching 1.0 even after counter expires
-                self.envelope = self.envelope * 0.97 + 0.03;
-                if self.envelope > 0.999 {
-                    self.envelope = 1.0;
-                }
-            }
-        } else if self.is_active || self.envelope > MIN_ENVELOPE_VALUE {
-            // Partial is becoming inactive
-            if self.is_active {
-                self.is_active = false;
-                self.crossfade_counter = release_samples;
-            }
-            
-            // Update envelope during release - exponential curve for natural fade out
-            if self.crossfade_counter > 0 {
-                // Exponential release curve - fades out more naturally
-                let progress = self.crossfade_counter as f32 / release_samples as f32;
-                let target = progress * progress; // Quadratic curve
-                
-                // Gradually approach target with smoothing
-                self.envelope = self.envelope * 0.9 + target * 0.1;
-                self.crossfade_counter -= 1;
-            } else {
-                // Continue smoothly approaching 0 even after counter expires
-                self.envelope = self.envelope * 0.97;
-                if self.envelope < MIN_ENVELOPE_VALUE {
-                    self.envelope = 0.0;
-                }
-            }
-        }
-    }
-}
-
+/// Configuration for resynthesis
 pub struct ResynthConfig {
     pub gain: f32,
     pub smoothing: f32,
@@ -208,44 +34,208 @@ impl Default for ResynthConfig {
     }
 }
 
+/// Parameter update structure
 #[derive(Clone)]
-struct SynthInstance {
-    partial_states: Vec<Vec<PartialState>>,
-    fade_level: f32,  // 0.0 to 1.0 for crossfading
-    num_partials: usize,  // Add num_partials field
+struct SynthUpdate {
+    partials: Vec<Vec<(f32, f32)>>,
+    gain: f32,
+    freq_scale: f32,
+    smoothing: f32,  // Add smoothing parameter for crossfade control
 }
 
-impl SynthInstance {
-    fn new(num_channels: usize) -> Self {
+/// State for a single partial
+struct PartialState {
+    freq: f32,               // Current frequency
+    target_freq: f32,        // Target frequency 
+    amp: f32,
+    phase: f32,
+    phase_delta: f32,
+    target_amp: f32,
+    current_amp: f32,
+}
+
+impl PartialState {
+    fn new() -> Self {
         Self {
-            partial_states: vec![vec![PartialState::new(); DEFAULT_NUM_PARTIALS]; num_channels],
-            fade_level: 0.0,
-            num_partials: DEFAULT_NUM_PARTIALS,
+            freq: 0.0,
+            target_freq: 0.0,
+            amp: 0.0,
+            phase: 0.0,
+            phase_delta: 0.0,
+            target_amp: 0.0,
+            current_amp: 0.0,
+        }
+    }
+}
+
+/// Lock-free synthesis engine
+struct WavetableSynth {
+    // Sine wavetable for efficient synthesis
+    wavetable: Vec<f32>,
+    
+    // Current state for all partials
+    partials: Vec<Vec<PartialState>>,
+    
+    // Sample rate for phase calculation
+    sample_rate: f32,
+    
+    // Pre-allocated output buffer to avoid allocations in audio thread
+    output_buffer: Vec<f32>,
+    
+    // Channels for parameter updates - lock-free queue
+    update_queue: Arc<ArrayQueue<SynthUpdate>>,
+    
+    // Current parameter values
+    current_gain: f32,
+    current_freq_scale: f32,
+    smoothing: f32,  // Add smoothing parameter for crossfade control
+}
+
+impl WavetableSynth {
+    fn new(num_channels: usize, num_partials: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
+        // Create sine wavetable
+        let wavetable = (0..WAVETABLE_SIZE)
+            .map(|i| (i as f32 / WAVETABLE_SIZE as f32 * 2.0 * PI).sin())
+            .collect();
+        
+        // Initialize partials
+        let partials = (0..num_channels)
+            .map(|_| (0..num_partials)
+                .map(|_| PartialState::new())
+                .collect())
+            .collect();
+        
+        // Pre-allocate output buffer (stereo by default)
+        let output_buffer = vec![0.0; 2];
+        
+        Self {
+            wavetable,
+            partials,
+            sample_rate,
+            output_buffer,
+            update_queue,
+            current_gain: 0.25,
+            current_freq_scale: 1.0,
+            smoothing: 0.0,  // Add smoothing parameter for crossfade control
         }
     }
     
-    // Add method to update number of partials if needed
-    fn update_num_partials(&mut self, new_num_partials: usize) {
-        if self.num_partials == new_num_partials {
-            return; // No change needed
+    /// Apply any pending updates
+    fn apply_updates(&mut self) {
+        // Process all available updates, keeping only the most recent
+        while let Some(update) = self.update_queue.pop() {
+            // Update global parameters
+            self.current_gain = update.gain;
+            self.current_freq_scale = update.freq_scale;
+            self.smoothing = update.smoothing;
+            
+            // Update partial parameters
+            for (ch, channel_partials) in update.partials.iter().enumerate() {
+                if ch < self.partials.len() {
+                    for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
+                        if i < self.partials[ch].len() {
+                            let partial = &mut self.partials[ch][i];
+                            
+                            // Store target frequency (with scaling applied)
+                            let target_freq = freq * self.current_freq_scale;
+                            partial.target_freq = target_freq;
+                            
+                            // If smoothing is disabled, immediately update freq
+                            if self.smoothing < 0.001 {
+                                partial.freq = target_freq;
+                                // Calculate phase_delta for direct frequency changes
+                                partial.phase_delta = target_freq * WAVETABLE_SIZE as f32 / self.sample_rate;
+                            }
+                            
+                            // Update amplitude target directly (no smoothing for amplitude)
+                            partial.target_amp = amp / 100.0;  // Convert from dB scale
+                            partial.current_amp = partial.target_amp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Process a complete buffer of audio
+    fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
+        // Apply any pending parameter updates first
+        self.apply_updates();
+        
+        // Calculate frames to process
+        let frames = buffer.len() / channels;
+        
+        // Ensure output buffer is large enough
+        if self.output_buffer.len() < channels {
+            self.output_buffer.resize(channels, 0.0);
         }
         
-        // Update the stored value
-        self.num_partials = new_num_partials;
+        // Calculate frequency crossfade rate based on smoothing parameter
+        // - When smoothing = 0, crossfade_rate = 1.0 (immediate change)
+        // - When smoothing = 0.9999, crossfade_rate is very small (slow change)
+        let crossfade_rate = if self.smoothing < 0.001 {
+            1.0  // No smoothing = immediate changes
+        } else {
+            // Use direct smoothing value which matches the original behavior better
+            self.smoothing  // Original code used this value directly
+        };
         
-        // Resize all channel's partial_states arrays
-        for channel_states in self.partial_states.iter_mut() {
-            if channel_states.len() < new_num_partials {
-                // Need to add more partials
-                channel_states.resize_with(new_num_partials, PartialState::new);
-            } else if channel_states.len() > new_num_partials {
-                // Need to remove some partials
-                channel_states.truncate(new_num_partials);
+        // Process each frame
+        for frame in 0..frames {
+            // Clear output buffer
+            for ch in 0..channels {
+                self.output_buffer[ch] = 0.0;
+            }
+            
+            // Process all partials
+            for (ch_idx, channel) in self.partials.iter_mut().enumerate() {
+                for partial in channel.iter_mut() {
+                    // Apply frequency smoothing/crossfade if needed
+                    if (partial.freq - partial.target_freq).abs() > 0.01 {
+                        // Original crossfade formula that matches Python implementation
+                        // Higher smoothing = slower transition
+                        partial.freq = partial.freq * crossfade_rate + partial.target_freq * (1.0 - crossfade_rate);
+                        
+                        // Recalculate phase_delta based on current frequency
+                        partial.phase_delta = partial.freq * WAVETABLE_SIZE as f32 / self.sample_rate;
+                    } else {
+                        // Close enough to target - snap to exact value
+                        partial.freq = partial.target_freq;
+                    }
+                    
+                    // Only generate audio if we have a frequency and amplitude
+                    if partial.freq > 0.0 && partial.target_amp > 0.0 {
+                        // Fast wavetable lookup with linear interpolation
+                        let idx_f = partial.phase % WAVETABLE_SIZE as f32;
+                        let idx1 = idx_f as usize;
+                        let idx2 = (idx1 + 1) % WAVETABLE_SIZE;
+                        let frac = idx_f - idx1 as f32;
+                        
+                        // Linear interpolation between adjacent wavetable samples
+                        let sample = self.wavetable[idx1] * (1.0 - frac) + self.wavetable[idx2] * frac;
+                        
+                        // Apply amplitude and add to output
+                        let output_sample = sample * partial.target_amp;
+                        
+                        // Distribute to stereo channels (simple panning)
+                        let output_ch = ch_idx % channels;
+                        self.output_buffer[output_ch] += output_sample;
+                        
+                        // Update phase accumulator for next sample
+                        partial.phase = (partial.phase + partial.phase_delta) % WAVETABLE_SIZE as f32;
+                    }
+                }
+            }
+            
+            // Apply gain and write to output buffer
+            for ch in 0..channels {
+                buffer[frame * channels + ch] = (self.output_buffer[ch] * self.current_gain).clamp(-1.0, 1.0);
             }
         }
     }
 }
 
+/// Starts a thread that performs real-time resynthesis of the analyzed spectrum.
 pub fn start_resynth_thread(
     spectrum_app: Arc<Mutex<SpectrumApp>>,
     config: Arc<Mutex<ResynthConfig>>,
@@ -253,7 +243,7 @@ pub fn start_resynth_thread(
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
 ) {
-    // Get current number of partials and channels from spectrum_app
+    // Initialize channels
     let (num_channels, num_partials) = {
         let spec_app = spectrum_app.lock().unwrap();
         (spec_app.clone_absolute_data().len(), 
@@ -264,191 +254,112 @@ pub fn start_resynth_thread(
          })
     };
     
-    // Create two synthesis instances with the correct number of partials
-    let mut current_synth = SynthInstance {
-        partial_states: vec![vec![PartialState::new(); num_partials]; num_channels],
-        fade_level: 0.0,
-        num_partials,
-    };
+    // Create synthesis engine and shared queue between threads
+    let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2)); // Extra capacity to avoid blocking
     
-    let mut next_synth = current_synth.clone();
-    let mut is_crossfading = false;
-    let mut crossfade_samples_remaining = 0;
-    let mut last_update = std::time::Instant::now();
-
-    // Helper function to generate a frame of audio
-    fn generate_frame(synth: &mut SynthInstance, frame: usize, sample_rate: f64) -> (f32, f32) {
-        let mut left = 0.0;
-        let mut right = 0.0;
+    // Create and initialize synth directly; no mutex needed for audio thread
+    let mut synth = WavetableSynth::new(
+        num_channels, 
+        num_partials,
+        sample_rate as f32,
+        Arc::clone(&update_queue)
+    );
+    
+    // Clone for update thread
+    let update_queue_clone = Arc::clone(&update_queue);
+    let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+    
+    // Update thread to feed the synth with new analysis data
+    let _update_thread = thread::spawn(move || {
+        let mut last_update = Instant::now();
         
-        for (channel, states) in synth.partial_states.iter_mut().enumerate() {
-            for state in states {
-                if state.freq.current > 0.0 && (state.amp.current > 0.0 || state.envelope > 0.0) {
-                    let amplitude = (state.amp.current / 100.0) * state.envelope;
-                    let sample = amplitude * state.phase.sin();
-                    
-                    // Update phase for next sample
-                    state.phase += 2.0 * PI * state.freq.current / sample_rate as f32;
-                    if state.phase >= 2.0 * PI {
-                        state.phase -= 2.0 * PI;
-                    }
-                    
-                    if channel % 2 == 0 {
-                        left += sample;
-                    } else {
-                        right += sample;
-                    }
-                }
-            }
-        }
-        (left, right)
-    }
-
-    let callback = move |args: pa::OutputStreamCallbackArgs<f32>| {
-        let buffer = args.buffer;
-        let frames = buffer.len() / 2;
-        
-        // Get config values
-        let config_lock = config.lock().unwrap();
-        let mut gain = config_lock.gain;
-        let update_rate = config_lock.update_rate;
-        let crossfade_duration = (update_rate * 0.25 * sample_rate as f32) as usize;
-        
-        // Apply system volume scaling (0.0-1.0 range)
-        // This makes the application respond to system volume controls
-        gain *= 1.0;
-        
-        // Check if it's time to update
-        let should_update = last_update.elapsed().as_secs_f32() >= update_rate;
-        
-        if should_update {
-            last_update = std::time::Instant::now();
-            
-            // Debug print FFT data
-            let partials = spectrum_app.lock().unwrap().clone_absolute_data();
-            // Only log this detailed FFT data at trace level
-            trace!("Got FFT data: {} channels", partials.len());
-            for (ch, channel_data) in partials.iter().enumerate() {
-                trace!("Channel {}: {} partials", ch, channel_data.len());
-                for &(freq, amp) in channel_data.iter().take(3) {  // Print first 3 partials
-                    trace!("  Freq: {:.1}, Amp: {:.1}", freq, amp);
-                }
-            }
-            
-            // Clone current synth to preserve smoothing state
-            next_synth = current_synth.clone();
-            
-            // Update with new FFT data
-            let partials = spectrum_app.lock().unwrap().clone_absolute_data();
-            
-            // Update number of partials if needed
-            if !partials.is_empty() && !partials[0].is_empty() {
-                let new_num_partials = partials[0].len();
-                if next_synth.num_partials != new_num_partials {
-                    next_synth.update_num_partials(new_num_partials);
-                }
-            }
-            
-            for (channel, channel_partials) in partials.iter().enumerate() {
-                // Add new channels if needed
-                while next_synth.partial_states.len() <= channel {
-                    next_synth.partial_states.push(vec![PartialState::new(); next_synth.num_partials]);
-                }
+        while !shutdown_flag_clone.load(Ordering::Relaxed) {
+            // Get current config
+            if let Ok(config_guard) = config.lock() {
+                let update_rate = config_guard.update_rate;
+                let gain = config_guard.gain;
+                let freq_scale = config_guard.freq_scale;
+                let smoothing = config_guard.smoothing;  // Add smoothing parameter for crossfade control
+                drop(config_guard);
                 
-                for (i, &(freq, amp)) in channel_partials.iter().enumerate() {
-                    // Make sure we don't go out of bounds with the partials
-                    if i < next_synth.partial_states[channel].len() {
-                        let state = &mut next_synth.partial_states[channel][i];
-                        state.freq.update(freq * config_lock.freq_scale, config_lock.smoothing);
-                        state.amp.update(amp, config_lock.smoothing);
+                if last_update.elapsed().as_secs_f32() >= update_rate {
+                    // Get new partial data and config
+                    if let Ok(spec_guard) = spectrum_app.lock() {
+                        let partials = spec_guard.clone_absolute_data();
+                        drop(spec_guard);
                         
-                        // Update envelope with smoothing instead of direct assignment
-                        let target_envelope = if amp > 0.0 { 1.0 } else { 0.0 };
-                        state.envelope = if config_lock.smoothing == 0.0 {
-                            target_envelope
-                        } else {
-                            state.envelope * config_lock.smoothing + target_envelope * (1.0 - config_lock.smoothing)
+                        // Create parameter update
+                        let update = SynthUpdate {
+                            partials,
+                            gain,
+                            freq_scale,
+                            smoothing,  // Add smoothing parameter for crossfade control
                         };
+                        
+                        // Submit update to the queue
+                        let _ = update_queue_clone.push(update);
+                        last_update = Instant::now();
                     }
                 }
             }
             
-            is_crossfading = true;
-            crossfade_samples_remaining = crossfade_duration;
+            thread::sleep(Duration::from_millis(10));
         }
-
-        if is_crossfading {
-            // Generate audio from both instances and crossfade
-            let fade_out = (crossfade_samples_remaining as f32 / crossfade_duration as f32).max(0.0);
-            let fade_in = 1.0 - fade_out;
-
-            for frame in 0..frames {
-                let (old_left, old_right) = generate_frame(&mut current_synth, frame, sample_rate);
-                let (new_left, new_right) = generate_frame(&mut next_synth, frame, sample_rate);
-
-                buffer[frame * 2] = (old_left * fade_out + new_left * fade_in) * gain;
-                buffer[frame * 2 + 1] = (old_right * fade_out + new_right * fade_in) * gain;
-            }
-
-            if crossfade_samples_remaining > frames {
-                crossfade_samples_remaining -= frames;
-            } else {
-                crossfade_samples_remaining = 0;
-                is_crossfading = false;
-                current_synth = next_synth.clone();
-            }
-        } else {
-            // Normal synthesis from current instance
-            for frame in 0..frames {
-                let (left, right) = generate_frame(&mut current_synth, frame, sample_rate);
-                buffer[frame * 2] = left * gain;
-                buffer[frame * 2 + 1] = right * gain;
-            }
-        }
-
-        pa::Continue
-    };
-
-    thread::spawn(move || {
-        let pa = match pa::PortAudio::new() {
-            Ok(pa) => pa,
-            Err(e) => {
-                error!("Failed to initialize PortAudio for resynthesis: {}", e);
-                return;
-            }
-        };
-
-        let output_params = pa::StreamParameters::<f32>::new(
-            device_index, 
-            2,
-            true,
-            0.1
-        );
-
-        let settings = pa::OutputStreamSettings::new(
-            output_params,
-            sample_rate,
-            // Keep original larger buffer size for Pi
-            if cfg!(target_arch = "arm") { 1024 } else { 512 },
-        );
-
-        let mut stream = match pa.open_non_blocking_stream(settings, callback) {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Failed to open output stream: {}", e);
-                return;
-            }
-        };
-
-        if let Err(e) = stream.start() {
-            error!("Failed to start output stream: {}", e);
+    });
+    
+    // Set up PortAudio
+    let pa = match pa::PortAudio::new() {
+        Ok(pa) => pa,
+        Err(e) => {
+            error!("Failed to initialize PortAudio: {}", e);
             return;
         }
-
-        while !shutdown_flag.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(100));
+    };
+    
+    let output_params = pa::StreamParameters::<f32>::new(
+        device_index,
+        2, // Stereo output
+        true,
+        0.1 // Higher latency for stability
+    );
+    
+    let settings = pa::OutputStreamSettings::new(
+        output_params,
+        sample_rate,
+        OUTPUT_BUFFER_SIZE as u32
+    );
+    
+    // Create audio callback - capturing synth by value
+    let callback = move |args: pa::OutputStreamCallbackArgs<f32>| {
+        // Process directly without any locks
+        synth.process_buffer(args.buffer, 2); // 2 = stereo
+        pa::Continue
+    };
+    
+    // Open stream
+    let mut stream = match pa.open_non_blocking_stream(settings, callback) {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to open output stream: {}", e);
+            return;
         }
-
-        info!("Resynthesis thread shutting down");
-    });
+    };
+    
+    // Start stream
+    if let Err(e) = stream.start() {
+        error!("Failed to start output stream: {}", e);
+        return;
+    }
+    
+    // Wait for shutdown
+    while !shutdown_flag.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    
+    // Cleanup
+    if let Err(e) = stream.stop() {
+        error!("Error stopping stream: {}", e);
+    }
+    
+    info!("Resynthesis thread shutting down");
 } 
