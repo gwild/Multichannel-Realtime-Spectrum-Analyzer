@@ -49,17 +49,28 @@ fn main() {
         println!("Relaunching in a new terminal for consistent environment...");
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
         let current_dir = std::env::current_dir().expect("Failed to get current directory");
+
+        // Build the command without debug.txt redirection by default
+        let mut cmd_str = format!("cd '{}' && {} --launched-by-python --gui-ipc", 
+            current_dir.display(), 
+            current_exe.display()
+        );
+
+        // Only add debug.txt output if --debug flag is present
+        if std::env::args().any(|arg| arg == "--debug") {
+            cmd_str.push_str(" --debug 2>&1 | tee debug.txt");
+        }
+        cmd_str.push_str("; read -p 'Press enter to close'");
+
         let cmd = vec![
             "xterm".to_string(),
             "-hold".to_string(),
             "-e".to_string(),
             "bash".to_string(),
             "-c".to_string(),
-            format!("cd '{}' && {} --launched-by-python --gui-ipc --enable-logs --debug 2>&1 | tee debug.txt; read -p 'Press enter to close'", 
-                current_dir.display(), 
-                current_exe.display()
-            ),
+            cmd_str,
         ];
+
         let mut child = std::process::Command::new(&cmd[0])
             .args(&cmd[1..])
             .spawn()
@@ -96,31 +107,31 @@ fn main() {
 
     // Set up logging for all modules in the application
     if args.contains(&"--debug".to_string()) {
-        std::env::set_var("RUST_LOG", "resynth=debug,audio_stream=debug,fft_analysis=debug,plot=debug");
-        env_logger::Builder::from_env("RUST_LOG")
-            .format(|buf, record| {
-                use std::io::Write;
-                writeln!(
-                    buf,
-                    "[{}:{}] {} - {}",
-                    record.level(),
-                    record.target(),
-                    chrono::Local::now().format("%H:%M:%S%.3f"),
-                    record.args()
-                )
-            })
-            .init();
-    } else if args.contains(&"--info".to_string()) {
-        std::env::set_var("RUST_LOG", "resynth=info");
-        env_logger::Builder::from_env("RUST_LOG").init();
-    } else if args.contains(&"--warn".to_string()) {
-        std::env::set_var("RUST_LOG", "resynth=warn");
-        env_logger::Builder::from_env("RUST_LOG").init();
-    } else if args.contains(&"--error".to_string()) {
-        std::env::set_var("RUST_LOG", "resynth=error");
-        env_logger::Builder::from_env("RUST_LOG").init();
+        std::env::set_var("RUST_LOG", "resynth=debug,audio_stream=info,fft_analysis=info,plot=info");
+        let mut builder = env_logger::Builder::from_env("RUST_LOG");
+        builder.format(|buf, record| {
+            writeln!(
+                buf,
+                "[{}:{}] {} - {}",
+                record.level(),
+                record.target(),
+                chrono::Local::now().format("%H:%M:%S%.3f"),
+                record.args()
+            )
+        });
+
+        // Only write to debug.txt when --debug is used
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("debug.txt") 
+        {
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+        builder.init();
     } else {
-        std::env::set_var("RUST_LOG", "resynth=error");
+        std::env::set_var("RUST_LOG", format!("resynth={}", log_level));
         env_logger::Builder::from_env("RUST_LOG").init();
     }
 

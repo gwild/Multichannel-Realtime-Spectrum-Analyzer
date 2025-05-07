@@ -20,7 +20,6 @@ const OUTPUT_BUFFER_SIZE: usize = 16384;  // Much larger for Linux/JACK compatib
 const OUTPUT_BUFFER_SIZE: usize = 4096;  // Smaller on non-Linux platforms
 
 const UPDATE_RING_SIZE: usize = 16;       // Increased for smoother updates
-const WAVETABLE_SIZE: usize = 4096;      // Size of wavetable for sine synthesis
 pub const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
 
 /// Configuration for resynthesis
@@ -35,7 +34,7 @@ pub struct ResynthConfig {
 impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
-            gain: 0.25,
+            gain: 0.5,
             smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,
@@ -104,112 +103,73 @@ impl PartialState {
 /// Lock-free synthesis engine
 #[derive(Clone)]
 struct WavetableSynth {
-    current_wavetables: Vec<Vec<f32>>,
-    next_wavetables: Vec<Vec<f32>>,
-    // Dual phase accumulators per channel
-    curr_phases: Vec<f32>,
-    next_phases: Vec<f32>,
-    root_freqs: Vec<f32>,
-    next_root_freqs: Vec<f32>,
+    current_wavetable: Vec<Vec<f32>>,
+    next_wavetable: Vec<Vec<f32>>,
     sample_counter: usize,
-    crossfade_samples: usize,
-    update_samples: usize,
+    wavetable_size: usize,
+    crossfade_start: usize,    // Point at which crossfade begins (2/3 through wavetable)
+    crossfade_length: usize,   // Length of crossfade period (1/3 of wavetable)
     in_crossfade: bool,
     sample_rate: f32,
+    update_rate: f32,
     output_buffer: Vec<f32>,
     update_queue: Arc<ArrayQueue<SynthUpdate>>,
     current_gain: f32,
-    update_rate: f32,
 }
 
 impl WavetableSynth {
-    fn resize_state_vectors(&mut self, num_channels: usize) {
-        self.current_wavetables.resize(num_channels, vec![0.0; WAVETABLE_SIZE]);
-        self.next_wavetables.resize(num_channels, vec![0.0; WAVETABLE_SIZE]);
-        self.curr_phases.resize(num_channels, 0.0);
-        self.next_phases.resize(num_channels, 0.0);
-        self.root_freqs.resize(num_channels, 1.0);
-        self.next_root_freqs.resize(num_channels, 1.0);
-        self.output_buffer.resize(num_channels, 0.0);
-    }
-
-    fn new(num_channels: usize, _num_partials: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
-        let update_rate = DEFAULT_UPDATE_RATE;
-        let update_samples = (update_rate * sample_rate) as usize;
-        let crossfade_samples = (update_samples as f32 * 0.5) as usize; // crossfade is half the update period
-
-        let mut synth = Self {
-            current_wavetables: vec![],
-            next_wavetables: vec![],
-            curr_phases: vec![],
-            next_phases: vec![],
-            root_freqs: vec![],
-            next_root_freqs: vec![],
-            sample_counter: 0,
-            crossfade_samples,
-            update_samples,
-            in_crossfade: false,
-            sample_rate,
-            output_buffer: vec![],
-            update_queue,
-            current_gain: 0.25,
-            update_rate,
-        };
-        synth.resize_state_vectors(num_channels);
-        synth
-    }
-
-    // Helper: build a wavetable from a set of partials (freq, amp), length = WAVETABLE_SIZE
-    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32) -> Vec<f32> {
-        let mut table = vec![0.0; WAVETABLE_SIZE];
+    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32, update_rate: f32) -> Vec<f32> {
+        let wavetable_size = (sample_rate * update_rate) as usize;
+        let mut table = vec![0.0; wavetable_size];
         
-        // Find the root frequency (first nonzero partial)
-        let f0 = partials.iter()
-            .find(|&&(f, a)| f > 0.0 && a > 0.0)
-            .map(|&(f, _)| f)
-            .unwrap_or(1.0);
+        debug!("Building wavetable with {} samples from partials:", wavetable_size);
+        for &(freq, amp) in partials {
+            if freq > 0.0 && amp > 0.0 {
+                let amplitude = (amp / 20.0).exp(); // Convert dB to linear amplitude
+                debug!("  Freq: {:.1} Hz, Amp: {:.1} dB -> Linear: {:.3}", freq, amp, amplitude);
+            }
+        }
 
-        // Adjust f0 to ensure integer cycles in wavetable
-        let cycles = (f0 * WAVETABLE_SIZE as f32 / sample_rate).round();
-        let adjusted_f0 = cycles * sample_rate / WAVETABLE_SIZE as f32;
-        
-        // First pass - generate sine components
-        for i in 0..WAVETABLE_SIZE {
-            let t = i as f32 / WAVETABLE_SIZE as f32; // 0..1
+        // Generate wavetable exactly matching the update period
+        for i in 0..wavetable_size {
+            let t = (i as f32 / wavetable_size as f32) * update_rate; // Exact time in seconds over update period
             for &(freq, amp) in partials {
                 if freq > 0.0 && amp > 0.0 {
-                    let norm_amp = amp / 100.0; // scale dB to linear
-                    // Adjust each partial frequency proportionally to adjusted f0
-                    let adjusted_freq = freq * (adjusted_f0 / f0);
-                    table[i] += norm_amp * (2.0 * PI * adjusted_freq * t).sin();
+                    let amplitude = (amp / 20.0).exp(); // Convert dB to linear amplitude
+                    table[i] += amplitude * (2.0 * PI * freq * t).sin();
                 }
             }
         }
 
-        // Ensure zero-crossing at boundaries
-        let start_val = table[0];
-        let end_val = table[WAVETABLE_SIZE - 1];
-        let correction = -(start_val + end_val) / 2.0;
-        
-        // Apply correction and normalize
-        let mut max = 0.0_f32;
-        for v in table.iter_mut() {
-            *v += correction;
-            max = max.max(v.abs());
-        }
-        
-        // Normalize if needed
-        if max > 1.0 {
-            for v in table.iter_mut() {
-                *v /= max;
-            }
-        }
-        
-        // Ensure exact zero at boundaries
-        table[0] = 0.0;
-        table[WAVETABLE_SIZE - 1] = 0.0;
-        
         table
+    }
+
+    fn new(num_channels: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
+        let update_rate = DEFAULT_UPDATE_RATE;
+        let wavetable_size = (sample_rate * update_rate) as usize;
+        let crossfade_length = wavetable_size / 3;  // Exactly 1/3 of wavetable
+        let crossfade_start = wavetable_size - crossfade_length;  // Start at 2/3 point
+
+        Self {
+            current_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
+            next_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
+            sample_counter: 0,
+            wavetable_size,
+            crossfade_start,
+            crossfade_length,
+            in_crossfade: false,
+            sample_rate,
+            update_rate,
+            output_buffer: vec![0.0; num_channels],
+            update_queue,
+            current_gain: 0.25,
+        }
+    }
+
+    fn resize_state_vectors(&mut self, num_channels: usize) {
+        self.current_wavetable = vec![vec![0.0; self.wavetable_size]; num_channels];
+        self.next_wavetable = vec![vec![0.0; self.wavetable_size]; num_channels];
+        self.output_buffer = vec![0.0; num_channels];
     }
 
     fn apply_updates(&mut self) {
@@ -217,30 +177,81 @@ impl WavetableSynth {
         while let Some(update) = self.update_queue.pop() {
             new_update = Some(update);
         }
+
         if let Some(update) = new_update {
-            self.current_gain = update.gain;
-            if self.update_rate != update.update_rate {
-                self.update_rate = update.update_rate;
-                self.update_samples = (self.update_rate * self.sample_rate) as usize;
-                self.crossfade_samples = (self.update_samples as f32 * 0.5) as usize; // half the update period
-            }
-
-            let update_channels = update.partials.len();
-            if update_channels != self.current_wavetables.len() {
-                self.resize_state_vectors(update_channels);
-            }
-
-            // Start new crossfade immediately upon receiving new data
-            self.sample_counter = 0;
-            self.in_crossfade = true;
-
+            debug!("Received new partials update:");
             for (ch, ch_partials) in update.partials.iter().enumerate() {
-                self.next_wavetables[ch] = Self::build_wavetable(ch_partials, self.sample_rate);
-                self.next_root_freqs[ch] = ch_partials.iter()
-                    .find(|&&(f, a)| f > 0.0 && a > 0.0)
-                    .map(|&(f, _)| f * update.freq_scale)
-                    .unwrap_or(1.0);
-                self.next_phases[ch] = self.curr_phases[ch]; // maintain phase continuity
+                debug!("Channel {}: {}", ch, format_partials_debug(ch_partials));
+            }
+
+            self.current_gain = update.gain;
+
+            // Check if update rate has changed significantly
+            if (self.update_rate - update.update_rate).abs() > f32::EPSILON {
+                let old_size = self.wavetable_size;
+                self.update_rate = update.update_rate;
+                let new_wavetable_size = (self.sample_rate * self.update_rate) as usize;
+                let new_crossfade_length = new_wavetable_size / 3;
+                let new_crossfade_start = new_wavetable_size - new_crossfade_length;
+
+                // Generate new wavetables safely
+                let mut new_current_wavetable = vec![vec![0.0; new_wavetable_size]; self.current_wavetable.len()];
+                let mut new_next_wavetable = vec![vec![0.0; new_wavetable_size]; self.next_wavetable.len()];
+
+                // If we're in a crossfade, we need to preserve both current and next wavetables
+                if self.in_crossfade {
+                    for ch in 0..self.current_wavetable.len() {
+                        // Resample current wavetable to new size
+                        for i in 0..new_wavetable_size {
+                            let old_idx = (i as f32 * old_size as f32 / new_wavetable_size as f32) as usize;
+                            new_current_wavetable[ch][i] = self.current_wavetable[ch][old_idx % old_size];
+                        }
+                        // Generate new next wavetable
+                        new_next_wavetable[ch] = Self::build_wavetable(
+                            &update.partials[ch],
+                            self.sample_rate,
+                            self.update_rate
+                        );
+                    }
+                    // Adjust sample counter position
+                    self.sample_counter = (self.sample_counter as f32 * new_wavetable_size as f32 / old_size as f32) as usize;
+                } else {
+                    // Not in crossfade, just generate new wavetable
+                    for (ch, ch_partials) in update.partials.iter().enumerate() {
+                        new_next_wavetable[ch] = Self::build_wavetable(
+                            ch_partials,
+                            self.sample_rate,
+                            self.update_rate
+                        );
+                    }
+                    self.sample_counter = 0;
+                }
+
+                // Atomically swap in new wavetables and parameters
+                self.current_wavetable = new_current_wavetable;
+                self.next_wavetable = new_next_wavetable;
+                self.wavetable_size = new_wavetable_size;
+                self.crossfade_length = new_crossfade_length;
+                self.crossfade_start = new_crossfade_start;
+
+                info!("Update rate changed safely: {} s, new wavetable size: {}", 
+                    self.update_rate, self.wavetable_size);
+            } else {
+                // Regular update without resizing
+                for (ch, ch_partials) in update.partials.iter().enumerate() {
+                    self.next_wavetable[ch] = Self::build_wavetable(
+                        ch_partials,
+                        self.sample_rate,
+                        self.update_rate
+                    );
+                    debug!("Generated new wavetable for channel {} with {} partials", 
+                        ch, ch_partials.len());
+                }
+
+                // Only reset sample counter if not in crossfade
+                if !self.in_crossfade {
+                    self.sample_counter = 0;
+                }
             }
         }
     }
@@ -249,99 +260,58 @@ impl WavetableSynth {
         if buffer.is_empty() || channels == 0 {
             return;
         }
-        if self.output_buffer.len() < channels {
-            self.output_buffer.resize(channels, 0.0);
-        }
+
         self.apply_updates();
         let frames = buffer.len() / channels;
 
         for frame in 0..frames {
-            let crossfade = if self.in_crossfade && self.sample_counter < self.crossfade_samples {
-                let fade_pos = self.sample_counter as f32 / self.crossfade_samples as f32;
-                0.5 * (1.0 - (PI * fade_pos).cos())
-            } else {
+            // Ensure sample_counter stays within bounds
+            if self.sample_counter >= self.wavetable_size {
+                self.sample_counter = 0;
                 if self.in_crossfade {
-                    // Crossfade complete, switch to new wavetables
-                    self.current_wavetables = self.next_wavetables.clone();
-                    self.root_freqs = self.next_root_freqs.clone();
-                    self.curr_phases = self.next_phases.clone();
+                    std::mem::swap(&mut self.current_wavetable, &mut self.next_wavetable);
                     self.in_crossfade = false;
                 }
+            }
+
+            // Calculate precise linear crossfade for 1/3 overlap
+            let crossfade = if self.sample_counter >= self.crossfade_start {
+                self.in_crossfade = true;
+                let fade_pos = (self.sample_counter - self.crossfade_start) as f32 
+                    / self.crossfade_length as f32;
+                fade_pos.clamp(0.0, 1.0) // Linear crossfade
+            } else {
                 0.0
             };
 
+            // Process each channel with precise amplitude control
             for ch in 0..channels {
-                if ch >= self.output_buffer.len() || ch >= self.current_wavetables.len() || 
-                   ch >= self.next_wavetables.len() || ch >= self.curr_phases.len() || 
-                   ch >= self.next_phases.len() || ch >= self.root_freqs.len() || 
-                   ch >= self.next_root_freqs.len() {
+                if ch >= self.current_wavetable.len() || self.sample_counter >= self.current_wavetable[ch].len() {
                     continue;
                 }
 
-                // Calculate phase increments based on root frequency
-                let curr_freq = self.root_freqs[ch];
-                let next_freq = self.next_root_freqs[ch];
-                
-                // Phase increment for one sample
-                let curr_phase_inc = (curr_freq * WAVETABLE_SIZE as f32) / self.sample_rate;
-                let next_phase_inc = (next_freq * WAVETABLE_SIZE as f32) / self.sample_rate;
+                // Ensure perfect complementary crossfade
+                let fade_out = 1.0 - crossfade;
+                let fade_in = crossfade;
 
-                // Get current phases
-                let curr_phase = self.curr_phases[ch];
-                let next_phase = self.next_phases[ch];
+                let curr_sample = self.current_wavetable[ch][self.sample_counter] * fade_out;
+                let next_sample = self.next_wavetable[ch][self.sample_counter] * fade_in;
 
-                // Interpolate current wavetable
-                let curr_idx_float = curr_phase % WAVETABLE_SIZE as f32;
-                let curr_idx1 = curr_idx_float as usize;
-                let curr_idx2 = (curr_idx1 + 1) % WAVETABLE_SIZE;
-                let curr_frac = curr_idx_float - curr_idx1 as f32;
-                
-                let curr_sample = self.current_wavetables[ch][curr_idx1] * (1.0 - curr_frac) + 
-                                self.current_wavetables[ch][curr_idx2] * curr_frac;
+                // Sum the crossfaded samples
+                let sample = curr_sample + next_sample;
 
-                // Interpolate next wavetable
-                let next_idx_float = next_phase % WAVETABLE_SIZE as f32;
-                let next_idx1 = next_idx_float as usize;
-                let next_idx2 = (next_idx1 + 1) % WAVETABLE_SIZE;
-                let next_frac = next_idx_float - next_idx1 as f32;
-                
-                let next_sample = self.next_wavetables[ch][next_idx1] * (1.0 - next_frac) + 
-                                self.next_wavetables[ch][next_idx2] * next_frac;
-
-                // Crossfade between current and next
-                let sample = if self.in_crossfade {
-                    curr_sample * (1.0 - crossfade) + next_sample * crossfade
-                } else {
-                    curr_sample
-                };
-
-                self.output_buffer[ch] = sample;
-
-                // Update phases
-                self.curr_phases[ch] = (curr_phase + curr_phase_inc) % WAVETABLE_SIZE as f32;
-                self.next_phases[ch] = (next_phase + next_phase_inc) % WAVETABLE_SIZE as f32;
-            }
-
-            let frame_start = frame * channels;
-            if frame_start + channels <= buffer.len() {
-                for ch in 0..channels {
-                    if ch >= self.output_buffer.len() { continue; }
-                    let idx = frame_start + ch;
-                    let sample = self.output_buffer[ch] * self.current_gain;
-                    // Soft clipping
-                    buffer[idx] = if sample.abs() > 1.0 {
-                        sample.signum() * (1.0 - (-sample.abs()).exp())
+                let idx = frame * channels + ch;
+                if idx < buffer.len() {
+                    let final_sample = sample * self.current_gain;
+                    buffer[idx] = if final_sample.abs() > 1.0 {
+                        final_sample.signum() * (1.0 - (-final_sample.abs()).exp())
                     } else {
-                        sample
+                        final_sample
                     };
                 }
             }
 
-            // Always increment sample counter
             self.sample_counter += 1;
-            if self.sample_counter >= self.update_samples {
-                self.sample_counter = 0;
-            }
         }
     }
 }
@@ -561,7 +531,6 @@ fn setup_audio_stream(
     // Create synthesizer for the callback
     let synth_for_callback = std::cell::RefCell::new(WavetableSynth::new(
         num_channels, 
-        num_partials,
         supported_sample_rate as f32,
         update_queue
     ));
@@ -579,4 +548,12 @@ fn setup_audio_stream(
     stream.start()?;
     
     Ok(stream)
+}
+
+fn format_partials_debug(partials: &[(f32, f32)]) -> String {
+    partials.iter()
+        .filter(|&&(freq, amp)| freq > 0.0 && amp > 0.0)
+        .map(|&(freq, amp)| format!("({:.1} Hz, {:.1} dB)", freq, amp))
+        .collect::<Vec<_>>()
+        .join(", ")
 } 

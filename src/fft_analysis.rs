@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::{info, warn, error, debug};
+use log::{info, warn, error};
 use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
@@ -193,7 +193,7 @@ pub fn start_fft_processing(
         let result = catch_unwind(AssertUnwindSafe(|| {
             let buffer_size = {
                 let buffer = audio_buffer.read().unwrap();
-                buffer.size()  // Use the new public getter method
+                buffer.size()
             };
 
             // Reinitialize FFT planner if buffer size changed
@@ -202,16 +202,15 @@ pub fn start_fft_processing(
                 spectrum_buffer = fft.make_output_vec();
                 current_buffer_size = buffer_size;
 
-                // Explicitly refresh the start_time reference
                 if let Some(new_start_time) = &mut start_time {
                     *Arc::make_mut(new_start_time) = Instant::now();
-                    info!("FFT planner and start_time reinitialized due to buffer size change (new size: {})", buffer_size);
+                    info!("FFT planner reinitialized, size: {}", buffer_size);
                 }
 
-                // Clear spectrograph history explicitly
                 if let Some(history) = &spectrograph_history {
                     if let Ok(mut history) = history.lock() {
                         history.clear();
+                        info!("Cleared spectrograph history due to buffer size change");
                     }
                 }
             }
@@ -339,18 +338,16 @@ pub fn start_fft_processing(
             // Update shared memory with minimal lock duration
             if let Some(buffer) = shared_memory_data {
                 if let Some(shared) = &mut shared_partials {
-                    // First update the in-memory data
                     shared.data = results.clone();
-                    debug!("Updated shared memory data with {} channels of partials", results.len());
+                    info!("Updated shared memory data: {} channels", results.len());
 
-                    // Then write to file
                     if let Ok(mut file) = std::fs::OpenOptions::new()
                         .write(true)
                         .open(&shared.path)
                     {
                         let _ = file.set_len(buffer.len() as u64);
                         let _ = file.write_all(&buffer);
-                        debug!("Wrote {} bytes to shared memory at {}", buffer.len(), shared.path);
+                        info!("Wrote {} bytes to shared memory", buffer.len());
                     }
                 }
             }
