@@ -568,7 +568,7 @@ impl eframe::App for MyApp {
                     resynth_config.gain = 0.25;
                     resynth_config.smoothing = 0.0;
                     resynth_config.freq_scale = 1.0;
-                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;
+                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;  // Now uses 1.0 seconds
                 }
                 
                 // Reset display settings

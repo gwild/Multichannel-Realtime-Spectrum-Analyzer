@@ -1,4 +1,5 @@
 use log::info;
+use log::debug;
 
 pub const MIN_FREQ: f64 = 20.0;  // Lowest frequency we want to analyze
 pub const MAX_FREQ: f64 = 20000.0;  // Highest frequency we want to analyze
@@ -20,7 +21,7 @@ pub fn calculate_optimal_buffer_size(sample_rate: f64) -> usize {
         .next_power_of_two()  // Round to next power of 2 for FFT efficiency
         .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
     
-    info!(
+    debug!(
         "Calculated buffer size - Min: {}, Max: {}, Selected: {}, SR: {}",
         min_samples, max_samples, initial_size, sample_rate
     );

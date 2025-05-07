@@ -16,7 +16,7 @@ use std::sync::{
 };
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
@@ -29,6 +29,8 @@ use std::time::Duration;
 use std::collections::VecDeque;
 use crate::plot::SpectrographSlice;
 use std::time::Instant;
+use std::fs::OpenOptions;
+use chrono;
 
 #[derive(Clone)]
 pub struct SharedMemory {
@@ -40,6 +42,35 @@ pub struct SharedMemory {
 pub const DEFAULT_NUM_PARTIALS: usize = 12;
 
 fn main() {
+    // Check if we're already running in a terminal launched by Python or manually
+    let is_launched_by_python = std::env::args().any(|arg| arg == "--launched-by-python");
+    if !is_launched_by_python {
+        // Relaunch in a new terminal
+        println!("Relaunching in a new terminal for consistent environment...");
+        let current_exe = std::env::current_exe().expect("Failed to get current executable path");
+        let current_dir = std::env::current_dir().expect("Failed to get current directory");
+        let cmd = vec![
+            "xterm".to_string(),
+            "-hold".to_string(),
+            "-e".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            format!("cd '{}' && {} --launched-by-python --gui-ipc --enable-logs --debug 2>&1 | tee debug.txt; read -p 'Press enter to close'", 
+                current_dir.display(), 
+                current_exe.display()
+            ),
+        ];
+        let mut child = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .spawn()
+            .expect("Failed to launch new terminal");
+        child.wait().expect("Failed to wait for child process");
+        return;
+    }
+
+    // Check if GStreamer is running, start it if not
+    check_and_start_gstreamer();
+
     // Parse command line arguments for logging
     let args: Vec<String> = std::env::args().collect();
     let log_level = if args.contains(&"--error".to_string()) {
@@ -64,14 +95,37 @@ fn main() {
     };
 
     // Set up logging for all modules in the application
-    std::env::set_var("RUST_LOG", format!("audio_streaming={}", log_level));
-    env_logger::init();
+    if args.contains(&"--debug".to_string()) {
+        std::env::set_var("RUST_LOG", "resynth=debug,audio_stream=debug,fft_analysis=debug,plot=debug");
+        env_logger::Builder::from_env("RUST_LOG")
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(
+                    buf,
+                    "[{}:{}] {} - {}",
+                    record.level(),
+                    record.target(),
+                    chrono::Local::now().format("%H:%M:%S%.3f"),
+                    record.args()
+                )
+            })
+            .init();
+    } else if args.contains(&"--info".to_string()) {
+        std::env::set_var("RUST_LOG", "resynth=info");
+        env_logger::Builder::from_env("RUST_LOG").init();
+    } else if args.contains(&"--warn".to_string()) {
+        std::env::set_var("RUST_LOG", "resynth=warn");
+        env_logger::Builder::from_env("RUST_LOG").init();
+    } else if args.contains(&"--error".to_string()) {
+        std::env::set_var("RUST_LOG", "resynth=error");
+        env_logger::Builder::from_env("RUST_LOG").init();
+    } else {
+        std::env::set_var("RUST_LOG", "resynth=error");
+        env_logger::Builder::from_env("RUST_LOG").init();
+    }
 
     // Print logging level information
-    if log_level != "error" {
-        println!("Logging level: {}", log_level);
-        println!("Run with --error, --warn, --info, --debug, or --trace to control verbosity");
-    }
+    println!("RUST_LOG set to: {}", std::env::var("RUST_LOG").unwrap_or_default());
 
     if let Err(e) = run() {
         if std::env::args().any(|arg| arg == "--enable-logs") {
@@ -80,6 +134,40 @@ fn main() {
             error!("Application error: {:?}", e);
         }
         std::process::exit(1);
+    }
+}
+
+// Function to check if GStreamer is running and start it if not
+fn check_and_start_gstreamer() {
+    let gstreamer_check = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("gst-launch-1.0")
+        .output();
+
+    match gstreamer_check {
+        Ok(output) if output.status.success() => {
+            info!("GStreamer is already running.");
+        },
+        _ => {
+            info!("GStreamer is not running, attempting to start it in a new terminal...");
+            let start_result = std::process::Command::new("xterm")
+                .arg("-e")
+                .arg("bash")
+                .arg("-c")
+                .arg("../stream.sh; read -p 'Press enter to close'")
+                .spawn();
+
+            match start_result {
+                Ok(child) => {
+                    info!("GStreamer stream started with PID: {} in a new terminal", child.id());
+                    // Wait a bit to ensure it starts
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                },
+                Err(e) => {
+                    error!("Failed to start GStreamer stream in a new terminal: {}", e);
+                }
+            }
+        }
     }
 }
 
@@ -309,19 +397,16 @@ fn run() -> Result<()> {
     writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
 
     // Create shared memory without mutex BEFORE threads start
-    let shared_partials = if std::env::args().any(|arg| arg == "--gui-ipc") {
-        info!("Starting in GUI+IPC mode");
+    let shared_partials = {
         let shmem_name = "audio_peaks";
         let shared_memory_path = format!("/dev/shm/{}", shmem_name);
         let file = std::fs::File::create(&shared_memory_path)?;
         file.set_len(4 * 1024 * 1024)?;
-        
+        info!("Shared memory initialized at {} for internal use", shared_memory_path);
         Some(SharedMemory {
             data: Vec::new(),
             path: shared_memory_path,
         })
-    } else {
-        None
     };
 
     // Before starting the FFT thread, initialize spectrograph history with fixed capacity
@@ -390,6 +475,7 @@ fn run() -> Result<()> {
         let spectrum_app = Arc::clone(&spectrum_app);
         let resynth_config = Arc::clone(&resynth_config);
         let shutdown_flag = Arc::clone(&shutdown_flag);
+        let shared_partials_clone = shared_partials.clone();
         move || {
             start_resynth_thread(
                 spectrum_app,
@@ -397,6 +483,7 @@ fn run() -> Result<()> {
                 selected_output_device,
                 selected_sample_rate,
                 shutdown_flag,
+                shared_partials_clone,
             );
         }
     });

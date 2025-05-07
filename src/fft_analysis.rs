@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
@@ -307,7 +307,7 @@ pub fn start_fft_processing(
 
             // Prepare shared memory data before acquiring lock
             let shared_memory_data = if shared_partials.is_some() {
-                let buffer_size = results.len() * num_partials * 8;
+                let buffer_size = results.len() * num_partials * 2 * 4;  // 2 f32s per partial, 4 bytes each
                 let mut buffer = Vec::with_capacity(buffer_size);
                 
                 for channel_data in &results {
@@ -317,8 +317,11 @@ pub fn start_fft_processing(
                         } else {
                             (0.0, 0.0)
                         };
-                        buffer.extend_from_slice(&freq.to_le_bytes());
-                        buffer.extend_from_slice(&amp.to_le_bytes());
+                        // Convert f32 to bytes
+                        let freq_bytes = freq.to_le_bytes();
+                        let amp_bytes = amp.to_le_bytes();
+                        buffer.extend_from_slice(&freq_bytes);  // 4 bytes
+                        buffer.extend_from_slice(&amp_bytes);   // 4 bytes
                     }
                 }
                 Some(buffer)
@@ -336,14 +339,19 @@ pub fn start_fft_processing(
             // Update shared memory with minimal lock duration
             if let Some(buffer) = shared_memory_data {
                 if let Some(shared) = &mut shared_partials {
+                    // First update the in-memory data
+                    shared.data = results.clone();
+                    debug!("Updated shared memory data with {} channels of partials", results.len());
+
+                    // Then write to file
                     if let Ok(mut file) = std::fs::OpenOptions::new()
                         .write(true)
                         .open(&shared.path)
                     {
                         let _ = file.set_len(buffer.len() as u64);
                         let _ = file.write_all(&buffer);
+                        debug!("Wrote {} bytes to shared memory at {}", buffer.len(), shared.path);
                     }
-                    shared.data = results.clone();
                 }
             }
 

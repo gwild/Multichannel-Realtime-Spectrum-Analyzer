@@ -43,7 +43,7 @@ impl CircularBuffer {
     /// * `size` - The maximum number of frames the buffer can hold (not total samples).
     /// * `channels` - The number of audio channels.
     pub fn new(size: usize, channels: usize) -> Self {
-        info!("Creating new CircularBuffer with size {} and {} channels", size, channels);
+        debug!("Creating new CircularBuffer with size {} and {} channels", size, channels);
         CircularBuffer {
             buffer: vec![0.0; size * channels],
             head: 0,
@@ -123,7 +123,7 @@ impl CircularBuffer {
     ///
     /// * `new_size` - The new maximum number of frames the buffer can hold.
     pub fn resize(&mut self, new_size: usize) {
-        info!("Buffer resize requested - Current: {}, New: {} frames ({} channels)", 
+        debug!("Buffer resize requested - Current: {}, New: {} frames ({} channels)", 
             self.size, new_size, self.channels);
         
         // Create new buffer
@@ -146,16 +146,16 @@ impl CircularBuffer {
         // On Linux, force a complete reinit
         #[cfg(target_os = "linux")]
         {
-            info!("Linux detected, forcing complete stream reinitialization");
+            debug!("Linux detected, forcing complete stream reinitialization");
             self.force_reinit.store(true, Ordering::SeqCst);
         }
         
         self.needs_restart.store(true, Ordering::SeqCst);
-        info!("Stream restart requested due to buffer resize");
+        debug!("Stream restart requested due to buffer resize");
         
         // Log buffer state after resize
         let non_zero = self.buffer.iter().filter(|&&x| x != 0.0).count();
-        info!("Buffer after resize - Size: {}, Channels: {}, Non-zero samples: {}", 
+        debug!("Buffer after resize - Size: {}, Channels: {}, Non-zero samples: {}", 
             self.size, self.channels, non_zero);
     }
 
@@ -223,13 +223,13 @@ pub fn build_input_stream(
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Input<f32>>, anyhow::Error> {
     let device_info = pa.device_info(device_index)?;
     
-    info!("Building stream for device: {} with {} channels at {} Hz",
+    debug!("Building stream for device: {} with {} channels at {} Hz",
         device_info.name, device_channels, sample_rate);
 
     // Add Linux-specific debug info
     #[cfg(target_os = "linux")]
     {
-        info!("Linux audio config - Default latency: {}, Suggested latency: {}",
+        debug!("Linux audio config - Default latency: {}, Suggested latency: {}",
             device_info.default_low_input_latency,
             device_info.default_high_input_latency);
     }
@@ -256,7 +256,7 @@ pub fn build_input_stream(
     if let Ok(_) = audio_buffer.read() {
         if let Ok(mut fft_config) = fft_config.lock() {
             fft_config.frames_per_buffer = frames_per_buffer;
-            info!("Updated FFTConfig frames_per_buffer to match stream: {}", frames_per_buffer);
+            debug!("Updated FFTConfig frames_per_buffer to match stream: {}", frames_per_buffer);
         }
     }
 
@@ -275,21 +275,21 @@ pub fn build_input_stream(
     
     // Detailed format check
     match pa.is_input_format_supported(input_params, sample_rate as f64) {
-        Ok(_) => info!("Input format is supported - SR: {}, Channels: {}", sample_rate, device_channels),
+        Ok(_) => debug!("Input format is supported - SR: {}, Channels: {}", sample_rate, device_channels),
         Err(e) => {
             error!("Input format not supported: {}", e);
             // Try default sample rate as fallback
             let default_sr = device_info.default_sample_rate;
-            info!("Trying default sample rate: {}", default_sr);
+            debug!("Trying default sample rate: {}", default_sr);
             if pa.is_input_format_supported(input_params, default_sr as f64).is_ok() {
-                info!("Default sample rate is supported, but requested rate isn't");
+                debug!("Default sample rate is supported, but requested rate isn't");
             }
             return Err(anyhow!("Unsupported input format: {}", e));
         }
     }
     
     let settings = pa::InputStreamSettings::new(input_params, sample_rate as f64, frames_per_buffer);
-    info!("Stream settings - SR: {}, Latency: {}, Buffer: {}", sample_rate, latency, frames_per_buffer);
+    debug!("Stream settings - SR: {}, Latency: {}, Buffer: {}", sample_rate, latency, frames_per_buffer);
 
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_count_clone = Arc::clone(&callback_count);
@@ -309,7 +309,7 @@ pub fn build_input_stream(
             // Log callback timing issues
             if count % 50 == 0 {
                 let max_value = args.buffer.iter().fold(0.0f32, |max, &x| max.max(x.abs()));
-                info!(
+                debug!(
                     "Callback #{} - Buffer: {} samples, Max amplitude: {:.6}, Time: {:?}",
                     count,
                     args.buffer.len(),
@@ -349,6 +349,7 @@ pub fn build_input_stream(
     )?;
 
     info!("Stream built successfully with {} frames per buffer", frames_per_buffer);
+    debug!("Stream built successfully with {} frames per buffer", frames_per_buffer);
     Ok(stream)
 }
 
@@ -376,7 +377,7 @@ pub fn process_input_samples(input: &[f32], device_channels: usize, selected_cha
     // Log some statistics periodically
     if frames > 0 && frames % 100 == 0 {
         let non_zero = processed.iter().filter(|&&x| x != 0.0).count();
-        info!(
+        debug!(
             "Processed {} frames, {} channels, {} non-zero samples",
             frames,
             selected_channels.len(),
@@ -429,7 +430,7 @@ pub fn start_sampling_thread(
             }
         };
         
-        info!("PortAudio initialized for sampling thread.");
+        debug!("PortAudio initialized for sampling thread.");
 
         // Get device info and channels
         let device_info = match pa.device_info(device_index) {
@@ -455,16 +456,16 @@ pub fn start_sampling_thread(
 
         match stream_result {
             Ok(mut stream) => {
-                info!("Successfully built input stream");
+                debug!("Successfully built input stream");
                 match stream.start() {
                     Ok(_) => {
-                        info!("Audio stream started successfully");
+                        debug!("Audio stream started successfully");
                         running.store(true, Ordering::SeqCst);
                         
                         // Wait for first batch of data
                         thread::sleep(Duration::from_millis(500));
                         stream_ready.store(true, Ordering::SeqCst);
-                        info!("Audio stream ready for FFT processing");
+                        debug!("Audio stream ready for FFT processing");
                         
                         // Monitor stream health
                         while !shutdown_flag.load(Ordering::SeqCst) {
@@ -480,7 +481,7 @@ pub fn start_sampling_thread(
                                     // Force reinit on Linux
                                     #[cfg(target_os = "linux")]
                                     {
-                                        info!("Linux detected, forcing complete stream reinitialization");
+                                        debug!("Linux detected, forcing complete stream reinitialization");
                                         buffer.force_reinit.store(true, Ordering::SeqCst);
                                     }
                                     
@@ -490,7 +491,7 @@ pub fn start_sampling_thread(
 
                                 // Existing buffer resize check
                                 if buffer.needs_restart() || buffer.needs_reinit() {
-                                    info!("Restart or reinit requested due to buffer resize.");
+                                    debug!("Restart or reinit requested due to buffer resize.");
 
                                     // Stop the current stream
                                     if let Err(e) = stream.stop() {
@@ -527,7 +528,7 @@ pub fn start_sampling_thread(
                             };
 
                             if needs_restart {
-                                info!("Attempting stream restart - Current state: running={}, stream active={:?}, stopped={:?}",
+                                debug!("Attempting stream restart - Current state: running={}, stream active={:?}, stopped={:?}",
                                     running.load(Ordering::SeqCst),
                                     stream.is_active(),
                                     stream.is_stopped()
@@ -538,7 +539,7 @@ pub fn start_sampling_thread(
                                 // On Linux, prefer full reinit
                                 #[cfg(target_os = "linux")]
                                 {
-                                    info!("Linux detected, preferring complete reinitialization");
+                                    debug!("Linux detected, preferring complete reinitialization");
                                     break;  // Break to outer loop for full reinit
                                 }
 
@@ -551,7 +552,7 @@ pub fn start_sampling_thread(
                                         stream.start()
                                     }) {
                                         Ok(_) => {
-                                            info!("Stream successfully restarted");
+                                            debug!("Stream successfully restarted");
                                             running.store(true, Ordering::SeqCst);
                                         },
                                         Err(e) => {
@@ -583,7 +584,7 @@ pub fn start_sampling_thread(
         thread::sleep(RESTART_COOLDOWN);
     }
     
-    info!("Audio sampling thread shutting down");
+    debug!("Audio sampling thread shutting down");
     running.store(false, Ordering::SeqCst);
 }
 
