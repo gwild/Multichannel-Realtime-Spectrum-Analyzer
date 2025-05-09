@@ -10,7 +10,9 @@ use crate::plot::SpectrumApp;
 use crate::DEFAULT_NUM_PARTIALS;
 use crossbeam_queue::ArrayQueue;
 use anyhow::{Result, Error, anyhow};
-use crate::SharedMemory;  // Import SharedMemory from main.rs
+use crate::SharedMemory;
+use crate::get_results::start_update_thread;
+use crate::fft_analysis::CurrentPartials;
 
 // Constants for audio performance - with optimized values for JACK
 #[cfg(target_os = "linux")]
@@ -66,12 +68,12 @@ pub struct ResynthConfigSnapshot {
 
 /// Parameter update structure
 #[derive(Clone, Debug)]
-struct SynthUpdate {
-    partials: Vec<Vec<(f32, f32)>>,
-    gain: f32,
-    freq_scale: f32,
-    smoothing: f32,  // Add smoothing parameter for crossfade control
-    update_rate: f32,  // Add update rate parameter
+pub struct SynthUpdate {
+    pub partials: Vec<Vec<(f32, f32)>>,
+    pub gain: f32,
+    pub freq_scale: f32,
+    pub smoothing: f32,  // Add smoothing parameter for crossfade control
+    pub update_rate: f32,  // Add update rate parameter
 }
 
 /// State for a single partial
@@ -105,7 +107,6 @@ impl PartialState {
 struct WavetableSynth {
     current_wavetable: Vec<Vec<f32>>,
     next_wavetable: Vec<Vec<f32>>,
-    wavetable_queue: Arc<ArrayQueue<Vec<Vec<f32>>>>,  // Queue for new wavetables
     sample_counter: usize,
     wavetable_size: usize,
     crossfade_start: usize,
@@ -128,7 +129,6 @@ impl WavetableSynth {
         Self {
             current_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
             next_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
-            wavetable_queue: Arc::new(ArrayQueue::new(10)),
             sample_counter: 0,
             wavetable_size,
             crossfade_start,
@@ -272,27 +272,21 @@ impl WavetableSynth {
                 new_wavetables.push(Self::build_wavetable(partials, self.sample_rate, update.update_rate));
             }
 
-            // Try to push to queue, with retry on failure
-            if let Ok(_) = self.wavetable_queue.push(new_wavetables.clone()) {
-                debug!("Successfully pushed new wavetables to queue");
-            } else {
-                debug!("Queue full, retrying after clearing");
-                // Clear queue and try again
-                while self.wavetable_queue.pop().is_some() {}
-                let _ = self.wavetable_queue.push(new_wavetables);
-            }
+            // Directly update next_wavetable and start crossfade
+            self.next_wavetable = new_wavetables;
+            self.in_crossfade = true;
+            debug!("Successfully updated next wavetable");
         }
     }
 }
 
 /// Starts a thread that performs real-time resynthesis of the analyzed spectrum.
 pub fn start_resynth_thread(
-    spectrum_app: Arc<Mutex<SpectrumApp>>,
     config: Arc<Mutex<ResynthConfig>>,
     device_index: pa::DeviceIndex,
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
-    shared_memory: Option<SharedMemory>,
+    current_partials: Arc<Mutex<CurrentPartials>>,
     num_channels: usize,
     num_partials: usize,
 ) {
@@ -302,95 +296,13 @@ pub fn start_resynth_thread(
     // Create synthesis engine and shared queue between threads
     let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2));
 
-    // Get the resynthesis queue from shared memory
-    let resynth_queue = if let Some(shared) = shared_memory {
-        match shared.resynth_queue {
-            Some(queue) => {
-                debug!("[RESYNTH SETUP] Using shared memory queue from fft_analysis");
-                Some(queue)
-            },
-            None => {
-                error!("[RESYNTH SETUP] Shared memory exists but resynth_queue is None");
-                None
-            }
-        }
-    } else {
-        error!("[RESYNTH SETUP] Shared memory not available - fft_analysis data cannot be accessed");
-        None
-    };
-    
-    // Log whether a queue is available
-    if resynth_queue.is_some() {
-        debug!("[RESYNTH SETUP] Resynth queue initialized successfully");
-    } else {
-        error!("[RESYNTH SETUP] Failed to initialize resynth queue - fft_analysis may not be providing data");
-    }
-
-    // Create update thread to feed the synth with new analysis data
-    let update_thread_flag = Arc::new(AtomicBool::new(true));
-    let update_thread_flag_clone = Arc::clone(&update_thread_flag);
-    let shutdown_flag_clone = Arc::clone(&shutdown_flag);
-    let update_queue_clone = Arc::clone(&update_queue);
-    let config_for_thread = Arc::clone(&config);
-
-    let _update_thread = thread::spawn(move || {
-        let mut last_update = Instant::now();
-        while !shutdown_flag_clone.load(Ordering::Relaxed) && update_thread_flag_clone.load(Ordering::Relaxed) {
-            // First check if it's time to update with minimal locking
-            let update_rate = {
-                let config = config_for_thread.lock().unwrap();
-                config.update_rate
-            };
-
-            // Only get new data if it's time for an update
-            if last_update.elapsed().as_secs_f32() >= update_rate {
-                // Get config snapshot with minimal lock duration
-                let config_snapshot = config_for_thread.lock().unwrap().snapshot();
-
-                // Get partials data from dedicated queue (no GUI locking)
-                if let Some(queue) = &resynth_queue {
-                    match queue.pop() {
-                        Some(partials_data) => {
-                            debug!("[RESYNTH UPDATE] Successfully retrieved partials data from shared memory queue");
-                            let update = SynthUpdate {
-                                partials: partials_data,
-                                gain: config_snapshot.gain,
-                                freq_scale: config_snapshot.freq_scale,
-                                smoothing: config_snapshot.smoothing,
-                                update_rate: config_snapshot.update_rate,
-                            };
-
-                            // Push update to synth
-                            debug!("[RESYNTH UPDATE] Attempting to push update to queue: gain={}, freq_scale={}, update_rate={}", update.gain, update.freq_scale, update.update_rate);
-                            match update_queue_clone.push(update) {
-                                Ok(_) => debug!("[RESYNTH UPDATE] Successfully pushed update to queue"),
-                                Err(e) => debug!("[RESYNTH UPDATE] Failed to push update to queue: {:?}", e),
-                            }
-                            last_update = Instant::now();
-                        },
-                        None => {
-                            debug!("[RESYNTH UPDATE] Shared memory queue is empty, no partials data available");
-                        }
-                    }
-                } else {
-                    debug!("[RESYNTH UPDATE] Shared memory queue not initialized, unable to retrieve partials data");
-                }
-            }
-
-            // Sleep longer when not updating to reduce CPU usage
-            let sleep_duration = if last_update.elapsed().as_secs_f32() >= update_rate {
-                // Short sleep when actively updating
-                Duration::from_millis(1)
-            } else {
-                // Longer sleep when waiting for next update
-                // Sleep for 1/10th of remaining time until next update, or 10ms minimum
-                let time_to_next = (update_rate - last_update.elapsed().as_secs_f32()).max(0.0);
-                Duration::from_secs_f32((time_to_next / 10.0).max(0.010))
-            };
-            thread::sleep(sleep_duration);
-        }
-        debug!("Resynth update thread shutting down");
-    });
+    // Start update thread to feed the synth with new analysis data
+    start_update_thread(
+        Arc::clone(&config),
+        Arc::clone(&shutdown_flag),
+        Arc::clone(&update_queue),
+        Arc::clone(&current_partials),
+    );
 
     // Main thread that handles audio stream lifecycle
     std::thread::spawn(move || {
@@ -444,8 +356,6 @@ pub fn start_resynth_thread(
             let _ = stream.stop();
         }
         
-        // Stop the update thread
-        update_thread_flag.store(false, Ordering::Relaxed);
         info!("Resynthesis thread shutting down");
     });
 }

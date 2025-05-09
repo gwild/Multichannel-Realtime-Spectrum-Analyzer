@@ -4,6 +4,7 @@ mod plot;
 mod utils;
 mod display;
 mod resynth;
+mod get_results;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -39,7 +40,7 @@ use crossbeam_queue::ArrayQueue;
 pub struct SharedMemory {
     pub data: Vec<Vec<(f32, f32)>>,
     pub path: String,
-    pub resynth_queue: Option<Arc<ArrayQueue<Vec<Vec<(f32, f32)>>>>>,
+    pub current_partials: Arc<Mutex<Vec<Vec<(f32, f32)>>>>,
 }
 
 // Add a new constant to replace hardcoded 12 throughout code
@@ -423,10 +424,7 @@ fn run() -> Result<()> {
     let mut control_file = std::fs::File::create(&control_path)?;
     writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
 
-    // Initialize shared resynth queue explicitly before any threads
-    let resynth_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 4));
-
-    // Create shared memory without mutex BEFORE threads start
+    // Initialize shared memory without mutex BEFORE threads start
     let shared_partials = {
         let shmem_name = "audio_peaks";
         let shared_memory_path = format!("/dev/shm/{}", shmem_name);
@@ -436,15 +434,16 @@ fn run() -> Result<()> {
         Some(SharedMemory {
             data: Vec::new(),
             path: shared_memory_path,
-            resynth_queue: Some(Arc::clone(&resynth_queue)),
+            current_partials: Arc::new(Mutex::new(Vec::new())),
         })
     };
 
     // Before starting the FFT thread, initialize spectrograph history with fixed capacity
     let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::with_capacity(MAX_SPECTROGRAPH_HISTORY)));
-
-    // Pass the initialized history to the FFT thread
     let spectrograph_history_fft = Arc::clone(&spectrograph_history);
+
+    // Create current_partials for FFT data sharing
+    let current_partials = Arc::new(Mutex::new(fft_analysis::CurrentPartials::new()));
 
     // Pass shared_partials to FFT thread
     let shared_partials_clone = shared_partials.clone();
@@ -459,6 +458,7 @@ fn run() -> Result<()> {
         let shared_partials_clone = shared_partials_clone.clone();
         let spectrograph_history = spectrograph_history_fft;
         let start_time = start_time_fft;
+        let current_partials = Arc::clone(&current_partials);
 
         move || {
             fft_analysis::start_fft_processing(
@@ -471,6 +471,7 @@ fn run() -> Result<()> {
                 shared_partials_clone,
                 Some(spectrograph_history),
                 Some(start_time),
+                current_partials,
             );
         }
     });
@@ -502,10 +503,8 @@ fn run() -> Result<()> {
 
     // Check shared memory initialization after FFT thread is ready
     if let Some(ref shared) = shared_partials {
-        if shared.resynth_queue.is_some() {
-            info!("Shared memory with resynth queue is properly initialized for resynthesis");
-        } else {
-            warn!("Shared memory is initialized but resynth queue is not set - resynthesis may not receive data");
+        if shared.current_partials.lock().unwrap().is_empty() {
+            warn!("Shared memory is initialized but current partials are empty - resynthesis may not receive data");
         }
     } else {
         error!("Shared memory is not initialized - resynthesis will not receive data from fft_analysis");
@@ -514,20 +513,18 @@ fn run() -> Result<()> {
     // Start resynthesis thread
     info!("Starting resynthesis...");
     let resynth_thread = std::thread::spawn({
-        let spectrum_app = Arc::clone(&spectrum_app);
         let resynth_config = Arc::clone(&resynth_config);
         let shutdown_flag = Arc::clone(&shutdown_flag);
-        let shared_partials_clone = shared_partials.clone();
         let num_channels = selected_channels.len();
         let num_partials = num_partials;
+        let current_partials = Arc::clone(&current_partials);
         move || {
             start_resynth_thread(
-                spectrum_app,
                 resynth_config,
                 selected_output_device,
                 selected_sample_rate,
                 shutdown_flag,
-                shared_partials_clone,
+                current_partials,
                 num_channels,
                 num_partials,
             );

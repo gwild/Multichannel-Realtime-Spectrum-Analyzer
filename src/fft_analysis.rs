@@ -82,6 +82,19 @@ pub struct FFTData {
     line_data: Vec<Vec<(f32, f32)>>,
 }
 
+// Add near the top of the file with other structs
+pub struct CurrentPartials {
+    pub data: Vec<Vec<(f32, f32)>>,
+}
+
+impl CurrentPartials {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+        }
+    }
+}
+
 /// Computes both partial data and full FFT line data
 fn compute_all_fft_data(
     all_channel_data: &[Vec<f32>],
@@ -136,16 +149,12 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
-    mut shared_partials: Option<SharedMemory>,
+    shared_partials: Option<SharedMemory>,
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
-    mut start_time: Option<Arc<Instant>>,
+    start_time: Option<Arc<Instant>>,
+    current_partials: Arc<Mutex<CurrentPartials>>,
 ) {
-    // Get the resynth queue from shared memory
-    let resynth_queue = if let Some(shared) = &shared_partials {
-        shared.resynth_queue.as_ref().map(Arc::clone)
-    } else {
-        None
-    };
+    debug!("Starting FFT processing thread");
 
     // Initialize FFT planner and buffers outside the loop
     let mut planner = RealFftPlanner::<f32>::new();
@@ -210,10 +219,7 @@ pub fn start_fft_processing(
                 spectrum_buffer = fft.make_output_vec();
                 current_buffer_size = buffer_size;
 
-                if let Some(new_start_time) = &mut start_time {
-                    *Arc::make_mut(new_start_time) = Instant::now();
-                    info!("FFT planner reinitialized, size: {}", buffer_size);
-                }
+                debug!("FFT planner reinitialized, size: {}", buffer_size);
 
                 if let Some(history) = &spectrograph_history {
                     if let Ok(mut history) = history.lock() {
@@ -312,25 +318,16 @@ pub fn start_fft_processing(
                 all_channels_partials
             };
 
-            // Push results to resynthesis queue first (no locking required)
-            if let Some(queue) = &resynth_queue {
-                if let Err(_) = queue.push(results.clone()) {
-                    debug!("Failed to push results to resynth queue - queue may be full");
-                } else {
-                    debug!("Successfully pushed results to resynth queue");
-                }
+            // Store FFT results in current_partials for resynth
+            if let Ok(mut current) = current_partials.lock() {
+                current.data = results.clone();
             }
 
-            // Update GUI with minimal lock duration
+            // Update GUI display
             {
                 let mut spectrum = spectrum_app.lock().unwrap();
                 spectrum.update_partials(results.clone());
                 spectrum.update_fft_line_data(all_channels_line_data);
-            }
-
-            // Update shared memory if needed
-            if let Some(shared) = &mut shared_partials {
-                shared.data = results.clone();  // Clone here to avoid moving
             }
 
             // Update spectrograph if needed
@@ -338,7 +335,7 @@ pub fn start_fft_processing(
                 let elapsed = start_time.as_ref().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
                 let slice = SpectrographSlice {
                     time: elapsed,
-                    data: results.iter()  // Now we can still use results here
+                    data: results.iter()
                         .flat_map(|channel_data| {
                             channel_data.iter()
                                 .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
@@ -359,7 +356,6 @@ pub fn start_fft_processing(
                     }
                 }
                 
-                // Always add new data
                 history.push_back(slice);
             }
         }));
