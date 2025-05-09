@@ -5,7 +5,7 @@ use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::cell::RefCell;
 use portaudio as pa;
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 use crate::plot::SpectrumApp;
 use crate::DEFAULT_NUM_PARTIALS;
 use crossbeam_queue::ArrayQueue;
@@ -19,7 +19,7 @@ const OUTPUT_BUFFER_SIZE: usize = 16384;  // Much larger for Linux/JACK compatib
 #[cfg(not(target_os = "linux"))]
 const OUTPUT_BUFFER_SIZE: usize = 4096;  // Smaller on non-Linux platforms
 
-const UPDATE_RING_SIZE: usize = 16;       // Increased for smoother updates
+pub const UPDATE_RING_SIZE: usize = 64;       // Increased for smoother updates and to prevent queue overflow
 pub const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
 
 /// Configuration for resynthesis
@@ -34,7 +34,7 @@ pub struct ResynthConfig {
 impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
-            gain: 0.5,
+            gain: 0.8,  // Increased default gain for better audibility
             smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,
@@ -65,7 +65,7 @@ pub struct ResynthConfigSnapshot {
 }
 
 /// Parameter update structure
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SynthUpdate {
     partials: Vec<Vec<(f32, f32)>>,
     gain: f32,
@@ -105,54 +105,30 @@ impl PartialState {
 struct WavetableSynth {
     current_wavetable: Vec<Vec<f32>>,
     next_wavetable: Vec<Vec<f32>>,
+    wavetable_queue: Arc<ArrayQueue<Vec<Vec<f32>>>>,  // Queue for new wavetables
     sample_counter: usize,
     wavetable_size: usize,
-    crossfade_start: usize,    // Point at which crossfade begins (2/3 through wavetable)
-    crossfade_length: usize,   // Length of crossfade period (1/3 of wavetable)
+    crossfade_start: usize,
+    crossfade_length: usize,
     in_crossfade: bool,
     sample_rate: f32,
     update_rate: f32,
-    output_buffer: Vec<f32>,
-    update_queue: Arc<ArrayQueue<SynthUpdate>>,
     current_gain: f32,
+    update_queue: Arc<ArrayQueue<SynthUpdate>>,
+    needs_resize: bool,  // Flag to indicate wavetable resize needed
+    new_size: usize,    // New size for resize operation
 }
 
 impl WavetableSynth {
-    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32, update_rate: f32) -> Vec<f32> {
-        let wavetable_size = (sample_rate * update_rate) as usize;
-        let mut table = vec![0.0; wavetable_size];
-        
-        debug!("Building wavetable with {} samples from partials:", wavetable_size);
-        for &(freq, amp) in partials {
-            if freq > 0.0 && amp > 0.0 {
-                let amplitude = (amp / 20.0).exp(); // Convert dB to linear amplitude
-                debug!("  Freq: {:.1} Hz, Amp: {:.1} dB -> Linear: {:.3}", freq, amp, amplitude);
-            }
-        }
-
-        // Generate wavetable exactly matching the update period
-        for i in 0..wavetable_size {
-            let t = (i as f32 / wavetable_size as f32) * update_rate; // Exact time in seconds over update period
-            for &(freq, amp) in partials {
-                if freq > 0.0 && amp > 0.0 {
-                    let amplitude = (amp / 20.0).exp(); // Convert dB to linear amplitude
-                    table[i] += amplitude * (2.0 * PI * freq * t).sin();
-                }
-            }
-        }
-
-        table
-    }
-
     fn new(num_channels: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
         let update_rate = DEFAULT_UPDATE_RATE;
         let wavetable_size = (sample_rate * update_rate) as usize;
-        let crossfade_length = wavetable_size / 3;  // Exactly 1/3 of wavetable
-        let crossfade_start = wavetable_size - crossfade_length;  // Start at 2/3 point
-
+        let crossfade_length = wavetable_size / 3;
+        let crossfade_start = wavetable_size - crossfade_length;
         Self {
             current_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
             next_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
+            wavetable_queue: Arc::new(ArrayQueue::new(10)),
             sample_counter: 0,
             wavetable_size,
             crossfade_start,
@@ -160,112 +136,27 @@ impl WavetableSynth {
             in_crossfade: false,
             sample_rate,
             update_rate,
-            output_buffer: vec![0.0; num_channels],
-            update_queue,
             current_gain: 0.25,
-        }
-    }
-
-    fn resize_state_vectors(&mut self, num_channels: usize) {
-        self.current_wavetable = vec![vec![0.0; self.wavetable_size]; num_channels];
-        self.next_wavetable = vec![vec![0.0; self.wavetable_size]; num_channels];
-        self.output_buffer = vec![0.0; num_channels];
-    }
-
-    fn apply_updates(&mut self) {
-        let mut new_update = None;
-        while let Some(update) = self.update_queue.pop() {
-            new_update = Some(update);
-        }
-
-        if let Some(update) = new_update {
-            debug!("Received new partials update:");
-            for (ch, ch_partials) in update.partials.iter().enumerate() {
-                debug!("Channel {}: {}", ch, format_partials_debug(ch_partials));
-            }
-
-            self.current_gain = update.gain;
-
-            // Check if update rate has changed significantly
-            if (self.update_rate - update.update_rate).abs() > f32::EPSILON {
-                let old_size = self.wavetable_size;
-                self.update_rate = update.update_rate;
-                let new_wavetable_size = (self.sample_rate * self.update_rate) as usize;
-                let new_crossfade_length = new_wavetable_size / 3;
-                let new_crossfade_start = new_wavetable_size - new_crossfade_length;
-
-                // Generate new wavetables safely
-                let mut new_current_wavetable = vec![vec![0.0; new_wavetable_size]; self.current_wavetable.len()];
-                let mut new_next_wavetable = vec![vec![0.0; new_wavetable_size]; self.next_wavetable.len()];
-
-                // If we're in a crossfade, we need to preserve both current and next wavetables
-                if self.in_crossfade {
-                    for ch in 0..self.current_wavetable.len() {
-                        // Resample current wavetable to new size
-                        for i in 0..new_wavetable_size {
-                            let old_idx = (i as f32 * old_size as f32 / new_wavetable_size as f32) as usize;
-                            new_current_wavetable[ch][i] = self.current_wavetable[ch][old_idx % old_size];
-                        }
-                        // Generate new next wavetable
-                        new_next_wavetable[ch] = Self::build_wavetable(
-                            &update.partials[ch],
-                            self.sample_rate,
-                            self.update_rate
-                        );
-                    }
-                    // Adjust sample counter position
-                    self.sample_counter = (self.sample_counter as f32 * new_wavetable_size as f32 / old_size as f32) as usize;
-                } else {
-                    // Not in crossfade, just generate new wavetable
-                    for (ch, ch_partials) in update.partials.iter().enumerate() {
-                        new_next_wavetable[ch] = Self::build_wavetable(
-                            ch_partials,
-                            self.sample_rate,
-                            self.update_rate
-                        );
-                    }
-                    self.sample_counter = 0;
-                }
-
-                // Atomically swap in new wavetables and parameters
-                self.current_wavetable = new_current_wavetable;
-                self.next_wavetable = new_next_wavetable;
-                self.wavetable_size = new_wavetable_size;
-                self.crossfade_length = new_crossfade_length;
-                self.crossfade_start = new_crossfade_start;
-
-                info!("Update rate changed safely: {} s, new wavetable size: {}", 
-                    self.update_rate, self.wavetable_size);
-            } else {
-                // Regular update without resizing
-                for (ch, ch_partials) in update.partials.iter().enumerate() {
-                    self.next_wavetable[ch] = Self::build_wavetable(
-                        ch_partials,
-                        self.sample_rate,
-                        self.update_rate
-                    );
-                    debug!("Generated new wavetable for channel {} with {} partials", 
-                        ch, ch_partials.len());
-                }
-
-                // Only reset sample counter if not in crossfade
-                if !self.in_crossfade {
-                    self.sample_counter = 0;
-                }
-            }
+            update_queue,
+            needs_resize: false,
+            new_size: wavetable_size,
         }
     }
 
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
-        if buffer.is_empty() || channels == 0 {
-            return;
+        // Check for updates
+        self.apply_updates();
+
+        // Check if resize is needed
+        if self.needs_resize {
+            self.resize_wavetables(self.new_size);
+            self.needs_resize = false;
         }
 
-        self.apply_updates();
         let frames = buffer.len() / channels;
 
         for frame in 0..frames {
-            // Ensure sample_counter stays within bounds
+            // Reset counter and swap buffers if needed
             if self.sample_counter >= self.wavetable_size {
                 self.sample_counter = 0;
                 if self.in_crossfade {
@@ -274,123 +165,229 @@ impl WavetableSynth {
                 }
             }
 
-            // Calculate precise linear crossfade for 1/3 overlap
-            let crossfade = if self.sample_counter >= self.crossfade_start {
-                self.in_crossfade = true;
-                let fade_pos = (self.sample_counter - self.crossfade_start) as f32 
-                    / self.crossfade_length as f32;
-                fade_pos.clamp(0.0, 1.0) // Linear crossfade
+            // Calculate crossfade coefficients using smoother curve
+            let (fade_out, fade_in) = if self.in_crossfade && self.sample_counter >= self.crossfade_start {
+                let progress = (self.sample_counter - self.crossfade_start) as f32 / self.crossfade_length as f32;
+                let fade = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos()); // Cosine interpolation
+                (1.0 - fade, fade)
             } else {
-                0.0
+                (1.0, 0.0)
             };
 
-            // Process each channel with precise amplitude control
+            // Process each channel
             for ch in 0..channels {
-                if ch >= self.current_wavetable.len() || self.sample_counter >= self.current_wavetable[ch].len() {
+                if ch >= self.current_wavetable.len() {
                     continue;
                 }
 
-                // Ensure perfect complementary crossfade
-                let fade_out = 1.0 - crossfade;
-                let fade_in = crossfade;
-
                 let curr_sample = self.current_wavetable[ch][self.sample_counter] * fade_out;
-                let next_sample = self.next_wavetable[ch][self.sample_counter] * fade_in;
+                let next_sample = if self.in_crossfade {
+                    self.next_wavetable[ch][self.sample_counter] * fade_in
+                } else {
+                    0.0
+                };
 
-                // Sum the crossfaded samples
-                let sample = curr_sample + next_sample;
-
-                let idx = frame * channels + ch;
-                if idx < buffer.len() {
-                    let final_sample = sample * self.current_gain;
-                    buffer[idx] = if final_sample.abs() > 1.0 {
-                        final_sample.signum() * (1.0 - (-final_sample.abs()).exp())
-                    } else {
-                        final_sample
-                    };
-                }
+                buffer[frame * channels + ch] = (curr_sample + next_sample) * self.current_gain;
             }
 
             self.sample_counter += 1;
+        }
+    }
+
+    fn resize_wavetables(&mut self, new_size: usize) {
+        let old_size = self.wavetable_size;
+        self.wavetable_size = new_size;
+        self.crossfade_length = new_size / 3;
+        self.crossfade_start = new_size - self.crossfade_length;
+
+        // Resize current wavetables with interpolation
+        for channel in 0..self.current_wavetable.len() {
+            let mut new_table = vec![0.0; new_size];
+            for i in 0..new_size {
+                let old_idx = (i as f32 * old_size as f32 / new_size as f32) as usize;
+                let next_idx = (old_idx + 1).min(old_size - 1);
+                let frac = (i as f32 * old_size as f32 / new_size as f32) - old_idx as f32;
+                
+                new_table[i] = self.current_wavetable[channel][old_idx] * (1.0 - frac) +
+                              self.current_wavetable[channel][next_idx] * frac;
+            }
+            self.current_wavetable[channel] = new_table;
+        }
+
+        // Resize next wavetables
+        for channel in 0..self.next_wavetable.len() {
+            self.next_wavetable[channel] = vec![0.0; new_size];
+        }
+
+        // Adjust sample counter
+        self.sample_counter = (self.sample_counter as f32 * new_size as f32 / old_size as f32) as usize;
+    }
+
+    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32, update_rate: f32) -> Vec<f32> {
+        let wavetable_size = (sample_rate * update_rate) as usize;
+        let mut table = vec![0.0; wavetable_size];
+        let mut max_amplitude: f32 = 0.0;
+        
+        // Generate wavetable
+        for i in 0..wavetable_size {
+            let t = i as f32 / sample_rate;  // Time in seconds
+            for &(freq, amp) in partials {
+                if freq > 0.0 && amp > 0.0 {
+                    // Convert dB to linear amplitude
+                    let amplitude = (amp / 20.0).exp();
+                    table[i] += amplitude * (2.0 * PI * freq * t).sin();
+                    max_amplitude = max_amplitude.max(amplitude);
+                }
+            }
+        }
+
+        // Normalize to prevent clipping
+        if max_amplitude > 1.0 {
+            for sample in &mut table {
+                *sample /= max_amplitude;
+            }
+        }
+
+        table
+    }
+
+    fn apply_updates(&mut self) {
+        while let Some(update) = self.update_queue.pop() {
+            // Update parameters
+            self.current_gain = update.gain;
+            
+            // Check if update rate has changed
+            if update.update_rate != self.update_rate {
+                self.update_rate = update.update_rate;
+                let new_size = (self.sample_rate * self.update_rate) as usize;
+                if new_size != self.wavetable_size {
+                    self.new_size = new_size;
+                    self.needs_resize = true;
+                }
+            }
+
+            // Process partials to build new wavetables
+            let mut new_wavetables = Vec::with_capacity(update.partials.len());
+            for partials in &update.partials {
+                new_wavetables.push(Self::build_wavetable(partials, self.sample_rate, update.update_rate));
+            }
+
+            // Try to push to queue, with retry on failure
+            if let Ok(_) = self.wavetable_queue.push(new_wavetables.clone()) {
+                debug!("Successfully pushed new wavetables to queue");
+            } else {
+                debug!("Queue full, retrying after clearing");
+                // Clear queue and try again
+                while self.wavetable_queue.pop().is_some() {}
+                let _ = self.wavetable_queue.push(new_wavetables);
+            }
         }
     }
 }
 
 /// Starts a thread that performs real-time resynthesis of the analyzed spectrum.
 pub fn start_resynth_thread(
-    spectrum_app: Arc<Mutex<SpectrumApp>>,  // Remove underscore to use this parameter
+    spectrum_app: Arc<Mutex<SpectrumApp>>,
     config: Arc<Mutex<ResynthConfig>>,
     device_index: pa::DeviceIndex,
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
-    _shared_partials: Option<SharedMemory>, // Mark as unused
+    shared_memory: Option<SharedMemory>,
+    num_channels: usize,
+    num_partials: usize,
 ) {
-    // Initialize channels
-    let (num_channels, num_partials) = {
-        let spec_app = spectrum_app.lock().unwrap();
-        let data = spec_app.clone_absolute_data();
-        (data.len(), 
-         if !data.is_empty() {
-             data[0].len()
-         } else {
-             DEFAULT_NUM_PARTIALS
-         })
-    };
-    
+    debug!("Module path for resynth: {}", module_path!());
+    debug!("Using fixed num_channels: {}, num_partials: {}", num_channels, num_partials);
+
     // Create synthesis engine and shared queue between threads
     let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2));
+
+    // Get the resynthesis queue from shared memory
+    let resynth_queue = if let Some(shared) = shared_memory {
+        match shared.resynth_queue {
+            Some(queue) => {
+                debug!("[RESYNTH SETUP] Using shared memory queue from fft_analysis");
+                Some(queue)
+            },
+            None => {
+                error!("[RESYNTH SETUP] Shared memory exists but resynth_queue is None");
+                None
+            }
+        }
+    } else {
+        error!("[RESYNTH SETUP] Shared memory not available - fft_analysis data cannot be accessed");
+        None
+    };
     
+    // Log whether a queue is available
+    if resynth_queue.is_some() {
+        debug!("[RESYNTH SETUP] Resynth queue initialized successfully");
+    } else {
+        error!("[RESYNTH SETUP] Failed to initialize resynth queue - fft_analysis may not be providing data");
+    }
+
     // Create update thread to feed the synth with new analysis data
     let update_thread_flag = Arc::new(AtomicBool::new(true));
     let update_thread_flag_clone = Arc::clone(&update_thread_flag);
     let shutdown_flag_clone = Arc::clone(&shutdown_flag);
     let update_queue_clone = Arc::clone(&update_queue);
     let config_for_thread = Arc::clone(&config);
-    let spectrum_app_clone = Arc::clone(&spectrum_app);
 
     let _update_thread = thread::spawn(move || {
         let mut last_update = Instant::now();
         while !shutdown_flag_clone.load(Ordering::Relaxed) && update_thread_flag_clone.load(Ordering::Relaxed) {
-            // Clone config and spectrum data with minimal lock duration
-            let (partials, gain, freq_scale, smoothing, update_rate) = {
-                let config_snapshot = config_for_thread.lock().unwrap().snapshot();
-
-                // Lock spectrum_app briefly to clone partials data
-                let partials_data = {
-                    let spec_app = spectrum_app_clone.lock().unwrap();
-                    spec_app.clone_absolute_data()
-                };
-
-                (
-                    partials_data,
-                    config_snapshot.gain,
-                    config_snapshot.freq_scale,
-                    config_snapshot.smoothing,
-                    config_snapshot.update_rate,
-                )
+            // First check if it's time to update with minimal locking
+            let update_rate = {
+                let config = config_for_thread.lock().unwrap();
+                config.update_rate
             };
 
-            // Only do heavy computation (wavetable build, etc.) after releasing locks
+            // Only get new data if it's time for an update
             if last_update.elapsed().as_secs_f32() >= update_rate {
-                debug!("Time for update: elapsed={}s, update_rate={}s", last_update.elapsed().as_secs_f32(), update_rate);
-                // Create parameter update
-                let update = SynthUpdate {
-                    partials,
-                    gain,
-                    freq_scale,
-                    smoothing,
-                    update_rate,  // Add update_rate to the update
-                };
-                // Submit update to the queue
-                match update_queue_clone.push(update) {
-                    Ok(_) => debug!("Successfully pushed update to queue"),
-                    Err(_) => debug!("Failed to push update to queue, queue might be full"),
+                // Get config snapshot with minimal lock duration
+                let config_snapshot = config_for_thread.lock().unwrap().snapshot();
+
+                // Get partials data from dedicated queue (no GUI locking)
+                if let Some(queue) = &resynth_queue {
+                    match queue.pop() {
+                        Some(partials_data) => {
+                            debug!("[RESYNTH UPDATE] Successfully retrieved partials data from shared memory queue");
+                            let update = SynthUpdate {
+                                partials: partials_data,
+                                gain: config_snapshot.gain,
+                                freq_scale: config_snapshot.freq_scale,
+                                smoothing: config_snapshot.smoothing,
+                                update_rate: config_snapshot.update_rate,
+                            };
+
+                            // Push update to synth
+                            debug!("[RESYNTH UPDATE] Attempting to push update to queue: gain={}, freq_scale={}, update_rate={}", update.gain, update.freq_scale, update.update_rate);
+                            match update_queue_clone.push(update) {
+                                Ok(_) => debug!("[RESYNTH UPDATE] Successfully pushed update to queue"),
+                                Err(e) => debug!("[RESYNTH UPDATE] Failed to push update to queue: {:?}", e),
+                            }
+                            last_update = Instant::now();
+                        },
+                        None => {
+                            debug!("[RESYNTH UPDATE] Shared memory queue is empty, no partials data available");
+                        }
+                    }
+                } else {
+                    debug!("[RESYNTH UPDATE] Shared memory queue not initialized, unable to retrieve partials data");
                 }
-                last_update = Instant::now();
-            } else {
-                debug!("Skipping update: elapsed={}s, update_rate={}s", last_update.elapsed().as_secs_f32(), update_rate);
             }
-            thread::sleep(Duration::from_millis(20));
+
+            // Sleep longer when not updating to reduce CPU usage
+            let sleep_duration = if last_update.elapsed().as_secs_f32() >= update_rate {
+                // Short sleep when actively updating
+                Duration::from_millis(1)
+            } else {
+                // Longer sleep when waiting for next update
+                // Sleep for 1/10th of remaining time until next update, or 10ms minimum
+                let time_to_next = (update_rate - last_update.elapsed().as_secs_f32()).max(0.0);
+                Duration::from_secs_f32((time_to_next / 10.0).max(0.010))
+            };
+            thread::sleep(sleep_duration);
         }
         debug!("Resynth update thread shutting down");
     });
@@ -416,27 +413,8 @@ pub fn start_resynth_thread(
                 Duration::from_millis(500)
             };
             
-            if needs_restart_now && last_restart_time.elapsed() < backoff_time {
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            
-            // Handle restart case
-            if needs_restart_now {
-                debug!("Restarting audio stream...");
-                
-                // Clean up existing stream if any
-                if let Some(mut stream) = current_stream.take() {
-                    let _ = stream.stop();
-                    // Add small delay after stopping the stream
-                    thread::sleep(Duration::from_millis(100));
-                }
-                
-                // Mark restart handled
-                needs_restart.store(false, Ordering::Relaxed);
-                last_restart_time = Instant::now();
-                
-                // Setup new stream with retry logic
+            if needs_restart_now && last_restart_time.elapsed() >= backoff_time {
+                debug!("Setting up new audio stream");
                 match setup_audio_stream(
                     device_index,
                     sample_rate,
@@ -445,29 +423,19 @@ pub fn start_resynth_thread(
                     num_partials
                 ) {
                     Ok(stream) => {
+                        debug!("Successfully created new audio stream");
                         current_stream = Some(stream);
                         consecutive_errors = 0;
-                        debug!("Audio stream restarted successfully");
+                        needs_restart.store(false, Ordering::Relaxed);
                     },
                     Err(e) => {
+                        error!("Failed to create audio stream: {}", e);
                         consecutive_errors += 1;
-                        error!("Failed to restart audio stream (attempt {}): {}", consecutive_errors, e);
-                        // Let the next iteration handle the retry
-                        continue;
                     }
                 }
+                last_restart_time = Instant::now();
             }
-            
-            // Check stream health if we have one
-            if let Some(ref stream) = current_stream {
-                if let Err(e) = stream.is_active() {
-                    error!("Stream health check failed: {}, will restart", e);
-                    current_stream = None;
-                    consecutive_errors += 1;
-                }
-            }
-            
-            // Sleep a bit before next check
+
             thread::sleep(Duration::from_millis(100));
         }
         
@@ -499,54 +467,32 @@ fn setup_audio_stream(
     // Create output parameters
     let output_params = pa::StreamParameters::<f32>::new(
         device_index,
-        2, // Stereo output
+        num_channels as i32,
         true,
         device_info.default_low_output_latency
     );
+
+    let settings = pa::OutputStreamSettings::new(output_params, sample_rate, OUTPUT_BUFFER_SIZE as u32);
     
-    // Choose a supported sample rate
-    let supported_sample_rate = match pa.is_output_format_supported(output_params, sample_rate) {
-        Ok(_) => sample_rate,
-        Err(_) => {
-            // Try common sample rates
-            let fallback_sample_rates = [44100.0, 48000.0, 96000.0, 192000.0];
-            let supported_rate = fallback_sample_rates
-                .iter()
-                .find(|&&rate| pa.is_output_format_supported(output_params, rate).is_ok())
-                .copied()
-                .unwrap_or(44100.0);
-            
-            info!("Sample rate {} not supported, using {} instead", sample_rate, supported_rate);
-            supported_rate
+    // Create wavetable synth
+    let synth = WavetableSynth::new(num_channels, sample_rate as f32, update_queue);
+    let synth = Arc::new(Mutex::new(synth));
+    
+    // Create stream with callback
+    let callback = move |pa::OutputStreamCallbackArgs { buffer, .. }| {
+        if let Ok(mut synth) = synth.lock() {
+            synth.process_buffer(buffer, num_channels);
         }
-    };
-    
-    // Create output settings
-    let settings = pa::stream::OutputSettings::new(
-        output_params,
-        supported_sample_rate,
-        OUTPUT_BUFFER_SIZE as u32
-    );
-    
-    // Create synthesizer for the callback
-    let synth_for_callback = std::cell::RefCell::new(WavetableSynth::new(
-        num_channels, 
-        supported_sample_rate as f32,
-        update_queue
-    ));
-    
-    // Create callback function
-    let callback = move |args: pa::OutputStreamCallbackArgs<f32>| {
-        // Use borrow_mut() to get mutable access
-        let mut synth = synth_for_callback.borrow_mut();
-        synth.process_buffer(args.buffer, 2); // 2 = stereo
         pa::Continue
     };
-    
-    // Open and start the stream
+
+    // Open stream
     let mut stream = pa.open_non_blocking_stream(settings, callback)?;
+
+    // Start the stream
     stream.start()?;
-    
+    debug!("Audio stream started successfully");
+
     Ok(stream)
 }
 
@@ -556,4 +502,4 @@ fn format_partials_debug(partials: &[(f32, f32)]) -> String {
         .map(|&(freq, amp)| format!("({:.1} Hz, {:.1} dB)", freq, amp))
         .collect::<Vec<_>>()
         .join(", ")
-} 
+}

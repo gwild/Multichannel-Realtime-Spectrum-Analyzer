@@ -17,11 +17,13 @@ use std::sync::{
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
 use log::{info, error, warn, debug};
+use fern::Dispatch;
+use log::LevelFilter;
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;
-use crate::resynth::{ResynthConfig, start_resynth_thread};
+use crate::resynth::{ResynthConfig, start_resynth_thread, UPDATE_RING_SIZE};
 use crate::plot::MyApp;
 use std::ffi::CString;
 use std::thread;
@@ -31,11 +33,13 @@ use crate::plot::SpectrographSlice;
 use std::time::Instant;
 use std::fs::OpenOptions;
 use chrono;
+use crossbeam_queue::ArrayQueue;
 
 #[derive(Clone)]
 pub struct SharedMemory {
-    data: Vec<Vec<(f32, f32)>>,
-    path: String,
+    pub data: Vec<Vec<(f32, f32)>>,
+    pub path: String,
+    pub resynth_queue: Option<Arc<ArrayQueue<Vec<Vec<(f32, f32)>>>>>,
 }
 
 // Add a new constant to replace hardcoded 12 throughout code
@@ -50,17 +54,19 @@ fn main() {
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
         let current_dir = std::env::current_dir().expect("Failed to get current directory");
 
-        // Build the command without debug.txt redirection by default
-        let mut cmd_str = format!("cd '{}' && {} --launched-by-python --gui-ipc", 
+        // Build the command, preserving all original arguments
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut cmd_str = format!("cd '{}' && {} --launched-by-python", 
             current_dir.display(), 
             current_exe.display()
         );
-
-        // Only add debug.txt output if --debug flag is present
-        if std::env::args().any(|arg| arg == "--debug") {
-            cmd_str.push_str(" --debug 2>&1 | tee debug.txt");
+        
+        // Add all original arguments
+        for arg in args {
+            cmd_str.push_str(&format!(" '{}'", arg));
         }
-        cmd_str.push_str("; read -p 'Press enter to close'");
+        
+        cmd_str.push_str(" 2>&1 | tee debug.txt; read -p 'Press enter to close'");
 
         let cmd = vec![
             "xterm".to_string(),
@@ -79,71 +85,81 @@ fn main() {
         return;
     }
 
+    // Initialize logging first, before any other operations
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.contains(&"--debug".to_string()) {
+        let mut dispatch = Dispatch::new()
+            .format(|out, message, record| {
+                out.finish(format_args!(
+                    "[{}:{}] {} - {}",
+                    record.level(),
+                    record.target(),
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                    message
+                ))
+            })
+            .level(LevelFilter::Info);  // Default level
+
+        let mut debug_enabled = false;
+        for arg in args.iter() {
+            match arg.as_str() {
+                "resynth" => {
+                    dispatch = dispatch.level_for("audio_streaming::resynth", LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for resynth module");
+                },
+                "fft" => {
+                    dispatch = dispatch.level_for("audio_streaming::fft_analysis", LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for fft module");
+                },
+                "audio" => {
+                    dispatch = dispatch.level_for("audio_streaming::audio_stream", LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for audio module");
+                },
+                "plot" => {
+                    dispatch = dispatch.level_for("audio_streaming::plot", LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for plot module");
+                },
+                "main" => {
+                    dispatch = dispatch.level_for("audio_streaming", LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for main module");
+                },
+                "all" => {
+                    dispatch = dispatch.level(LevelFilter::Debug);
+                    debug_enabled = true;
+                    println!("Enabling debug for all modules");
+                    break;
+                },
+                _ => {}
+            }
+        }
+
+        if !debug_enabled {
+            println!("Debug flag present but no module specified. Defaulting to global debug. Available modules: resynth, fft, audio, plot, main, all");
+            dispatch = dispatch.level(LevelFilter::Debug); // Default to global debug if no module specified
+        }
+
+        dispatch
+            .chain(std::io::stdout())
+            .apply()
+            .unwrap();
+
+        debug!("Logging initialized with args: {:?}", args);
+    } else {
+        std::env::set_var("RUST_LOG", "error");
+        env_logger::init();
+    }
+
     // Check if GStreamer is running, start it if not
     check_and_start_gstreamer();
 
-    // Parse command line arguments for logging
-    let args: Vec<String> = std::env::args().collect();
-    let log_level = if args.contains(&"--error".to_string()) {
-        "error"
-    } else if args.contains(&"--warn".to_string()) {
-        "warn"
-    } else if args.contains(&"--info".to_string()) {
-        "info"
-    } else if args.contains(&"--debug".to_string()) {
-        "debug"
-    } else if args.contains(&"--trace".to_string()) {
-        "trace"
-    } else if args.contains(&"--enable-logs".to_string()) {
-        // Backward compatibility with old flag
-        "info"
-    } else if std::env::var("RUST_LOG").is_ok() {
-        // Keep any manually set RUST_LOG value
-        &std::env::var("RUST_LOG").unwrap_or_else(|_| "error".to_string())
-    } else {
-        // Default to error level only
-        "error"
-    };
-
-    // Set up logging for all modules in the application
-    if args.contains(&"--debug".to_string()) {
-        std::env::set_var("RUST_LOG", "resynth=debug,audio_stream=info,fft_analysis=info,plot=info");
-        let mut builder = env_logger::Builder::from_env("RUST_LOG");
-        builder.format(|buf, record| {
-            writeln!(
-                buf,
-                "[{}:{}] {} - {}",
-                record.level(),
-                record.target(),
-                chrono::Local::now().format("%H:%M:%S%.3f"),
-                record.args()
-            )
-        });
-
-        // Only write to debug.txt when --debug is used
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open("debug.txt") 
-        {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
-        }
-        builder.init();
-    } else {
-        std::env::set_var("RUST_LOG", format!("resynth={}", log_level));
-        env_logger::Builder::from_env("RUST_LOG").init();
-    }
-
-    // Print logging level information
-    println!("RUST_LOG set to: {}", std::env::var("RUST_LOG").unwrap_or_default());
-
     if let Err(e) = run() {
-        if std::env::args().any(|arg| arg == "--enable-logs") {
-            error!("Application encountered an error: {:?}", e);
-        } else {
-            error!("Application error: {:?}", e);
-        }
+        error!("Application error: {:?}", e);
         std::process::exit(1);
     }
 }
@@ -407,6 +423,9 @@ fn run() -> Result<()> {
     let mut control_file = std::fs::File::create(&control_path)?;
     writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
 
+    // Initialize shared resynth queue explicitly before any threads
+    let resynth_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 4));
+
     // Create shared memory without mutex BEFORE threads start
     let shared_partials = {
         let shmem_name = "audio_peaks";
@@ -417,6 +436,7 @@ fn run() -> Result<()> {
         Some(SharedMemory {
             data: Vec::new(),
             path: shared_memory_path,
+            resynth_queue: Some(Arc::clone(&resynth_queue)),
         })
     };
 
@@ -480,6 +500,17 @@ fn run() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
+    // Check shared memory initialization after FFT thread is ready
+    if let Some(ref shared) = shared_partials {
+        if shared.resynth_queue.is_some() {
+            info!("Shared memory with resynth queue is properly initialized for resynthesis");
+        } else {
+            warn!("Shared memory is initialized but resynth queue is not set - resynthesis may not receive data");
+        }
+    } else {
+        error!("Shared memory is not initialized - resynthesis will not receive data from fft_analysis");
+    }
+
     // Start resynthesis thread
     info!("Starting resynthesis...");
     let resynth_thread = std::thread::spawn({
@@ -487,6 +518,8 @@ fn run() -> Result<()> {
         let resynth_config = Arc::clone(&resynth_config);
         let shutdown_flag = Arc::clone(&shutdown_flag);
         let shared_partials_clone = shared_partials.clone();
+        let num_channels = selected_channels.len();
+        let num_partials = num_partials;
         move || {
             start_resynth_thread(
                 spectrum_app,
@@ -495,6 +528,8 @@ fn run() -> Result<()> {
                 selected_sample_rate,
                 shutdown_flag,
                 shared_partials_clone,
+                num_channels,
+                num_partials,
             );
         }
     });
@@ -635,3 +670,4 @@ fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels:
         }
     }
 }
+

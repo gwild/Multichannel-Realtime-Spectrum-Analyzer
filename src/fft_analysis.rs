@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::plot::SpectrumApp;
 use crate::audio_stream::CircularBuffer;
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use crossbeam_queue::ArrayQueue;
 
 // Change the constant declaration to be public
 pub const MAX_SPECTROGRAPH_HISTORY: usize = 500;
@@ -139,6 +140,13 @@ pub fn start_fft_processing(
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
     mut start_time: Option<Arc<Instant>>,
 ) {
+    // Get the resynth queue from shared memory
+    let resynth_queue = if let Some(shared) = &shared_partials {
+        shared.resynth_queue.as_ref().map(Arc::clone)
+    } else {
+        None
+    };
+
     // Initialize FFT planner and buffers outside the loop
     let mut planner = RealFftPlanner::<f32>::new();
     let mut current_buffer_size = DEFAULT_BUFFER_SIZE;
@@ -281,7 +289,7 @@ pub fn start_fft_processing(
                     &channel_buffers,
                     channel_index,     
                     sample_rate, 
-                    &cached_config  // Use cached config
+                    &cached_config
                 );
                 
                 all_channels_partials.push(partials);
@@ -289,10 +297,10 @@ pub fn start_fft_processing(
             }
 
             // Apply crosstalk filtering if enabled
-            let results = if cached_config.crosstalk_enabled {  // Use cached config
+            let results = if cached_config.crosstalk_enabled {
                 filter_crosstalk_frequency_domain(
                     &mut all_channels_partials,
-                    cached_config.crosstalk_threshold,  // Use cached values
+                    cached_config.crosstalk_threshold,
                     cached_config.crosstalk_reduction,
                     cached_config.harmonic_tolerance,
                     cached_config.root_freq_min,
@@ -304,29 +312,14 @@ pub fn start_fft_processing(
                 all_channels_partials
             };
 
-            // Prepare shared memory data before acquiring lock
-            let shared_memory_data = if shared_partials.is_some() {
-                let buffer_size = results.len() * num_partials * 2 * 4;  // 2 f32s per partial, 4 bytes each
-                let mut buffer = Vec::with_capacity(buffer_size);
-                
-                for channel_data in &results {
-                    for i in 0..num_partials {
-                        let (freq, amp) = if i < channel_data.len() {
-                            channel_data[i]
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        // Convert f32 to bytes
-                        let freq_bytes = freq.to_le_bytes();
-                        let amp_bytes = amp.to_le_bytes();
-                        buffer.extend_from_slice(&freq_bytes);  // 4 bytes
-                        buffer.extend_from_slice(&amp_bytes);   // 4 bytes
-                    }
+            // Push results to resynthesis queue first (no locking required)
+            if let Some(queue) = &resynth_queue {
+                if let Err(_) = queue.push(results.clone()) {
+                    debug!("Failed to push results to resynth queue - queue may be full");
+                } else {
+                    debug!("Successfully pushed results to resynth queue");
                 }
-                Some(buffer)
-            } else {
-                None
-            };
+            }
 
             // Update GUI with minimal lock duration
             {
@@ -335,29 +328,17 @@ pub fn start_fft_processing(
                 spectrum.update_fft_line_data(all_channels_line_data);
             }
 
-            // Update shared memory with minimal lock duration
-            if let Some(buffer) = shared_memory_data {
-                if let Some(shared) = &mut shared_partials {
-                    shared.data = results.clone();
-                    info!("Updated shared memory data: {} channels", results.len());
-
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&shared.path)
-                    {
-                        let _ = file.set_len(buffer.len() as u64);
-                        let _ = file.write_all(&buffer);
-                        info!("Wrote {} bytes to shared memory", buffer.len());
-                    }
-                }
+            // Update shared memory if needed
+            if let Some(shared) = &mut shared_partials {
+                shared.data = results.clone();  // Clone here to avoid moving
             }
 
-            // Update spectrograph with minimal lock duration
+            // Update spectrograph if needed
             if let Some(history) = &spectrograph_history {
                 let elapsed = start_time.as_ref().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
                 let slice = SpectrographSlice {
                     time: elapsed,
-                    data: results.iter()
+                    data: results.iter()  // Now we can still use results here
                         .flat_map(|channel_data| {
                             channel_data.iter()
                                 .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
