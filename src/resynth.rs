@@ -13,6 +13,7 @@ use anyhow::{Result, Error, anyhow};
 use crate::SharedMemory;
 use crate::get_results::start_update_thread;
 use crate::fft_analysis::CurrentPartials;
+use crate::make_waves::{build_wavetable, format_partials_debug};
 
 // Constants for audio performance - with optimized values for JACK
 #[cfg(target_os = "linux")]
@@ -105,177 +106,109 @@ impl PartialState {
 /// Lock-free synthesis engine
 #[derive(Clone)]
 struct WavetableSynth {
-    current_wavetable: Vec<Vec<f32>>,
-    next_wavetable: Vec<Vec<f32>>,
+    wavetables: Vec<Vec<Vec<f32>>>,  // Vector of wavetables for each channel
+    transition_tables: Vec<Vec<Vec<f32>>>,  // Pre-combined transition wavetables
     sample_counter: usize,
-    wavetable_size: usize,
-    crossfade_start: usize,
-    crossfade_length: usize,
-    in_crossfade: bool,
+    current_table: usize,
     sample_rate: f32,
     update_rate: f32,
     current_gain: f32,
     update_queue: Arc<ArrayQueue<SynthUpdate>>,
-    needs_resize: bool,  // Flag to indicate wavetable resize needed
-    new_size: usize,    // New size for resize operation
 }
 
 impl WavetableSynth {
     fn new(num_channels: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
         let update_rate = DEFAULT_UPDATE_RATE;
-        let wavetable_size = (sample_rate * update_rate) as usize;
-        let crossfade_length = wavetable_size / 3;
-        let crossfade_start = wavetable_size - crossfade_length;
         Self {
-            current_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
-            next_wavetable: vec![vec![0.0; wavetable_size]; num_channels],
+            wavetables: vec![vec![vec![0.0; (sample_rate * update_rate / 3.0) as usize]; 1]; num_channels],
+            transition_tables: vec![vec![vec![0.0; (sample_rate * update_rate / 3.0) as usize]; 1]; num_channels],
             sample_counter: 0,
-            wavetable_size,
-            crossfade_start,
-            crossfade_length,
-            in_crossfade: false,
+            current_table: 0,
             sample_rate,
             update_rate,
             current_gain: 0.25,
             update_queue,
-            needs_resize: false,
-            new_size: wavetable_size,
+        }
+    }
+
+    fn create_transition_table(old_data: &[f32], new_data: &[f32]) -> Vec<f32> {
+        let len = old_data.len();
+        let mut transition = vec![0.0; len];
+        
+        for i in 0..len {
+            let fade = i as f32 / len as f32;
+            transition[i] = old_data[i] * (1.0 - fade) + new_data[i] * fade;
+        }
+        
+        transition
+    }
+
+    fn process_update(&mut self, update: SynthUpdate) {
+        self.current_gain = update.gain;
+        let rate_changed = (update.update_rate - self.update_rate).abs() > 1e-6;
+        
+        // Calculate segment length (1/3 of total period)
+        let new_segment_len = ((if rate_changed { update.update_rate } else { self.update_rate } 
+            * self.sample_rate) / 3.0) as usize;
+            
+        // Build new wavetable segments
+        let mut new_segments = update.partials.iter()
+            .map(|partials| build_wavetable(partials, self.sample_rate, update.update_rate))
+            .collect::<Vec<Vec<f32>>>();
+            
+        // Split into thirds and create transition tables
+        for channel in 0..new_segments.len() {
+            let mut channel_tables = Vec::new();
+            
+            // Create pure segment (middle third)
+            let pure_segment = new_segments[channel][0..new_segment_len].to_vec();
+            
+            // Create transition from current to new (if we have current data)
+            if !self.wavetables[channel].is_empty() {
+                let current = &self.wavetables[channel][self.current_table];
+                channel_tables.push(Self::create_transition_table(
+                    &current[0..new_segment_len],
+                    &new_segments[channel][0..new_segment_len]
+                ));
+            }
+            
+            // Add pure segment
+            channel_tables.push(pure_segment);
+            
+            // Create transition to next update (will be replaced when next update arrives)
+            channel_tables.push(new_segments[channel][0..new_segment_len].to_vec());
+            
+            // Update the wavetables for this channel
+            self.wavetables[channel] = channel_tables;
+        }
+        
+        if rate_changed {
+            self.update_rate = update.update_rate;
         }
     }
 
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
-        // Check for updates
-        self.apply_updates();
-
-        // Check if resize is needed
-        if self.needs_resize {
-            self.resize_wavetables(self.new_size);
-            self.needs_resize = false;
+        // Process any pending updates
+        while let Some(update) = self.update_queue.pop() {
+            self.process_update(update);
         }
 
         let frames = buffer.len() / channels;
+        let segment_len = (self.sample_rate * self.update_rate / 3.0) as usize;
 
         for frame in 0..frames {
-            // Reset counter and swap buffers if needed
-            if self.sample_counter >= self.wavetable_size {
-                self.sample_counter = 0;
-                if self.in_crossfade {
-                    std::mem::swap(&mut self.current_wavetable, &mut self.next_wavetable);
-                    self.in_crossfade = false;
-                }
-            }
-
-            // Calculate crossfade coefficients using smoother curve
-            let (fade_out, fade_in) = if self.in_crossfade && self.sample_counter >= self.crossfade_start {
-                let progress = (self.sample_counter - self.crossfade_start) as f32 / self.crossfade_length as f32;
-                let fade = 0.5 * (1.0 - (progress * std::f32::consts::PI).cos()); // Cosine interpolation
-                (1.0 - fade, fade)
-            } else {
-                (1.0, 0.0)
-            };
-
-            // Process each channel
             for ch in 0..channels {
-                if ch >= self.current_wavetable.len() {
-                    continue;
-                }
-
-                let curr_sample = self.current_wavetable[ch][self.sample_counter] * fade_out;
-                let next_sample = if self.in_crossfade {
-                    self.next_wavetable[ch][self.sample_counter] * fade_in
-                } else {
-                    0.0
-                };
-
-                buffer[frame * channels + ch] = (curr_sample + next_sample) * self.current_gain;
+                if ch >= self.wavetables.len() || self.wavetables[ch].is_empty() { continue; }
+                
+                let table = &self.wavetables[ch][self.current_table];
+                buffer[frame * channels + ch] = table[self.sample_counter] * self.current_gain;
             }
 
             self.sample_counter += 1;
-        }
-    }
-
-    fn resize_wavetables(&mut self, new_size: usize) {
-        let old_size = self.wavetable_size;
-        self.wavetable_size = new_size;
-        self.crossfade_length = new_size / 3;
-        self.crossfade_start = new_size - self.crossfade_length;
-
-        // Resize current wavetables with interpolation
-        for channel in 0..self.current_wavetable.len() {
-            let mut new_table = vec![0.0; new_size];
-            for i in 0..new_size {
-                let old_idx = (i as f32 * old_size as f32 / new_size as f32) as usize;
-                let next_idx = (old_idx + 1).min(old_size - 1);
-                let frac = (i as f32 * old_size as f32 / new_size as f32) - old_idx as f32;
-                
-                new_table[i] = self.current_wavetable[channel][old_idx] * (1.0 - frac) +
-                              self.current_wavetable[channel][next_idx] * frac;
+            if self.sample_counter >= segment_len {
+                self.sample_counter = 0;
+                self.current_table = (self.current_table + 1) % self.wavetables[0].len();
             }
-            self.current_wavetable[channel] = new_table;
-        }
-
-        // Resize next wavetables
-        for channel in 0..self.next_wavetable.len() {
-            self.next_wavetable[channel] = vec![0.0; new_size];
-        }
-
-        // Adjust sample counter
-        self.sample_counter = (self.sample_counter as f32 * new_size as f32 / old_size as f32) as usize;
-    }
-
-    fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32, update_rate: f32) -> Vec<f32> {
-        let wavetable_size = (sample_rate * update_rate) as usize;
-        let mut table = vec![0.0; wavetable_size];
-        let mut max_amplitude: f32 = 0.0;
-        
-        // Generate wavetable
-        for i in 0..wavetable_size {
-            let t = i as f32 / sample_rate;  // Time in seconds
-            for &(freq, amp) in partials {
-                if freq > 0.0 && amp > 0.0 {
-                    // Convert dB to linear amplitude
-                    let amplitude = (amp / 20.0).exp();
-                    table[i] += amplitude * (2.0 * PI * freq * t).sin();
-                    max_amplitude = max_amplitude.max(amplitude);
-                }
-            }
-        }
-
-        // Normalize to prevent clipping
-        if max_amplitude > 1.0 {
-            for sample in &mut table {
-                *sample /= max_amplitude;
-            }
-        }
-
-        table
-    }
-
-    fn apply_updates(&mut self) {
-        while let Some(update) = self.update_queue.pop() {
-            // Update parameters
-            self.current_gain = update.gain;
-            
-            // Check if update rate has changed
-            if update.update_rate != self.update_rate {
-                self.update_rate = update.update_rate;
-                let new_size = (self.sample_rate * self.update_rate) as usize;
-                if new_size != self.wavetable_size {
-                    self.new_size = new_size;
-                    self.needs_resize = true;
-                }
-            }
-
-            // Process partials to build new wavetables
-            let mut new_wavetables = Vec::with_capacity(update.partials.len());
-            for partials in &update.partials {
-                new_wavetables.push(Self::build_wavetable(partials, self.sample_rate, update.update_rate));
-            }
-
-            // Directly update next_wavetable and start crossfade
-            self.next_wavetable = new_wavetables;
-            self.in_crossfade = true;
-            debug!("Successfully updated next wavetable");
         }
     }
 }
@@ -404,12 +337,4 @@ fn setup_audio_stream(
     debug!("Audio stream started successfully");
 
     Ok(stream)
-}
-
-fn format_partials_debug(partials: &[(f32, f32)]) -> String {
-    partials.iter()
-        .filter(|&&(freq, amp)| freq > 0.0 && amp > 0.0)
-        .map(|&(freq, amp)| format!("({:.1} Hz, {:.1} dB)", freq, amp))
-        .collect::<Vec<_>>()
-        .join(", ")
 }

@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use log::debug;
+use log::{debug, warn};
 use crossbeam_queue::ArrayQueue;
 use crate::ResynthConfig;
 use crate::resynth::SynthUpdate;
@@ -19,6 +19,8 @@ pub fn start_update_thread(
     thread::spawn(move || {
         let mut last_update = Instant::now();
         let mut update_count = 0;
+        let mut last_update_rate = 1.0;  // Track last update rate
+        let mut consecutive_failures = 0;  // Track consecutive queue push failures
         
         debug!(target: "get_results", "Update thread started, beginning main loop");
         
@@ -27,6 +29,19 @@ pub fn start_update_thread(
                 let config = config.lock().unwrap();
                 config.update_rate
             };
+
+            // If update rate changed, wait for queue to clear
+            if (update_rate - last_update_rate).abs() > 1e-6 {
+                debug!(target: "get_results", 
+                    "Update rate changed: {:.3}s -> {:.3}s, waiting for queue to clear",
+                    last_update_rate, update_rate
+                );
+                while update_queue.len() > 0 && !shutdown_flag.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                last_update_rate = update_rate;
+                last_update = Instant::now();  // Reset timing after rate change
+            }
 
             if last_update.elapsed().as_secs_f32() >= update_rate {
                 let config_snapshot = config.lock().unwrap().snapshot();
@@ -43,44 +58,7 @@ pub fn start_update_thread(
                 if let Ok(current) = current_partials.lock() {
                     update_count += 1;
                     
-                    // Log a separator for better readability
-                    debug!(target: "get_results", "----------------------------------------");
-                    debug!(target: "get_results", "FFT Data Update #{}", update_count);
-                    
-                    // Log data for each channel
-                    for (channel_idx, channel_data) in current.data.iter().enumerate() {
-                        // Log channel header with total partials count
-                        let active_partials = channel_data.iter()
-                            .filter(|&&(f, a)| f > 0.0 && a > 0.0)
-                            .count();
-                            
-                        debug!(target: "get_results", 
-                            "Channel {} - Active partials: {}/{}", 
-                            channel_idx, 
-                            active_partials,
-                            channel_data.len()
-                        );
-                        
-                        // Log each active partial's data
-                        for (i, &(freq, amp)) in channel_data.iter()
-                            .filter(|&&(f, a)| f > 0.0 && a > 0.0)
-                            .enumerate() 
-                        {
-                            debug!(target: "get_results", 
-                                "  [{:2}] f={:8.1} Hz, amp={:6.1} dB", 
-                                i,
-                                freq, 
-                                amp
-                            );
-                        }
-                        
-                        // Add a blank line between channels
-                        if channel_idx < current.data.len() - 1 {
-                            debug!(target: "get_results", "");
-                        }
-                    }
-                    debug!(target: "get_results", "----------------------------------------");
-
+                    // Create update with current data
                     let update = SynthUpdate {
                         partials: current.data.clone(),
                         gain: config_snapshot.gain,
@@ -89,28 +67,51 @@ pub fn start_update_thread(
                         update_rate: config_snapshot.update_rate,
                     };
 
+                    // Try to push update to queue with backoff on failure
                     match update_queue.push(update) {
-                        Ok(_) => debug!(target: "get_results", 
-                            "Successfully pushed update #{} to synthesis queue", 
-                            update_count
-                        ),
-                        Err(e) => debug!(target: "get_results", 
-                            "Failed to push update #{} to synthesis queue: {:?}", 
-                            update_count, 
-                            e
-                        ),
+                        Ok(_) => {
+                            debug!(target: "get_results", 
+                                "Successfully pushed update #{} to synthesis queue", 
+                                update_count
+                            );
+                            consecutive_failures = 0;  // Reset failure counter on success
+                            last_update = Instant::now();
+                        },
+                        Err(_) => {
+                            consecutive_failures += 1;
+                            warn!(target: "get_results", 
+                                "Failed to push update #{} to synthesis queue (attempt {})", 
+                                update_count,
+                                consecutive_failures
+                            );
+                            
+                            // Exponential backoff on consecutive failures
+                            let backoff = Duration::from_millis(
+                                (50 * consecutive_failures as u64).min(1000)
+                            );
+                            thread::sleep(backoff);
+                            
+                            // If too many failures, force a rate change pause
+                            if consecutive_failures > 5 {
+                                warn!(target: "get_results", "Too many consecutive failures, forcing pause");
+                                thread::sleep(Duration::from_millis(500));
+                                consecutive_failures = 0;
+                            }
+                        }
                     }
-                    last_update = Instant::now();
                 }
             }
 
-            let sleep_duration = if last_update.elapsed().as_secs_f32() >= update_rate {
-                Duration::from_millis(1)
+            // Adaptive sleep based on update rate and queue state
+            let queue_usage = update_queue.len() as f32 / update_queue.capacity() as f32;
+            let base_sleep = if queue_usage > 0.8 {
+                // Sleep longer if queue is nearly full
+                Duration::from_millis(50)
             } else {
                 let time_to_next = (update_rate - last_update.elapsed().as_secs_f32()).max(0.0);
-                Duration::from_secs_f32((time_to_next / 10.0).max(0.010))
+                Duration::from_secs_f32((time_to_next / 10.0).max(0.001))
             };
-            thread::sleep(sleep_duration);
+            thread::sleep(base_sleep);
         }
         debug!(target: "get_results", "Update thread shutting down after {} updates", update_count);
     });

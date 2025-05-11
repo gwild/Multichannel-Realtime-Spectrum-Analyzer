@@ -5,6 +5,7 @@ mod utils;
 mod display;
 mod resynth;
 mod get_results;
+mod make_waves;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
