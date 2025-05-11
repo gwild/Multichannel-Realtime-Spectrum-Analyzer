@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -114,5 +114,85 @@ pub fn start_update_thread(
             thread::sleep(base_sleep);
         }
         debug!(target: "get_results", "Update thread shutting down after {} updates", update_count);
+    });
+}
+
+pub fn start_update_thread_with_sender(
+    config: Arc<Mutex<ResynthConfig>>,
+    shutdown_flag: Arc<AtomicBool>,
+    update_sender: mpsc::Sender<SynthUpdate>,
+    current_partials: Arc<Mutex<CurrentPartials>>,
+) {
+    debug!(target: "get_results", "Starting update thread for FFT data retrieval (mpsc sender)");
+
+    thread::spawn(move || {
+        let mut last_update = Instant::now();
+        let mut update_count = 0;
+        let mut last_update_rate = 1.0;
+        let mut consecutive_failures = 0;
+        debug!(target: "get_results", "Update thread started, beginning main loop (mpsc sender)");
+        while !shutdown_flag.load(Ordering::Relaxed) {
+            let update_rate = {
+                let config = config.lock().unwrap();
+                config.update_rate
+            };
+            if (update_rate - last_update_rate).abs() > 1e-6 {
+                debug!(target: "get_results", 
+                    "Update rate changed: {:.3}s -> {:.3}s, pausing for rate change",
+                    last_update_rate, update_rate
+                );
+                last_update_rate = update_rate;
+                last_update = Instant::now();
+            }
+            if last_update.elapsed().as_secs_f32() >= update_rate {
+                let config_snapshot = config.lock().unwrap().snapshot();
+                debug!(target: "get_results", 
+                    "Update #{} - Config: gain={:.3}, freq_scale={:.3}, smoothing={:.3}, update_rate={:.3}s",
+                    update_count + 1,
+                    config_snapshot.gain,
+                    config_snapshot.freq_scale,
+                    config_snapshot.smoothing,
+                    config_snapshot.update_rate
+                );
+                if let Ok(current) = current_partials.lock() {
+                    update_count += 1;
+                    let update = SynthUpdate {
+                        partials: current.data.clone(),
+                        gain: config_snapshot.gain,
+                        freq_scale: config_snapshot.freq_scale,
+                        smoothing: config_snapshot.smoothing,
+                        update_rate: config_snapshot.update_rate,
+                    };
+                    match update_sender.send(update) {
+                        Ok(_) => {
+                            debug!(target: "get_results", 
+                                "Successfully sent update #{} to wavegen thread (mpsc)", 
+                                update_count
+                            );
+                            consecutive_failures = 0;
+                            last_update = Instant::now();
+                        },
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            warn!(target: "get_results", 
+                                "Failed to send update #{} to wavegen thread (attempt {}): {}", 
+                                update_count,
+                                consecutive_failures,
+                                e
+                            );
+                            let backoff = Duration::from_millis((50 * consecutive_failures as u64).min(1000));
+                            thread::sleep(backoff);
+                            if consecutive_failures > 5 {
+                                warn!(target: "get_results", "Too many consecutive failures, forcing pause");
+                                thread::sleep(Duration::from_millis(500));
+                                consecutive_failures = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        debug!(target: "get_results", "Update thread shutting down after {} updates (mpsc sender)", update_count);
     });
 } 

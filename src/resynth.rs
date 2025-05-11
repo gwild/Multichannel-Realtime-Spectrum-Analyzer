@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::f32::consts::PI;
@@ -11,9 +11,11 @@ use crate::DEFAULT_NUM_PARTIALS;
 use crossbeam_queue::ArrayQueue;
 use anyhow::{Result, Error, anyhow};
 use crate::SharedMemory;
-use crate::get_results::start_update_thread;
+use crate::get_results::{start_update_thread, start_update_thread_with_sender};
 use crate::fft_analysis::CurrentPartials;
 use crate::make_waves::{build_wavetable, format_partials_debug};
+use std::collections::VecDeque;
+use hound;
 
 // Constants for audio performance - with optimized values for JACK
 #[cfg(target_os = "linux")]
@@ -105,112 +107,211 @@ impl PartialState {
 
 /// Lock-free synthesis engine
 #[derive(Clone)]
-struct WavetableSynth {
-    wavetables: Vec<Vec<Vec<f32>>>,  // Vector of wavetables for each channel
-    transition_tables: Vec<Vec<Vec<f32>>>,  // Pre-combined transition wavetables
+struct WaveSegment {
+    samples: Vec<Vec<f32>>,  // Per-channel samples
+    length: usize,           // Length of segment
+}
+
+struct WaveSynth {
+    playback_queue: Arc<Mutex<VecDeque<WaveSegment>>>,  // Shared queue of segments ready for playback
     sample_counter: usize,
-    current_table: usize,
     sample_rate: f32,
     update_rate: f32,
     current_gain: f32,
-    update_queue: Arc<ArrayQueue<SynthUpdate>>,
+    max_queue_size: usize,
 }
 
-impl WavetableSynth {
-    fn new(num_channels: usize, sample_rate: f32, update_queue: Arc<ArrayQueue<SynthUpdate>>) -> Self {
+impl WaveSynth {
+    fn new(sample_rate: f32) -> Self {
         let update_rate = DEFAULT_UPDATE_RATE;
+        let segment_length = (sample_rate * update_rate / 3.0) as usize;
+        let silent_segment = WaveSegment {
+            samples: vec![vec![0.0; segment_length]; 2],
+            length: segment_length,
+        };
+        let mut queue = VecDeque::new();
+        queue.push_back(silent_segment.clone());
+        queue.push_back(silent_segment.clone());
+        queue.push_back(silent_segment);
         Self {
-            wavetables: vec![vec![vec![0.0; (sample_rate * update_rate / 3.0) as usize]; 1]; num_channels],
-            transition_tables: vec![vec![vec![0.0; (sample_rate * update_rate / 3.0) as usize]; 1]; num_channels],
+            playback_queue: Arc::new(Mutex::new(queue)),
             sample_counter: 0,
-            current_table: 0,
             sample_rate,
             update_rate,
-            current_gain: 0.25,
-            update_queue,
+            current_gain: 1.0,
+            max_queue_size: 6,
         }
     }
 
-    fn create_transition_table(old_data: &[f32], new_data: &[f32]) -> Vec<f32> {
-        let len = old_data.len();
-        let mut transition = vec![0.0; len];
-        
-        for i in 0..len {
-            let fade = i as f32 / len as f32;
-            transition[i] = old_data[i] * (1.0 - fade) + new_data[i] * fade;
-        }
-        
-        transition
-    }
-
-    fn process_update(&mut self, update: SynthUpdate) {
-        self.current_gain = update.gain;
-        let rate_changed = (update.update_rate - self.update_rate).abs() > 1e-6;
-        
-        // Calculate segment length (1/3 of total period)
-        let new_segment_len = ((if rate_changed { update.update_rate } else { self.update_rate } 
-            * self.sample_rate) / 3.0) as usize;
-            
-        // Build new wavetable segments
-        let mut new_segments = update.partials.iter()
-            .map(|partials| build_wavetable(partials, self.sample_rate, update.update_rate))
-            .collect::<Vec<Vec<f32>>>();
-            
-        // Split into thirds and create transition tables
-        for channel in 0..new_segments.len() {
-            let mut channel_tables = Vec::new();
-            
-            // Create pure segment (middle third)
-            let pure_segment = new_segments[channel][0..new_segment_len].to_vec();
-            
-            // Create transition from current to new (if we have current data)
-            if !self.wavetables[channel].is_empty() {
-                let current = &self.wavetables[channel][self.current_table];
-                channel_tables.push(Self::create_transition_table(
-                    &current[0..new_segment_len],
-                    &new_segments[channel][0..new_segment_len]
-                ));
+    fn combine_partials_to_stereo(partials: &[Vec<(f32, f32)>]) -> [Vec<(f32, f32)>; 2] {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut left_count = 0;
+        let mut right_count = 0;
+        for (i, ch_partials) in partials.iter().enumerate() {
+            if i % 2 == 0 {
+                left.extend_from_slice(ch_partials);
+                left_count += 1;
+            } else {
+                right.extend_from_slice(ch_partials);
+                right_count += 1;
             }
-            
-            // Add pure segment
-            channel_tables.push(pure_segment);
-            
-            // Create transition to next update (will be replaced when next update arrives)
-            channel_tables.push(new_segments[channel][0..new_segment_len].to_vec());
-            
-            // Update the wavetables for this channel
-            self.wavetables[channel] = channel_tables;
         }
-        
-        if rate_changed {
-            self.update_rate = update.update_rate;
+        // Attenuate amplitudes by number of contributing channels
+        if left_count > 0 {
+            for partial in &mut left {
+                partial.1 /= left_count as f32;
+            }
         }
+        if right_count > 0 {
+            for partial in &mut right {
+                partial.1 /= right_count as f32;
+            }
+        }
+        [left, right]
+    }
+
+    fn prepare_segment(&mut self, partials: &[Vec<(f32, f32)>], is_transition: bool, old_samples: Option<&[Vec<f32>]>) -> WaveSegment {
+        let segment_length = (self.sample_rate * self.update_rate / 3.0) as usize;
+        let mut segment = WaveSegment {
+            samples: vec![vec![0.0; segment_length]; 2], // Always stereo
+            length: segment_length,
+        };
+        let stereo_partials = Self::combine_partials_to_stereo(partials);
+        let gain = self.current_gain * 0.01;
+        for ch in 0..2 {
+            for i in 0..segment_length {
+                let time = i as f32 / self.sample_rate;
+                let mut sample = 0.0;
+                for &(freq, amp) in stereo_partials[ch].iter().filter(|&&(f, a)| f > 0.0 && a > 0.0) {
+                    let phase = 2.0 * std::f32::consts::PI * freq * time;
+                    sample += amp * phase.sin();
+                }
+                sample *= gain;
+                if is_transition {
+                    let fade_in = i as f32 / segment_length as f32;
+                    let fade_out = 1.0 - fade_in;
+                    if let Some(old) = old_samples {
+                        if ch < old.len() && i < old[ch].len() {
+                            let old_sample = old[ch][i];
+                            segment.samples[ch][i] = old_sample * fade_out + sample * fade_in;
+                            continue;
+                        }
+                    }
+                }
+                segment.samples[ch][i] = sample;
+            }
+        }
+        segment
     }
 
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
-        // Process any pending updates
-        while let Some(update) = self.update_queue.pop() {
-            self.process_update(update);
-        }
-
+        let channels = 2;
         let frames = buffer.len() / channels;
-        let segment_len = (self.sample_rate * self.update_rate / 3.0) as usize;
-
+        let mut queue = self.playback_queue.lock().unwrap();
         for frame in 0..frames {
-            for ch in 0..channels {
-                if ch >= self.wavetables.len() || self.wavetables[ch].is_empty() { continue; }
-                
-                let table = &self.wavetables[ch][self.current_table];
-                buffer[frame * channels + ch] = table[self.sample_counter] * self.current_gain;
+            if let Some(current_segment) = queue.front() {
+                if self.sample_counter >= current_segment.length {
+                    self.sample_counter = 0;
+                    if queue.len() > 1 {
+                        queue.pop_front();
+                    }
+                }
+                if let Some(current_segment) = queue.front() {
+                    for ch in 0..channels {
+                        if ch < current_segment.samples.len() {
+                            buffer[frame * channels + ch] = current_segment.samples[ch][self.sample_counter];
+                        }
+                    }
+                }
             }
-
             self.sample_counter += 1;
-            if self.sample_counter >= segment_len {
-                self.sample_counter = 0;
-                self.current_table = (self.current_table + 1) % self.wavetables[0].len();
-            }
         }
     }
+}
+
+// Utility function to dump a WaveSegment to a stereo .wav file
+fn dump_wave_segment_to_wav(segment: &WaveSegment, sample_rate: u32, path: &str) {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("Failed to create wav file");
+    let len = segment.length;
+    for i in 0..len {
+        let l = (segment.samples[0][i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        let r = (segment.samples[1][i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        writer.write_sample(l).unwrap();
+        writer.write_sample(r).unwrap();
+    }
+    writer.finalize().unwrap();
+}
+
+// --- Wave Generation Thread ---
+pub fn start_wavegen_thread(
+    update_rx: mpsc::Receiver<SynthUpdate>,
+    playback_queue: Arc<Mutex<VecDeque<WaveSegment>>>,
+    sample_rate: f32,
+    max_queue_size: usize,
+) {
+    std::thread::spawn(move || {
+        let mut update_rate = DEFAULT_UPDATE_RATE;
+        let mut last_pure_segment: Option<WaveSegment> = None;
+        while let Ok(update) = update_rx.recv() {
+            let current_gain = update.gain;
+            let freq_scale = update.freq_scale;
+            if (update.update_rate - update_rate).abs() > f32::EPSILON {
+                let mut queue = playback_queue.lock().unwrap();
+                queue.clear();
+                update_rate = update.update_rate;
+                // Do NOT reset last_pure_segment here!
+            }
+            let segment_length = (sample_rate * update_rate / 3.0) as usize;
+            let stereo_partials = WaveSynth::combine_partials_to_stereo(&update.partials);
+            // --- Pure segment: new only, gain applied ---
+            let mut pure = WaveSegment {
+                samples: vec![vec![0.0; segment_length]; 2],
+                length: segment_length,
+            };
+            for ch in 0..2 {
+                for i in 0..segment_length {
+                    let time = i as f32 / sample_rate;
+                    let mut sample = 0.0;
+                    for &(freq, amp) in stereo_partials[ch].iter().filter(|&&(f, a)| f > 0.0 && a > 0.0) {
+                        let phase = 2.0 * std::f32::consts::PI * (freq * freq_scale) * time;
+                        sample += amp * phase.sin();
+                    }
+                    pure.samples[ch][i] = sample * current_gain * 0.01;
+                }
+            }
+            // --- Dump pure segment to wav for inspection ---
+            dump_wave_segment_to_wav(&pure, sample_rate as u32, "pure_segment_dump.wav");
+            // --- Transition segment: crossfade from last pure to new pure ---
+            let mut transition = WaveSegment {
+                samples: vec![vec![0.0; segment_length]; 2],
+                length: segment_length,
+            };
+            for ch in 0..2 {
+                for i in 0..segment_length {
+                    let fade_in = i as f32 / segment_length as f32;
+                    let fade_out = 1.0 - fade_in;
+                    let old_sample = last_pure_segment.as_ref().and_then(|old| old.samples.get(ch).and_then(|v| v.get(i).copied())).unwrap_or(0.0);
+                    let new_sample = pure.samples[ch][i];
+                    transition.samples[ch][i] = old_sample * fade_out + new_sample * fade_in;
+                }
+            }
+            // Push transition and pure to queue
+            let mut queue = playback_queue.lock().unwrap();
+            if queue.len() < max_queue_size {
+                queue.push_back(transition.clone());
+                queue.push_back(pure.clone());
+            }
+            // Update last_pure_segment for next transition
+            last_pure_segment = Some(pure);
+        }
+    });
 }
 
 /// Starts a thread that performs real-time resynthesis of the analyzed spectrum.
@@ -220,52 +321,42 @@ pub fn start_resynth_thread(
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
     current_partials: Arc<Mutex<CurrentPartials>>,
-    num_channels: usize,
-    num_partials: usize,
+    _num_channels: usize,
+    _num_partials: usize,
 ) {
     debug!("Module path for resynth: {}", module_path!());
-    debug!("Using fixed num_channels: {}, num_partials: {}", num_channels, num_partials);
-
-    // Create synthesis engine and shared queue between threads
-    let update_queue = Arc::new(ArrayQueue::new(UPDATE_RING_SIZE * 2));
-
-    // Start update thread to feed the synth with new analysis data
-    start_update_thread(
+    let (update_tx, update_rx) = mpsc::channel::<SynthUpdate>();
+    let synth = WaveSynth::new(sample_rate as f32);
+    let playback_queue = synth.playback_queue.clone();
+    let max_queue_size = synth.max_queue_size;
+    // Start wavegen thread
+    start_wavegen_thread(update_rx, playback_queue, sample_rate as f32, max_queue_size);
+    // Start update thread to feed the wavegen with new analysis data
+    start_update_thread_with_sender(
         Arc::clone(&config),
         Arc::clone(&shutdown_flag),
-        Arc::clone(&update_queue),
+        update_tx,
         Arc::clone(&current_partials),
     );
-
     // Main thread that handles audio stream lifecycle
     std::thread::spawn(move || {
         let mut current_stream: Option<pa::Stream<pa::NonBlocking, pa::Output<f32>>> = None;
         let mut last_restart_time = Instant::now();
         let mut consecutive_errors = 0;
-        
-        // Store the restart flag for checking
         let needs_restart = Arc::clone(&config.lock().unwrap().needs_restart);
-        
-        // Main loop continues until shutdown
         while !shutdown_flag.load(Ordering::Relaxed) {
-            // Check if we need to restart
             let needs_restart_now = needs_restart.load(Ordering::Relaxed) || current_stream.is_none();
-            
-            // Debounce restarts with exponential backoff
             let backoff_time = if consecutive_errors > 0 {
                 Duration::from_millis((500 * consecutive_errors as u64).min(5000))
             } else {
                 Duration::from_millis(500)
             };
-            
             if needs_restart_now && last_restart_time.elapsed() >= backoff_time {
                 debug!("Setting up new audio stream");
                 match setup_audio_stream(
                     device_index,
                     sample_rate,
-                    Arc::clone(&update_queue),
-                    num_channels,
-                    num_partials
+                    synth.playback_queue.clone(),
                 ) {
                     Ok(stream) => {
                         debug!("Successfully created new audio stream");
@@ -280,61 +371,46 @@ pub fn start_resynth_thread(
                 }
                 last_restart_time = Instant::now();
             }
-
             thread::sleep(Duration::from_millis(100));
         }
-        
-        // Shutdown - stop stream if it exists
         if let Some(mut stream) = current_stream {
             let _ = stream.stop();
         }
-        
         info!("Resynthesis thread shutting down");
     });
 }
 
-/// Sets up a PortAudio output stream with the given parameters
 fn setup_audio_stream(
     device_index: pa::DeviceIndex,
-    sample_rate: f64, 
-    update_queue: Arc<ArrayQueue<SynthUpdate>>,
-    num_channels: usize,
-    num_partials: usize
+    sample_rate: f64,
+    playback_queue: Arc<Mutex<VecDeque<WaveSegment>>>,
 ) -> Result<pa::Stream<pa::NonBlocking, pa::Output<f32>>, anyhow::Error> {
-    // Initialize PortAudio
     let pa = pa::PortAudio::new()?;
-    
-    // Get device info
     let device_info = pa.device_info(device_index)?;
-    
-    // Create output parameters
     let output_params = pa::StreamParameters::<f32>::new(
         device_index,
-        num_channels as i32,
+        2,
         true,
         device_info.default_low_output_latency
     );
-
     let settings = pa::OutputStreamSettings::new(output_params, sample_rate, OUTPUT_BUFFER_SIZE as u32);
-    
-    // Create wavetable synth
-    let synth = WavetableSynth::new(num_channels, sample_rate as f32, update_queue);
+    let synth = WaveSynth {
+        playback_queue: playback_queue.clone(),
+        sample_counter: 0,
+        sample_rate: sample_rate as f32,
+        update_rate: DEFAULT_UPDATE_RATE,
+        current_gain: 1.0,
+        max_queue_size: 6,
+    };
     let synth = Arc::new(Mutex::new(synth));
-    
-    // Create stream with callback
     let callback = move |pa::OutputStreamCallbackArgs { buffer, .. }| {
         if let Ok(mut synth) = synth.lock() {
-            synth.process_buffer(buffer, num_channels);
+            synth.process_buffer(buffer, 2);
         }
         pa::Continue
     };
-
-    // Open stream
     let mut stream = pa.open_non_blocking_stream(settings, callback)?;
-
-    // Start the stream
     stream.start()?;
     debug!("Audio stream started successfully");
-
     Ok(stream)
 }
