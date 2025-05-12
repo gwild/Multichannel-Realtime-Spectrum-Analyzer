@@ -278,13 +278,14 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // --- Buffer Size Debounce Check --- 
         let debounce_duration = Duration::from_millis(300);
-        let mut apply_debounced_size = false;
+        let mut size_to_apply_after_debounce: Option<usize> = None; // Variable to hold the size if debounce passes
+
         if let Some(timer) = self.buffer_debounce_timer {
             if timer.elapsed() >= debounce_duration {
-                if let Some(desired_size) = self.desired_buffer_size {
+                if let Some(desired_val) = self.desired_buffer_size { // Check if there's a desired size
                     let current_size = *self.buffer_size.lock().unwrap();
-                    if desired_size != current_size {
-                        apply_debounced_size = true;
+                    if desired_val != current_size {
+                        size_to_apply_after_debounce = Some(desired_val); // Capture the value
                     }
                 }
                 // Clear timer and desired size regardless of whether we applied
@@ -293,11 +294,9 @@ impl eframe::App for MyApp {
             }
         }
 
-        // Apply the change outside the check to avoid borrowing issues
-        if apply_debounced_size {
-            if let Some(desired_size) = self.desired_buffer_size {
-                 self.update_buffer_size(desired_size); // Call the actual update function
-            }
+        // Apply the change using the captured value
+        if let Some(new_size) = size_to_apply_after_debounce {
+            self.update_buffer_size(new_size); // Call the actual update function
         }
         // --- End Debounce Check ---
 
@@ -382,8 +381,10 @@ impl eframe::App for MyApp {
             ui.horizontal(|ui| {
                 // Buffer size slider
                 {
-                    let buffer_size = *self.buffer_size.lock().unwrap();
-                    let mut buffer_log_slider = (buffer_size as f32).log2().round() as u32;
+                    let current_actual_buffer_size = *self.buffer_size.lock().unwrap();
+                    let display_size = self.desired_buffer_size.unwrap_or(current_actual_buffer_size);
+                    let mut buffer_log_slider = (display_size as f32).log2().round() as u32;
+
                     ui.label("Buffer Size:");
                     let min_power = (MIN_BUFFER_SIZE as f32).log2() as u32;
                     let max_power = (MAX_BUFFER_SIZE as f32).log2() as u32;
