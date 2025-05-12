@@ -10,7 +10,7 @@ use portaudio as pa;
 use log::{info, error, warn, debug};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE};
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -30,8 +30,8 @@ pub struct CircularBuffer {
     head: usize,
     size: usize,
     channels: usize,
-    needs_restart: Arc<AtomicBool>,
-    force_reinit: Arc<AtomicBool>,
+    pub needs_restart: Arc<AtomicBool>,
+    pub force_reinit: Arc<AtomicBool>,
     last_active: Arc<Mutex<Instant>>,  // Track last activity
 }
 
@@ -495,13 +495,40 @@ pub fn start_sampling_thread(
 
                                     // Stop the current stream
                                     if let Err(e) = stream.stop() {
-                                        error!("Failed to stop stream: {}", e);
+                                        error!("Failed to stop stream before resize: {}", e);
+                                        // Optionally break outer loop if stop fails critically
+                                        // break;
                                     }
+                                    // Drop read lock before taking write lock
+                                    drop(buffer);
 
-                                    // Clear flags
-                                    buffer.clear_restart_flag();
-                                    buffer.clear_reinit_flag();
+                                    // Get the new target size
+                                    let new_target_size = match _buffer_size.lock() { // Use the Arc<Mutex<usize>> passed to the thread
+                                        Ok(size_lock) => *size_lock,
+                                        Err(e) => {
+                                            error!("Failed to lock buffer_size Arc: {}. Using default.", e);
+                                            DEFAULT_BUFFER_SIZE
+                                        }
+                                    };
 
+                                    // Acquire write lock and perform resize *in this thread*
+                                    match main_buffer.write() {
+                                        Ok(mut buffer_write_lock) => {
+                                            buffer_write_lock.resize(new_target_size);
+                                            // Clear flags *after* successful resize
+                                            buffer_write_lock.clear_restart_flag();
+                                            buffer_write_lock.clear_reinit_flag();
+                                            info!("Audio buffer resized to {} in background thread.", new_target_size);
+                                        },
+                                        Err(e) => {
+                                            error!("Failed to acquire write lock for buffer resize: {}. Restart may fail.", e);
+                                            // Attempt to clear flags anyway using read lock, might not be ideal
+                                            if let Ok(buffer_read_lock) = main_buffer.read() {
+                                                buffer_read_lock.clear_restart_flag();
+                                                buffer_read_lock.clear_reinit_flag();
+                                            }
+                                        }
+                                    }
                                     // Break to outer loop to reinitialize the stream
                                     break;
                                 }

@@ -21,6 +21,7 @@ use std::time::Instant;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use crossbeam_queue::ArrayQueue;
+use rustfft::num_complex::Complex;
 
 // Change the constant declaration to be public
 pub const MAX_SPECTROGRAPH_HISTORY: usize = 500;
@@ -103,40 +104,46 @@ fn compute_all_fft_data(
     config: &FFTConfig,
 ) -> (Vec<(f32, f32)>, Vec<(f32, f32)>) {
     let signal = &all_channel_data[channel_index];
-    
+    let signal_len = signal.len(); // Store original signal length
+
     // Apply window to signal
     let windowed_signal = apply_window(&signal, config.window_type);
 
-    // Perform FFT
+    // Perform FFT (once)
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(windowed_signal.len());
     let mut indata = windowed_signal;
-    let mut spectrum = fft.make_output_vec();
+    let mut complex_spectrum_output = fft.make_output_vec(); // Store the complex output
     
-    if let Err(e) = fft.process(&mut indata, &mut spectrum) {
+    if let Err(e) = fft.process(&mut indata, &mut complex_spectrum_output) {
         error!("FFT computation error: {:?}", e);
         return (vec![(0.0, 0.0); config.num_partials], Vec::new());
     }
 
-    // Convert to dB scale
-    let freq_step = sample_rate as f32 / signal.len() as f32;
-    let line_data: Vec<(f32, f32)> = spectrum
+    // Convert to dB scale for line_data
+    let freq_step = sample_rate as f32 / signal_len as f32; // Use original signal_len
+    let line_data: Vec<(f32, f32)> = complex_spectrum_output
         .par_iter()
         .enumerate()
         .map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
             let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
             let db = if magnitude > 1e-10 {
-                20.0 * (magnitude + 1e-10).log10()
+                20.0 * (magnitude + 1e-10).log10() // Add epsilon for stability
             } else {
-                0.0
+                0.0 // Or a very small dB value like -120.0
             };
-            (frequency, db.max(0.0))
+            (frequency, db.max(0.0)) // Ensure non-negative dB for line plot
         })
         .collect();
 
-    // Compute partials using existing logic
-    let partials = compute_spectrum(all_channel_data, channel_index, sample_rate, config, None);
+    // Compute partials using the new function and the *same* complex_spectrum_output
+    let partials = extract_partials_from_spectrum(
+        &complex_spectrum_output, 
+        sample_rate, 
+        signal_len, // Pass original signal length
+        config
+    );
 
     (partials, line_data)
 }
@@ -852,4 +859,75 @@ fn find_closest_frequency(spectrum: &[(f32, f32)], target: f32, max_distance: f3
     }
     
     closest_idx
+}
+
+/// Extracts partials (frequency, magnitude peaks) from a pre-computed complex FFT spectrum.
+fn extract_partials_from_spectrum(
+    spectrum: &[Complex<f32>],
+    sample_rate: u32,
+    signal_len: usize, // Need original signal length for freq_step
+    config: &FFTConfig,
+) -> Vec<(f32, f32)> {
+    // 1. Calculate frequency step
+    let freq_step = sample_rate as f32 / signal_len as f32;
+
+    // 2. Collect all valid magnitudes above threshold from the complex spectrum
+    let mut all_magnitudes: Vec<(f32, f32)> = spectrum
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, &complex_val)| {
+            let frequency = i as f32 * freq_step;
+            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+
+            // Only compute dB if magnitude is significant
+            if magnitude > 1e-10 { // Use a small epsilon to avoid log(0)
+                let db = 20.0 * magnitude.log10();
+                // Only include if above threshold and in frequency range
+                if db > config.magnitude_threshold as f32 &&
+                   frequency >= config.min_frequency as f32 &&
+                   frequency <= config.max_frequency as f32 {
+                    Some((frequency, db))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // 3. If no peaks above threshold, return array of zeros
+    if all_magnitudes.is_empty() {
+        return vec![(0.0, 0.0); config.num_partials];
+    }
+
+    // 4. Sort by frequency (ascending)
+    all_magnitudes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 5. Apply minimum frequency spacing while maintaining frequency order
+    let mut filtered_magnitudes: Vec<(f32, f32)> = Vec::with_capacity(config.num_partials);
+    for &mag in all_magnitudes.iter() {
+        if filtered_magnitudes.is_empty() {
+            filtered_magnitudes.push(mag);
+        } else {
+            let last_freq = filtered_magnitudes.last().unwrap().0;
+            if (mag.0 - last_freq).abs() >= config.min_freq_spacing as f32 {
+                filtered_magnitudes.push(mag);
+            }
+        }
+        // Stop early if we have enough partials
+        if filtered_magnitudes.len() >= config.num_partials {
+            break;
+        }
+    }
+
+    // 6. Create final result vector with proper padding
+    let mut result = Vec::with_capacity(config.num_partials);
+    result.extend(filtered_magnitudes);
+    // Pad with zeros if fewer than num_partials were found
+    while result.len() < config.num_partials {
+        result.push((0.0, 0.0));
+    }
+
+    result
 }

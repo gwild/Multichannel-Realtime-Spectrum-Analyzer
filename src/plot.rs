@@ -5,7 +5,7 @@ use egui::plot::{Plot, BarChart, Legend};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
-use log::{info, debug, log_enabled, Level};
+use log::{info, debug, log_enabled, Level, error};
 use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
@@ -155,17 +155,19 @@ impl MyApp {
         };
 
         // FIX IMPLEMENTATION:
-        // After we construct `instance`, we clamp `max_frequency` so the x scale
-        // is correct on startup, if current max_frequency exceeds nyquist_limit.
+        // First, ensure the initial max_frequency from default() respects the
+        // current runtime Nyquist limit (sets the slider's *range* correctly).
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
-            let nyquist_limit = (*buffer_s as f64 / 2.0).min(MAX_FREQ);
-
+            let nyquist_limit = (*buffer_s as f64 / 2.0).min(MAX_FREQ); // Use runtime buffer size
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
                 cfg.max_frequency = nyquist_limit;
-                debug!("Clamped max frequency at startup to {}", cfg.max_frequency);
+                debug!("Clamped initial max frequency range to {:.1} Hz", cfg.max_frequency);
             }
+            // Now, explicitly set the initial *value* of the slider
+            cfg.max_frequency = 1400.0;
+            debug!("Set initial max frequency value to 1400.0 Hz");
         }
 
         // Return the newly created instance with the fix
@@ -177,60 +179,40 @@ impl MyApp {
             .next_power_of_two()
             .max(512)
             .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
-        
+
         // Only log size adjustments at info level
         if validated_size != new_size {
             info!("Buffer size adjusted: {} → {}", new_size, validated_size);
         }
-        
+
         // Log detailed calculations at debug level
-        debug!("Buffer validation: min={}, max={}, power_of_2={}", 
+        debug!("Buffer validation: min={}, max={}, power_of_2={}",
                MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, validated_size);
-        
-        // Update frame size if necessary
-        if let Ok(mut fft_config) = self.fft_config.lock() {
-            if fft_config.frames_per_buffer as usize > validated_size {
-                let new_frames = FRAME_SIZES.iter()
-                    .rev()
-                    .find(|&&x| x as usize <= validated_size)
-                    .copied()
-                    .unwrap_or(FRAME_SIZES[0]);
-                fft_config.frames_per_buffer = new_frames;
-                info!("Adjusted frames per buffer to {} due to buffer size change", new_frames);
-            }
-        }
-        
+
+        // Update the target buffer size value
         if let Ok(mut size) = self.buffer_size.lock() {
             *size = validated_size;
-        }
-        
-        if let Ok(mut buffer) = self.audio_buffer.write() {
-            buffer.resize(validated_size);
-        }
-
-        // Signal resynth thread to restart due to buffer size change
-        if let Ok(resynth_config) = self.resynth_config.lock() {
-            resynth_config.needs_restart.store(true, Ordering::SeqCst);
-            info!("Signaled resynthesis thread to restart due to buffer size change");
+        } else {
+            error!("Failed to lock buffer_size for update.");
+            return; // Don't proceed if we can't update the size
         }
 
-        // Clear spectrograph history and reset start time when buffer size changes
-        if let Ok(mut history) = self.spectrograph_history.lock() {
-            let slices_per_second = self.sample_rate / validated_size as f64;
-            let history_len = (5.0 * slices_per_second).ceil() as usize;
-            // Trim or extend, but do not clear
-            while history.len() > history_len {
-                history.pop_front();
+        // Signal the audio thread to handle the resize by setting the flag
+        if let Ok(buffer) = self.audio_buffer.read() {
+             // Use read lock just to access the flag Arc
+            buffer.needs_restart.store(true, Ordering::SeqCst);
+            #[cfg(target_os = "linux")]
+            {
+                debug!("Linux detected, forcing complete stream reinitialization via flag");
+                buffer.force_reinit.store(true, Ordering::SeqCst);
             }
-            // No need to extend; VecDeque will grow as needed
+            info!("Signaled audio thread to restart due to buffer size change request to {}", validated_size);
+        } else {
+             error!("Failed to lock audio_buffer to signal restart.");
         }
-        *Arc::make_mut(&mut self.start_time) = Instant::now();
 
-        // Explicitly reset plot bounds by requesting a repaint
+        // Explicitly request repaint to update UI state if needed
         self.last_repaint = Instant::now();
-
-        // Explicitly log the clearing action for debugging with structured context
-        info!("Spectrograph history trimmed and start time reset due to buffer size change (new size: {})", validated_size);
     }
 
     // Helper method to get the current nyquist limit
@@ -528,49 +510,71 @@ impl eframe::App for MyApp {
                 }
             }
 
+            // Calculate nyquist limit based on current buffer size for general use
+            let current_buffer_size = *self.buffer_size.lock().unwrap();
+            let mut nyquist_limit = (self.sample_rate / 2.0).min(current_buffer_size as f64 / 2.0);
+
             // 8) Reset button
+            let mut needs_buffer_reset = false; // Variable to track if buffer reset is needed
             if ui.button("Reset to Defaults").clicked() {
-                {
+                { // Scope for fft_config lock
                     let mut fft_config = self.fft_config.lock().unwrap();
-                    let old_frames = fft_config.frames_per_buffer;
-                    
-                    // Reset FFT config
-                    fft_config.min_frequency = MIN_FREQ;
-                    fft_config.max_frequency = 8192.0;
-                    fft_config.magnitude_threshold = 6.0;
-                    fft_config.min_freq_spacing = 20.0;
-                    fft_config.window_type = WindowType::Hanning;
-                    
-                    // Reset crosstalk settings
-                    fft_config.crosstalk_enabled = false;
-                    fft_config.crosstalk_threshold = 0.5;
-                    fft_config.crosstalk_reduction = 0.5;
-                    fft_config.harmonic_tolerance = 0.03;
-                    fft_config.root_freq_min = 20.0;
-                    fft_config.root_freq_max = DEFAULT_BUFFER_SIZE as f32 / 4.0;
-                    fft_config.freq_match_distance = 5.0;
-                    
-                    // Only change frames_per_buffer if platform requires it
-                    let new_frames = if cfg!(target_os = "linux") {
-                        1024  // Larger buffer for Linux stability
+                    let current_num_channels = fft_config.num_channels; // Preserve
+
+                    // Start with a fresh default from the struct
+                    *fft_config = FFTConfig::default();
+
+                    // Re-apply essential overrides that main.rs would do for a default startup:
+                    fft_config.num_channels = current_num_channels; // Restore preserved num_channels
+                    fft_config.num_partials = DEFAULT_NUM_PARTIALS; // Reset to the application default
+
+                    // Replicate frames_per_buffer logic from main.rs using self.sample_rate
+                    fft_config.frames_per_buffer = if cfg!(target_os = "linux") {
+                        2048u32
                     } else {
-                        512   // Default for other platforms
+                        match self.sample_rate as u32 {
+                            48000 => 1024u32,
+                            44100 => 1024u32,
+                            96000 => 2048u32,
+                            192000 => 4096u32,
+                            _ => { // Fallback logic from main.rs
+                                let mut base_size = 1024u32;
+                                // Ensure sample_rate is positive to avoid issues with / 50.0 if it were 0
+                                if self.sample_rate > 0.0 {
+                                    while base_size * 2 <= (self.sample_rate / 50.0) as u32 {
+                                        base_size *= 2;
+                                    }
+                                }
+                                base_size
+                            }
+                        }
                     };
-                    
-                    if old_frames != new_frames {
-                        fft_config.frames_per_buffer = new_frames;
+
+                    // Re-apply the max_frequency clamping that MyApp::new() would do.
+                    // Use the *current runtime* buffer size for clamping, not the default buffer size.
+                    let current_buffer_size = *self.buffer_size.lock().unwrap(); // Get current buffer size
+                    let nyquist_limit_for_current_state = (self.sample_rate / 2.0).min(current_buffer_size as f64 / 2.0);
+                    if fft_config.max_frequency > nyquist_limit_for_current_state {
+                        fft_config.max_frequency = nyquist_limit_for_current_state;
                     }
-                }
-                
+                    // Set the reset *value* explicitly to 1400.0 Hz
+                    fft_config.max_frequency = 1400.0;
+                    // Note: The slider's *range* will still be determined by the current Nyquist limit
+                    // calculated based on the potentially reset buffer size, handled by the slider logic itself.
+                    
+                    // All other FFTConfig fields (like root_freq_max, window_type, magnitude_threshold, etc.)
+                    // are now correctly set to their initial defaults by FFTConfig::default().
+                } // fft_config lock released here
+
                 // Reset resynth config
-                {
+                { // Scope for resynth_config lock
                     let mut resynth_config = self.resynth_config.lock().unwrap();
-                    resynth_config.gain = 0.25;
+                    resynth_config.gain = 0.8; // Correct default gain
                     resynth_config.smoothing = 0.0;
                     resynth_config.freq_scale = 1.0;
-                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;  // Now uses 1.0 seconds
-                }
-                
+                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;
+                } // resynth_config lock released here
+
                 // Reset display settings
                 self.y_scale = 80.0;
                 self.alpha = 255;
@@ -578,10 +582,20 @@ impl eframe::App for MyApp {
                 self.show_line_plot = false;
                 self.show_spectrograph = false;
                 
-                // Reset buffer size
-                if *self.buffer_size.lock().unwrap() != DEFAULT_BUFFER_SIZE {
-                    self.update_buffer_size(DEFAULT_BUFFER_SIZE);
+                // Check if buffer size needs reset *after* other locks are released
+                if current_buffer_size != DEFAULT_BUFFER_SIZE { // Compare with current size
+                    needs_buffer_reset = true; // Set flag instead of calling directly
+                    // --- IMPORTANT --- 
+                    // If buffer will be reset, recalculate the nyquist limit for *this frame's* slider range
+                    // based on the target default buffer size.
+                    nyquist_limit = (self.sample_rate / 2.0).min(DEFAULT_BUFFER_SIZE as f64 / 2.0);
+                    debug!("Reset triggered buffer change, overriding slider range limit for this frame to {}", nyquist_limit);
                 }
+            }
+
+            // Perform buffer reset outside the main button logic if needed
+            if needs_buffer_reset {
+                self.update_buffer_size(DEFAULT_BUFFER_SIZE);
             }
 
             // 8) Plot logic
@@ -699,6 +713,16 @@ impl eframe::App for MyApp {
                     // 5. Apply the modified style back to the context
                     plot_ui.ctx().set_style(style);
                     
+                    // Explicitly set plot bounds to ensure consistent x-axis
+                    let current_max_freq = self.fft_config.lock().unwrap().max_frequency;
+                    let bounds = egui::plot::PlotBounds::from_min_max(
+                        [0.0, 0.0], // Min X, Min Y
+                        [current_max_freq as f64, self.y_scale as f64] // Max X, Max Y
+                    );
+                    // Add Debug log here
+                    debug!(target: "audio_streaming::plot", "Plot Update: current_max_freq = {}, bounds = {:?}", current_max_freq, bounds);
+                    plot_ui.set_plot_bounds(bounds);
+
                     // Plot the data using the new style
                     for bar_chart in all_bar_charts {
                         plot_ui.bar_chart(bar_chart);
