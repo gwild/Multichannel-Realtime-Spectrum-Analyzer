@@ -71,6 +71,28 @@ pub fn build_wavetable(partials: &[(f32, f32)], sample_rate: f32, update_rate: f
         }
     }
 
+    // --- Ensure last cycle ends at zero (zero crossing) ---
+    // Find fundamental frequency (lowest nonzero freq)
+    let fundamental = partials.iter()
+        .filter(|&&(f, a)| f > 0.0 && a > 0.0)
+        .map(|&(f, _)| f)
+        .fold(f32::INFINITY, |min, f| if f < min { f } else { min });
+    if fundamental < f32::INFINITY && fundamental > 0.0 {
+        let period = (sample_rate / fundamental).round() as usize;
+        if period < wavetable.len() {
+            let start = wavetable.len() - period;
+            let end = wavetable.len();
+            let last_val = wavetable[end - 1];
+            for i in start..end {
+                let t = (i - start) as f32 / (period - 1) as f32;
+                wavetable[i] = wavetable[i] * (1.0 - t) + 0.0 * t; // Linear ramp to zero
+            }
+            // Ensure last sample is exactly zero
+            wavetable[end - 1] = 0.0;
+        }
+    }
+    // --- End zero crossing logic ---
+
     // Apply fade envelope
     wavetable = apply_fade_envelope(&wavetable, fade_samples);
 

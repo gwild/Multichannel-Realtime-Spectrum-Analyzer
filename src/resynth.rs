@@ -209,15 +209,36 @@ impl WaveSynth {
         let channels = 2;
         let frames = buffer.len() / channels;
         let mut queue = self.playback_queue.lock().unwrap();
+        let crossfade_len = (self.sample_rate * 0.5) as usize; // 0.5s crossfade
+        let mut prev_segment: Option<WaveSegment> = None;
         for frame in 0..frames {
             if let Some(current_segment) = queue.front() {
                 if self.sample_counter >= current_segment.length {
                     self.sample_counter = 0;
                     if queue.len() > 1 {
-                        queue.pop_front();
+                        // Save outgoing segment for crossfade
+                        prev_segment = queue.pop_front();
                     }
                 }
                 if let Some(current_segment) = queue.front() {
+                    // Crossfade logic
+                    if let Some(ref prev) = prev_segment {
+                        let actual_crossfade = crossfade_len.min(prev.length).min(current_segment.length);
+                        if self.sample_counter < actual_crossfade {
+                            for ch in 0..channels {
+                                if ch < current_segment.samples.len() && ch < prev.samples.len() {
+                                    let t = self.sample_counter as f32 / (actual_crossfade - 1) as f32;
+                                    let fade_in = t;
+                                    let fade_out = 1.0 - t;
+                                    let prev_val = prev.samples[ch][prev.length - actual_crossfade + self.sample_counter];
+                                    let curr_val = current_segment.samples[ch][self.sample_counter];
+                                    buffer[frame * channels + ch] = prev_val * fade_out + curr_val * fade_in;
+                                }
+                            }
+                            self.sample_counter += 1;
+                            continue;
+                        }
+                    }
                     for ch in 0..channels {
                         if ch < current_segment.samples.len() {
                             buffer[frame * channels + ch] = current_segment.samples[ch][self.sample_counter];
@@ -247,6 +268,76 @@ fn dump_wave_segment_to_wav(segment: &WaveSegment, sample_rate: u32, path: &str)
         writer.write_sample(r).unwrap();
     }
     writer.finalize().unwrap();
+}
+
+// Helper: Ramp last period to zero, ending at zero and ideally rising from negative
+fn ramp_last_period_to_zero(samples: &mut [Vec<f32>], sample_rate: f32, partials: &[Vec<(f32, f32)>]) {
+    // Find fundamental frequency (lowest nonzero freq)
+    let fundamental = partials.iter()
+        .flat_map(|ch| ch.iter())
+        .filter(|&&(f, a)| f > 0.0 && a > 0.0)
+        .map(|&(f, _)| f)
+        .fold(f32::INFINITY, |min, f| if f < min { f } else { min });
+    if fundamental < f32::INFINITY && fundamental > 0.0 {
+        let period = (sample_rate / fundamental).round() as usize;
+        for ch in samples.iter_mut() {
+            if period < ch.len() {
+                let start = ch.len() - period;
+                let end = ch.len();
+                for i in start..end {
+                    let t = (i - start) as f32 / (period - 1) as f32;
+                    ch[i] = ch[i] * (1.0 - t);
+                }
+                // Ensure last sample is exactly zero
+                ch[end - 1] = 0.0;
+                // Optionally, nudge penultimate sample negative if not already
+                if ch[end - 2] > 0.0 {
+                    ch[end - 2] = -ch[end - 2].abs();
+                }
+            }
+        }
+    }
+}
+
+// Helper: Find negative peak in last window and cosine ramp to zero (short window, e.g., 1/32 of segment)
+fn fade_from_negative_peak_to_zero(samples: &mut [Vec<f32>], sample_rate: f32) {
+    let window_frac = 32; // Use last 1/32 of the segment
+    for ch in samples.iter_mut() {
+        let len = ch.len();
+        if len < window_frac { continue; }
+        let window = len / window_frac;
+        let search_start = len - window;
+        // Find index of minimum (most negative) value in last window
+        let (min_idx, _) = ch[search_start..]
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let fade_start = search_start + min_idx;
+        let fade_len = len - fade_start;
+        if fade_len < 2 { continue; }
+        for i in 0..fade_len {
+            let t = i as f32 / (fade_len - 1) as f32;
+            let ramp = 0.5 * (1.0 + (std::f32::consts::PI * t).cos()); // Cosine ramp from 1 to 0
+            ch[fade_start + i] *= ramp;
+        }
+        ch[len - 1] = 0.0; // Ensure last sample is exactly zero
+    }
+}
+
+// Helper: Cosine fade-in from zero at the start of each channel
+fn fade_in_from_zero(samples: &mut [Vec<f32>], sample_rate: f32) {
+    let window_frac = 32; // Use first 1/32 of the segment
+    for ch in samples.iter_mut() {
+        let len = ch.len();
+        if len < window_frac { continue; }
+        let window = len / window_frac;
+        for i in 0..window {
+            let t = i as f32 / (window - 1) as f32;
+            let ramp = 0.5 * (1.0 - (std::f32::consts::PI * t).cos()); // Cosine ramp from 0 to 1
+            ch[i] *= ramp;
+        }
+    }
 }
 
 // --- Wave Generation Thread ---
@@ -286,6 +377,10 @@ pub fn start_wavegen_thread(
                     pure.samples[ch][i] = sample * current_gain * 0.01;
                 }
             }
+            // --- Fade in from zero at start ---
+            fade_in_from_zero(&mut pure.samples, sample_rate);
+            // --- Fade from negative peak to zero at end ---
+            fade_from_negative_peak_to_zero(&mut pure.samples, sample_rate);
             // --- Dump pure segment to wav for inspection ---
             dump_wave_segment_to_wav(&pure, sample_rate as u32, "pure_segment_dump.wav");
             // --- Transition segment: crossfade from last pure to new pure ---
@@ -302,6 +397,12 @@ pub fn start_wavegen_thread(
                     transition.samples[ch][i] = old_sample * fade_out + new_sample * fade_in;
                 }
             }
+            // --- Fade in from zero at start ---
+            fade_in_from_zero(&mut transition.samples, sample_rate);
+            // --- Fade from negative peak to zero at end ---
+            fade_from_negative_peak_to_zero(&mut transition.samples, sample_rate);
+            // --- Dump transition segment to wav for inspection ---
+            dump_wave_segment_to_wav(&transition, sample_rate as u32, "transition_segment_dump.wav");
             // Push transition and pure to queue
             let mut queue = playback_queue.lock().unwrap();
             if queue.len() < max_queue_size {
