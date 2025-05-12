@@ -741,8 +741,8 @@ pub fn filter_crosstalk_frequency_domain(
     }
 
     let mut filtered_spectra = spectra.clone();
-    let scaled_reduction = (reduction * 2.0).min(1.0);
-    
+    let scaled_reduction = reduction;
+
     let mut count_filtered = 0;
     
     // For each frequency in each channel
@@ -779,11 +779,11 @@ pub fn filter_crosstalk_frequency_domain(
                     // (same crosstalk logic as before)
                     // If both channels have harmonic claim
                     if is_harmonic && other_is_harmonic {
-                        if other_mag > magnitude * 2.0 {
+                        if other_mag > magnitude * 1.5 {
                             filtered_spectra[ch_idx][i].1 *= 0.1;
                             count_filtered += 1;
                             crosstalk_info!("  → ch{} weaker harmonic freq={:.1}, reducing 90%", ch_idx, freq);
-                        } else if magnitude > other_mag * 2.0 {
+                        } else if magnitude > other_mag * 1.5 {
                             filtered_spectra[other_ch][other_idx].1 *= 0.1;
                             count_filtered += 1;
                             crosstalk_info!("  → ch{} weaker harmonic freq={:.1}, reducing 90%", other_ch, other_freq);
@@ -799,23 +799,23 @@ pub fn filter_crosstalk_frequency_domain(
                         }
                     }
                     else if is_harmonic && !other_is_harmonic {
-                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * scaled_reduction);
+                        filtered_spectra[other_ch][other_idx].1 *= 1.0 - scaled_reduction;
                         crosstalk_info!("  → Reduced ch{} freq={:.1} (NON-harm), mag now={:.3}", other_ch, other_freq, filtered_spectra[other_ch][other_idx].1);
                         count_filtered += 1;
                     }
                     else if !is_harmonic && other_is_harmonic {
-                        filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * scaled_reduction);
+                        filtered_spectra[ch_idx][i].1 *= 1.0 - scaled_reduction;
                         crosstalk_info!("  → Reduced ch{} freq={:.1} (NON-harm), mag now={:.3}", ch_idx, freq, filtered_spectra[ch_idx][i].1);
                         count_filtered += 1;
                     }
                     else {
                         // Neither is harmonic – compare magnitudes
                         if other_mag > magnitude * (1.0 + threshold) {
-                            filtered_spectra[ch_idx][i].1 *= 1.0 - (threshold * scaled_reduction);
+                            filtered_spectra[ch_idx][i].1 *= 1.0 - scaled_reduction;
                             count_filtered += 1;
                             crosstalk_info!("  → ch{} significantly weaker freq={:.1}, mag now={:.3}", ch_idx, freq, filtered_spectra[ch_idx][i].1);
                         } else if magnitude > other_mag * (1.0 + threshold) {
-                            filtered_spectra[other_ch][other_idx].1 *= 1.0 - (threshold * scaled_reduction);
+                            filtered_spectra[other_ch][other_idx].1 *= 1.0 - scaled_reduction;
                             count_filtered += 1;
                             crosstalk_info!("  → ch{} significantly weaker freq={:.1}, mag now={:.3}", other_ch, other_freq, filtered_spectra[other_ch][other_idx].1);
                         }
