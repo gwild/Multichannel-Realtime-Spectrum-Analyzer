@@ -110,6 +110,9 @@ pub struct MyApp {
     sample_rate: f64,
     show_results: bool,
     partials_rx: Option<broadcast::Receiver<PartialsData>>, // Added receiver field
+    // Fields for buffer size debouncing
+    desired_buffer_size: Option<usize>,
+    buffer_debounce_timer: Option<Instant>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -156,6 +159,9 @@ impl MyApp {
             sample_rate,
             show_results: true,
             partials_rx: Some(partials_rx), // Store the receiver
+            // Initialize debounce fields
+            desired_buffer_size: None,
+            buffer_debounce_timer: None,
         };
 
         // FIX IMPLEMENTATION:
@@ -270,6 +276,31 @@ impl eframe::App for MyApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // --- Buffer Size Debounce Check --- 
+        let debounce_duration = Duration::from_millis(300);
+        let mut apply_debounced_size = false;
+        if let Some(timer) = self.buffer_debounce_timer {
+            if timer.elapsed() >= debounce_duration {
+                if let Some(desired_size) = self.desired_buffer_size {
+                    let current_size = *self.buffer_size.lock().unwrap();
+                    if desired_size != current_size {
+                        apply_debounced_size = true;
+                    }
+                }
+                // Clear timer and desired size regardless of whether we applied
+                self.buffer_debounce_timer = None;
+                self.desired_buffer_size = None; 
+            }
+        }
+
+        // Apply the change outside the check to avoid borrowing issues
+        if apply_debounced_size {
+            if let Some(desired_size) = self.desired_buffer_size {
+                 self.update_buffer_size(desired_size); // Call the actual update function
+            }
+        }
+        // --- End Debounce Check ---
+
         // --- Receive and process partials --- 
         if let Some(rx) = self.partials_rx.as_mut() { // Check if receiver exists
             let mut latest_partials: Option<PartialsData> = None;
@@ -364,8 +395,11 @@ impl eframe::App for MyApp {
                         .changed()
                     {
                         let new_size = 1 << buffer_log_slider;
-                        self.update_buffer_size(new_size);
-                        size_changed = true;
+                        // self.update_buffer_size(new_size); // REMOVED direct call
+                        // Instead, set desired size and timer for debouncing
+                        self.desired_buffer_size = Some(new_size);
+                        self.buffer_debounce_timer = Some(Instant::now());
+                        size_changed = true; // Keep UI responsive even if change is debounced
                     }
                     ui.label("samples");
                 }
@@ -642,7 +676,11 @@ impl eframe::App for MyApp {
 
             // Perform buffer reset outside the main button logic if needed
             if needs_buffer_reset {
-                self.update_buffer_size(DEFAULT_BUFFER_SIZE);
+                // self.update_buffer_size(DEFAULT_BUFFER_SIZE); // REMOVED direct call
+                // Instead, set desired size and timer for debouncing
+                self.desired_buffer_size = Some(DEFAULT_BUFFER_SIZE);
+                self.buffer_debounce_timer = Some(Instant::now());
+                 // Note: UI update based on nyquist_limit change still applies immediately from button logic
             }
 
             // 8) Plot logic

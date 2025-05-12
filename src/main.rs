@@ -38,9 +38,7 @@ use memmap2::MmapMut;
 
 #[derive(Clone)]
 pub struct SharedMemory {
-    pub data: Vec<Vec<(f32, f32)>>,
     pub path: String,
-    pub current_partials: Arc<Mutex<Vec<Vec<(f32, f32)>>>>,
 }
 
 // Add a new constant to replace hardcoded 12 throughout code
@@ -502,9 +500,7 @@ async fn run() -> Result<()> {
         file.set_len(4 * 1024 * 1024)?;
         info!("Shared memory initialized at {} for internal use", shared_memory_path);
         Some(SharedMemory {
-            data: Vec::new(),
             path: shared_memory_path,
-            current_partials: Arc::new(Mutex::new(Vec::new())),
         })
     };
 
@@ -570,15 +566,6 @@ async fn run() -> Result<()> {
     let stream_ready_fft = Arc::clone(&stream_ready);
     while !stream_ready_fft.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Check shared memory initialization after FFT thread is ready
-    if let Some(ref shared) = shared_partials {
-        if shared.current_partials.lock().unwrap().is_empty() {
-            warn!("Shared memory is initialized but current partials are empty - resynthesis may not receive data");
-        }
-    } else {
-        error!("Shared memory is not initialized - resynthesis will not receive data from fft_analysis");
     }
 
     // Start resynthesis thread
