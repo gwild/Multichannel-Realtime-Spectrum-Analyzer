@@ -40,7 +40,7 @@ pub struct ResynthConfig {
 impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
-            gain: 0.8,  // Increased default gain for better audibility
+            gain: 0.5,  // Set default gain to 0.5
             smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,

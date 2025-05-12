@@ -569,7 +569,7 @@ impl eframe::App for MyApp {
                 // Reset resynth config
                 { // Scope for resynth_config lock
                     let mut resynth_config = self.resynth_config.lock().unwrap();
-                    resynth_config.gain = 0.8; // Correct default gain
+                    resynth_config.gain = 0.5; // Set reset gain to 0.5
                     resynth_config.smoothing = 0.0;
                     resynth_config.freq_scale = 1.0;
                     resynth_config.update_rate = DEFAULT_UPDATE_RATE;
@@ -610,9 +610,11 @@ impl eframe::App for MyApp {
                     let channel_partials = &absolute_values[channel];
                     let mut bars: Vec<egui::plot::Bar> = channel_partials
                         .iter()
-                        .filter(|&&(freq, raw_val)| freq > 0.0 && raw_val != 0.0)
-                        .map(|&(freq, raw_val)| {
-                            egui::plot::Bar::new(freq as f64, raw_val as f64)
+                        // Filter out non-positive frequencies and values (assuming dB)
+                        .filter(|&&(freq, db_val)| freq > 0.0 && db_val > -f32::INFINITY) // Use -inf for dB check
+                        .map(|&(freq, db_val)| {
+                            // Use dB value directly for plotting
+                            egui::plot::Bar::new(freq as f64, db_val as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
@@ -759,6 +761,8 @@ impl eframe::App for MyApp {
                     (fft.max_frequency as f32).min(buffer_size as f32 / 2.0)
                 };
 
+                let min_db_for_color = -self.y_scale; // e.g., -80.0 dB
+
                 Plot::new("spectrograph_plot")
                     .legend(Legend::default())
                     .view_aspect(6.0)
@@ -794,8 +798,12 @@ impl eframe::App for MyApp {
 
                             for slice in history.iter() {
                                 if slice.time >= earliest_time && slice.time <= latest_time {
-                                    for &(freq, magnitude) in &slice.data {
-                                        let normalized_magnitude = (magnitude / self.y_scale).clamp(0.0, 1.0);
+                                    // Note: SpectrographSlice data needs reconsideration if it stores linear amp
+                                    // Assuming for now it stores dB as created by FFT thread before conversion
+                                    for &(freq, db_val) in &slice.data { // Assuming data is (freq, dB)
+                                        // Normalize based on dB range (e.g., -80dB to 0dB, y_scale = 80)
+                                        let normalized_magnitude = (( (db_val as f32).max(min_db_for_color) - min_db_for_color) / self.y_scale).clamp(0.0, 1.0);
+                                        // Same color mapping logic
                                         let color = egui::Color32::from_rgb(
                                             (255.0 * normalized_magnitude) as u8,
                                             (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
@@ -859,14 +867,15 @@ pub mod display_utils {
         let magnitudes = (0..num_partials)
             .map(|i| {
                 if i < values.len() {
-                    let (freq, raw_val) = values[i];
-                    if raw_val > 0.0 {
-                        format!("({:.2}, {:.0})", freq, raw_val)
+                    let (freq, db_val) = values[i];
+                    // Format dB value directly
+                    if db_val.is_finite() && freq > 0.0 { // Check if dB is valid and freq > 0
+                        format!("({:.2}, {:.0})", freq, db_val)
                     } else {
-                        "(0.00, 0)".to_string()
+                        "(0.00, -)".to_string() // Display '-' for invalid/zero values
                     }
                 } else {
-                    "(0.00, 0)".to_string()
+                    "(0.00, -)".to_string()
                 }
             })
             .collect::<Vec<_>>()

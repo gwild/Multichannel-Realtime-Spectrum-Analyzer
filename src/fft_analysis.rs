@@ -518,6 +518,9 @@ pub fn compute_spectrum(
         return vec![(0.0, 0.0); config.num_partials];
     }
 
+    // Keep threshold in dB for comparison
+    // let linear_magnitude_threshold = 10.0_f32.powf(config.magnitude_threshold as f32 / 20.0);
+
     // 3. First collect all valid magnitudes above threshold
     let freq_step = sample_rate as f32 / signal.len() as f32;
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum
@@ -528,13 +531,13 @@ pub fn compute_spectrum(
             let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
             
             // Only compute dB if magnitude is significant
-            if magnitude > 1e-10 {
+            if magnitude > 1e-10 { // Use a small epsilon to avoid log(0)
                 let db = 20.0 * magnitude.log10();
-                // Only include if above threshold and in frequency range
+                // Only include if above dB threshold and in frequency range
                 if db > config.magnitude_threshold as f32 &&
                    frequency >= config.min_frequency as f32 && 
                    frequency <= config.max_frequency as f32 {
-                    Some((frequency, db))
+                    Some((frequency, db)) // Return dB magnitude
                 } else {
                     None
                 }
@@ -871,6 +874,9 @@ fn extract_partials_from_spectrum(
     // 1. Calculate frequency step
     let freq_step = sample_rate as f32 / signal_len as f32;
 
+    // Keep threshold in dB for comparison
+    // let linear_magnitude_threshold = 10.0_f32.powf(config.magnitude_threshold as f32 / 20.0);
+
     // 2. Collect all valid magnitudes above threshold from the complex spectrum
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum
         .par_iter()
@@ -882,11 +888,11 @@ fn extract_partials_from_spectrum(
             // Only compute dB if magnitude is significant
             if magnitude > 1e-10 { // Use a small epsilon to avoid log(0)
                 let db = 20.0 * magnitude.log10();
-                // Only include if above threshold and in frequency range
+                // Only include if above dB threshold and in frequency range
                 if db > config.magnitude_threshold as f32 &&
                    frequency >= config.min_frequency as f32 &&
                    frequency <= config.max_frequency as f32 {
-                    Some((frequency, db))
+                    Some((frequency, db)) // Return dB magnitude
                 } else {
                     None
                 }

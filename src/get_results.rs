@@ -147,22 +147,39 @@ pub fn start_update_thread_with_sender(
             if last_update.elapsed().as_secs_f32() >= update_rate {
                 let config_snapshot = config.lock().unwrap().snapshot();
                 debug!(target: "get_results", 
-                    "Update #{} - Config: gain={:.3}, freq_scale={:.3}, smoothing={:.3}, update_rate={:.3}s",
+                    "Update #{}: Preparing update - Config (used for freq/smooth/rate): gain={:.3}, freq_scale={:.3}, smoothing={:.3}, update_rate={:.3}s",
                     update_count + 1,
-                    config_snapshot.gain,
+                    config_snapshot.gain, // Gain from config is NOT used for resynth now
                     config_snapshot.freq_scale,
                     config_snapshot.smoothing,
                     config_snapshot.update_rate
                 );
                 if let Ok(current) = current_partials.lock() {
                     update_count += 1;
+
+                    // Clone the original dB partials from current_partials
+                    let db_partials = current.data.clone();
+
+                    // --- Conversion Step --- 
+                    // Convert partials to linear scale for resynthesis
+                    let linear_partials: Vec<Vec<(f32, f32)>> = db_partials.iter().map(|channel_partials| {
+                        channel_partials.iter().map(|&(freq, db_amp)| {
+                            // Convert dB to linear amplitude: amp = 10^(dB/20)
+                            let linear_amp = 10.0_f32.powf(db_amp / 20.0);
+                            (freq, linear_amp)
+                        }).collect()
+                    }).collect();
+                    // --- End Conversion Step --- 
+
+                    // Create the update with linear partials and use the gain from the config snapshot
                     let update = SynthUpdate {
-                        partials: current.data.clone(),
-                        gain: config_snapshot.gain,
+                        partials: linear_partials, // Use converted linear partials
+                        gain: config_snapshot.gain, // Use gain from config (controlled by GUI slider)
                         freq_scale: config_snapshot.freq_scale,
                         smoothing: config_snapshot.smoothing,
                         update_rate: config_snapshot.update_rate,
                     };
+
                     match update_sender.send(update) {
                         Ok(_) => {
                             debug!(target: "get_results", 
