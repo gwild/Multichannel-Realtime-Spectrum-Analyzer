@@ -6,13 +6,16 @@ use log::{debug, warn};
 use crossbeam_queue::ArrayQueue;
 use crate::ResynthConfig;
 use crate::resynth::SynthUpdate;
-use crate::fft_analysis::CurrentPartials;
+use tokio::sync::broadcast;
+
+// Define type alias
+type PartialsData = Vec<Vec<(f32, f32)>>;
 
 pub fn start_update_thread(
     config: Arc<Mutex<ResynthConfig>>,
     shutdown_flag: Arc<AtomicBool>,
     update_queue: Arc<ArrayQueue<SynthUpdate>>,
-    current_partials: Arc<Mutex<CurrentPartials>>,
+    mut partials_rx: broadcast::Receiver<PartialsData>,
 ) {
     debug!(target: "get_results", "Starting update thread for FFT data retrieval");
 
@@ -54,13 +57,34 @@ pub fn start_update_thread(
                     config_snapshot.update_rate
                 );
 
-                // Get current FFT data
-                if let Ok(current) = current_partials.lock() {
+                // --- Get latest partials from broadcast channel --- 
+                let mut latest_partials: Option<PartialsData> = None;
+                loop {
+                    match partials_rx.try_recv() {
+                        Ok(partials) => {
+                            latest_partials = Some(partials);
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break, // No new data
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            warn!(target: "get_results", "Partials receiver lagged by {} messages.", n);
+                            break; // Got latest available
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            warn!(target: "get_results", "Partials broadcast channel closed.");
+                            shutdown_flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                // --- End get partials ---
+
+                // Process if we received new partials
+                if let Some(current_partials_data) = latest_partials {
                     update_count += 1;
                     
-                    // Create update with current data
+                    // Create update with received (linear) partials
                     let update = SynthUpdate {
-                        partials: current.data.clone(),
+                        partials: current_partials_data, // Use received data directly
                         gain: config_snapshot.gain,
                         freq_scale: config_snapshot.freq_scale,
                         smoothing: config_snapshot.smoothing,
@@ -121,7 +145,7 @@ pub fn start_update_thread_with_sender(
     config: Arc<Mutex<ResynthConfig>>,
     shutdown_flag: Arc<AtomicBool>,
     update_sender: mpsc::Sender<SynthUpdate>,
-    current_partials: Arc<Mutex<CurrentPartials>>,
+    mut partials_rx: broadcast::Receiver<PartialsData>,
 ) {
     debug!(target: "get_results", "Starting update thread for FFT data retrieval (mpsc sender)");
 
@@ -154,27 +178,35 @@ pub fn start_update_thread_with_sender(
                     config_snapshot.smoothing,
                     config_snapshot.update_rate
                 );
-                if let Ok(current) = current_partials.lock() {
+
+                // --- Get latest partials from broadcast channel --- 
+                let mut latest_partials: Option<PartialsData> = None;
+                loop {
+                    match partials_rx.try_recv() {
+                        Ok(partials) => {
+                            latest_partials = Some(partials);
+                        }
+                        Err(broadcast::error::TryRecvError::Empty) => break, // No new data
+                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                            warn!(target: "get_results", "Partials receiver (mpsc) lagged by {} messages.", n);
+                            break; // Got latest available
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            warn!(target: "get_results", "Partials broadcast channel closed (mpsc).");
+                            shutdown_flag.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                // --- End get partials ---
+
+                if let Some(linear_partials_data) = latest_partials {
                     update_count += 1;
 
-                    // Clone the original dB partials from current_partials
-                    let db_partials = current.data.clone();
-
-                    // --- Conversion Step --- 
-                    // Convert partials to linear scale for resynthesis
-                    let linear_partials: Vec<Vec<(f32, f32)>> = db_partials.iter().map(|channel_partials| {
-                        channel_partials.iter().map(|&(freq, db_amp)| {
-                            // Convert dB to linear amplitude: amp = 10^(dB/20)
-                            let linear_amp = 10.0_f32.powf(db_amp / 20.0);
-                            (freq, linear_amp)
-                        }).collect()
-                    }).collect();
-                    // --- End Conversion Step --- 
-
-                    // Create the update with linear partials and use the gain from the config snapshot
+                    // Create the update with the received linear partials
                     let update = SynthUpdate {
-                        partials: linear_partials, // Use converted linear partials
-                        gain: config_snapshot.gain, // Use gain from config (controlled by GUI slider)
+                        partials: linear_partials_data, // Use received linear partials directly
+                        gain: config_snapshot.gain, 
                         freq_scale: config_snapshot.freq_scale,
                         smoothing: config_snapshot.smoothing,
                         update_rate: config_snapshot.update_rate,

@@ -24,10 +24,8 @@ use log::LevelFilter;
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
-use crate::fft_analysis::WindowType;
-use crate::resynth::{ResynthConfig, start_resynth_thread, UPDATE_RING_SIZE};
+use crate::resynth::{ResynthConfig, start_resynth_thread};
 use crate::plot::MyApp;
-use std::ffi::CString;
 use std::thread;
 use std::time::Duration;
 use std::collections::VecDeque;
@@ -35,7 +33,8 @@ use crate::plot::SpectrographSlice;
 use std::time::Instant;
 use std::fs::OpenOptions;
 use chrono;
-use crossbeam_queue::ArrayQueue;
+use tokio::sync::broadcast;
+use memmap2::MmapMut;
 
 #[derive(Clone)]
 pub struct SharedMemory {
@@ -47,7 +46,76 @@ pub struct SharedMemory {
 // Add a new constant to replace hardcoded 12 throughout code
 pub const DEFAULT_NUM_PARTIALS: usize = 12;
 
-fn main() {
+// Define type alias (should match fft_analysis)
+type PartialsData = Vec<Vec<(f32, f32)>>;
+
+// Async function to handle shared memory updates
+async fn shared_memory_updater_loop(
+    mut partials_rx: broadcast::Receiver<PartialsData>,
+    shared_memory_path: String,
+    shutdown_flag: Arc<AtomicBool>,
+) {
+    debug!(target: "shared_memory", "Starting shared memory update loop for path: {}", shared_memory_path);
+
+    while !shutdown_flag.load(Ordering::Relaxed) {
+        match partials_rx.recv().await {
+            Ok(linear_partials) => {
+                // Convert linear magnitudes to dB for Python
+                let db_partials: PartialsData = linear_partials.into_iter().map(|channel_partials| {
+                    channel_partials.into_iter().map(|(freq, magnitude)| {
+                        let db_val = if magnitude > 1e-10 { 
+                            20.0 * magnitude.log10()
+                        } else {
+                            -120.0 // Use a low dB value for silence/zero
+                        };
+                        (freq, db_val.max(-120.0_f32)) // Clamp to a floor
+                    }).collect()
+                }).collect();
+
+                // Serialize dB partials to bytes (simple approach: flatten and write f32 pairs)
+                let mut bytes_to_write = Vec::<u8>::new();
+                for channel in db_partials {
+                    for (freq, db) in channel {
+                        bytes_to_write.extend_from_slice(&freq.to_ne_bytes());
+                        bytes_to_write.extend_from_slice(&db.to_ne_bytes());
+                    }
+                }
+
+                // Write to shared memory file
+                match OpenOptions::new().read(true).write(true).open(&shared_memory_path) {
+                    Ok(file) => {
+                        match unsafe { MmapMut::map_mut(&file) } {
+                            Ok(mut mmap) => {
+                                let len = bytes_to_write.len().min(mmap.len());
+                                mmap[..len].copy_from_slice(&bytes_to_write[..len]);
+                                // Optional: Write a sentinel/length if protocol requires
+                                // mmap.flush(); // Ensure changes are written (usually optional)
+                            }
+                            Err(e) => {
+                                error!(target: "shared_memory", "Failed to memory map file {}: {}", shared_memory_path, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(target: "shared_memory", "Failed to open shared memory file {}: {}", shared_memory_path, e);
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!(target: "shared_memory", "Shared memory partials receiver lagged by {} messages.", n);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                info!(target: "shared_memory", "Partials broadcast channel closed for shared memory.");
+                break; // Exit loop if channel is closed
+            }
+        }
+    }
+    info!(target: "shared_memory", "Shared memory update loop shutting down.");
+}
+
+// Make main async
+#[tokio::main]
+async fn main() {
     // Check if we're already running in a terminal launched by Python or manually
     let is_launched_by_python = std::env::args().any(|arg| arg == "--launched-by-python");
     if !is_launched_by_python {
@@ -160,7 +228,7 @@ fn main() {
     // Check if GStreamer is running, start it if not
     check_and_start_gstreamer();
 
-    if let Err(e) = run() {
+    if let Err(e) = run().await {
         error!("Application error: {:?}", e);
         std::process::exit(1);
     }
@@ -200,7 +268,8 @@ fn check_and_start_gstreamer() {
     }
 }
 
-fn run() -> Result<()> {
+// Make run async
+async fn run() -> Result<()> {
     let pa = Arc::new(pa::PortAudio::new()?);
     info!("PortAudio initialized.");
 
@@ -443,8 +512,10 @@ fn run() -> Result<()> {
     let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::with_capacity(MAX_SPECTROGRAPH_HISTORY)));
     let spectrograph_history_fft = Arc::clone(&spectrograph_history);
 
-    // Create current_partials for FFT data sharing
-    let current_partials = Arc::new(Mutex::new(fft_analysis::CurrentPartials::new()));
+    // Create the broadcast channel for partials
+    let (partials_tx, partials_rx) = broadcast::channel::<PartialsData>(16); 
+    // Clone sender for FFT thread
+    let fft_partials_tx = partials_tx.clone();
 
     // Pass shared_partials to FFT thread
     let shared_partials_clone = shared_partials.clone();
@@ -459,7 +530,7 @@ fn run() -> Result<()> {
         let shared_partials_clone = shared_partials_clone.clone();
         let spectrograph_history = spectrograph_history_fft;
         let start_time = start_time_fft;
-        let current_partials = Arc::clone(&current_partials);
+        let partials_tx_clone = fft_partials_tx;
 
         move || {
             fft_analysis::start_fft_processing(
@@ -469,10 +540,9 @@ fn run() -> Result<()> {
                 selected_channels,
                 selected_sample_rate as u32,
                 shutdown_flag_fft,
-                shared_partials_clone,
+                partials_tx_clone,
                 Some(spectrograph_history),
                 Some(start_time),
-                current_partials,
             );
         }
     });
@@ -513,19 +583,20 @@ fn run() -> Result<()> {
 
     // Start resynthesis thread
     info!("Starting resynthesis...");
+    // Create a receiver for the resynthesis update thread
+    let resynth_partials_rx = partials_tx.subscribe();
     let resynth_thread = std::thread::spawn({
         let resynth_config = Arc::clone(&resynth_config);
         let shutdown_flag = Arc::clone(&shutdown_flag);
         let num_channels = selected_channels.len();
         let num_partials = num_partials;
-        let current_partials = Arc::clone(&current_partials);
         move || {
             start_resynth_thread(
                 resynth_config,
                 selected_output_device,
                 selected_sample_rate,
                 shutdown_flag,
-                current_partials,
+                resynth_partials_rx,
                 num_channels,
                 num_partials,
             );
@@ -534,6 +605,8 @@ fn run() -> Result<()> {
 
     // Start GUI
     info!("Starting GUI...");
+    // Create a receiver for the GUI
+    let plot_partials_rx = partials_tx.subscribe();
     let app = plot::MyApp::new(
         spectrum_app.clone(),
         fft_config.clone(),
@@ -544,7 +617,19 @@ fn run() -> Result<()> {
         spectrograph_history.clone(),
         start_time.clone(),
         selected_sample_rate,
+        plot_partials_rx,
     );
+
+    // Spawn SharedMemory update thread
+    if let Some(shared_mem_info) = shared_partials {
+        let shared_memory_partials_rx = partials_tx.subscribe();
+        let sm_shutdown_flag = shutdown_flag.clone();
+        tokio::spawn(async move {
+            shared_memory_updater_loop(shared_memory_partials_rx, shared_mem_info.path, sm_shutdown_flag).await;
+        });
+    } else {
+        warn!("SharedMemory struct not initialized, skipping shared memory update thread.");
+    }
 
     let native_options = NativeOptions {
         initial_window_size: Some(egui::vec2(1024.0, 440.0)),

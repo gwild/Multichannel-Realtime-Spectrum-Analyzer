@@ -1,22 +1,15 @@
 use std::sync::{Arc, Mutex, mpsc, Condvar};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::cell::RefCell;
 use portaudio as pa;
 use log::{info, error, debug, warn};
-use crate::plot::SpectrumApp;
-use crate::DEFAULT_NUM_PARTIALS;
-use crossbeam_queue::ArrayQueue;
-use anyhow::{Result, Error, anyhow};
-use crate::SharedMemory;
-use crate::get_results::{start_update_thread, start_update_thread_with_sender};
-use crate::fft_analysis::CurrentPartials;
-use crate::make_waves::{build_segment_buffer, format_partials_debug};
+use crate::get_results::{start_update_thread_with_sender};
 use std::collections::VecDeque;
-use hound;
-use std::sync::atomic::AtomicUsize;
+use tokio::sync::broadcast;
+
+// Define type alias (same as other files)
+type PartialsData = Vec<Vec<(f32, f32)>>; 
 
 // Constants for audio performance - with optimized values for JACK
 #[cfg(target_os = "linux")]
@@ -244,7 +237,7 @@ impl WaveSynth {
         }
     }
 
-    fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
+    fn process_buffer(&mut self, buffer: &mut [f32], _channels: usize) {
         let channels = 2; // Force stereo
         let frames = buffer.len() / channels;
         let mut queue = self.playback_queue.lock().unwrap();
@@ -467,7 +460,7 @@ pub fn start_wavegen_thread(
                 }
                 // Always keep the queue full
                 loop {
-                    let mut queue = playback_queue.lock().unwrap();
+                    let queue = playback_queue.lock().unwrap();
                     if queue.len() >= max_queue_size {
                         drop(queue);
                         // Wait for a new update or for space in the queue
@@ -528,7 +521,7 @@ pub fn start_resynth_thread(
     device_index: pa::DeviceIndex,
     sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
-    current_partials: Arc<Mutex<CurrentPartials>>,
+    mut partials_rx: broadcast::Receiver<PartialsData>,
     _num_channels: usize,
     _num_partials: usize,
 ) {
@@ -545,7 +538,7 @@ pub fn start_resynth_thread(
         Arc::clone(&config),
         Arc::clone(&shutdown_flag),
         update_tx,
-        Arc::clone(&current_partials),
+        partials_rx,
     );
     // Main thread that handles audio stream lifecycle
     std::thread::spawn(move || {

@@ -1,11 +1,11 @@
-use log::info;
+// Removed: use log::info;
 use log::debug;
 
 pub const MIN_FREQ: f64 = 20.0;  // Lowest frequency we want to analyze
 pub const MAX_FREQ: f64 = 20000.0;  // Highest frequency we want to analyze
 pub const MIN_BUFFER_SIZE: usize = 512;  // Minimum buffer size
 pub const MAX_BUFFER_SIZE: usize = 65536;  // Increased maximum buffer size for higher frequencies
-pub const DEFAULT_BUFFER_SIZE: usize = 16384;  // Increased default size to handle higher frequencies
+pub const DEFAULT_BUFFER_SIZE: usize = 1024;  // Increased default size to handle higher frequencies
 pub const DEFAULT_FRAMES_PER_BUFFER: u32 = 2048;  // Add this constant
 pub const FRAME_SIZES: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
 

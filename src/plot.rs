@@ -5,27 +5,28 @@ use egui::plot::{Plot, BarChart, Legend};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
-use log::{info, debug, log_enabled, Level, error};
+use log::{info, debug, error, warn};
 use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for GUI throttling.
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, calculate_optimal_buffer_size, FRAME_SIZES, DEFAULT_BUFFER_SIZE};
-use crate::display::SpectralDisplay;
+use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;  // Add at top with other imports
-use crate::fft_analysis::{apply_window, extract_channel_data};
-use realfft::RealFftPlanner;
 use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use egui::widgets::plot::uniform_grid_spacer;
 use std::collections::VecDeque;
-use std::collections::BTreeMap;
 use chrono;
 use egui::TextStyle;
 use egui::FontId;
 use egui::FontFamily;
 use egui::Color32;
+use tokio::sync::broadcast; // Added import
+use crate::display::SpectralDisplay; // Added import
+
+// Define type alias
+type PartialsData = Vec<Vec<(f32, f32)>>; 
 
 pub struct SpectrographSlice {
     pub time: f64,
@@ -108,6 +109,7 @@ pub struct MyApp {
     start_time: Arc<Instant>,
     sample_rate: f64,
     show_results: bool,
+    partials_rx: Option<broadcast::Receiver<PartialsData>>, // Added receiver field
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -122,6 +124,7 @@ impl MyApp {
         spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
         start_time: Arc<Instant>,
         sample_rate: f64,
+        mut partials_rx: broadcast::Receiver<PartialsData>, // Added receiver parameter
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -152,6 +155,7 @@ impl MyApp {
             start_time,
             sample_rate,
             show_results: true,
+            partials_rx: Some(partials_rx), // Store the receiver
         };
 
         // FIX IMPLEMENTATION:
@@ -218,7 +222,7 @@ impl MyApp {
     // Helper method to get the current nyquist limit
     fn get_nyquist_limit(&self) -> f32 {
         let buffer_size = *self.buffer_size.lock().unwrap();
-        (buffer_size as f32 / 2.0)
+        buffer_size as f32 / 2.0
     }
 
     pub fn update_ui(&mut self, ui: &mut egui::Ui) {
@@ -266,6 +270,49 @@ impl eframe::App for MyApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // --- Receive and process partials --- 
+        if let Some(rx) = self.partials_rx.as_mut() { // Check if receiver exists
+            let mut latest_partials: Option<PartialsData> = None;
+            loop {
+                 match rx.try_recv() {
+                    Ok(partials) => { latest_partials = Some(partials); }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                        warn!(target: "plot", "GUI partials receiver lagged by {} messages.", n);
+                        // latest_partials might contain the newest after lag
+                        break; // Process the latest one we got (if any)
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        warn!(target: "plot", "Partials broadcast channel closed for GUI.");
+                        self.partials_rx = None; // Stop trying to receive
+                        break;
+                    }
+                }
+            }
+
+            if let Some(linear_partials) = latest_partials {
+                // Convert linear magnitudes to dB for display
+                let db_partials: PartialsData = linear_partials.into_iter().map(|channel_partials| {
+                    channel_partials.into_iter().map(|(freq, magnitude)| {
+                        let db_val = if magnitude > 1e-10 { // Avoid log(0)
+                            20.0 * magnitude.log10()
+                        } else {
+                            -100.0 // Or some other very low dB value
+                        };
+                        (freq, db_val.max(-100.0)) // Clamp dB to a minimum floor, e.g., -100dB
+                    }).collect()
+                }).collect();
+
+                // Update the shared SpectrumApp state with dB values
+                if let Ok(mut spectrum) = self.spectrum.lock() {
+                    spectrum.update_partials(db_partials);
+                }
+            }
+        } else {
+            // Optional: Indicate somehow that data is not updating if receiver is gone
+        }
+        // --- End receive and process partials ---
+
         // Throttling: Limit repaint to at most 10 times per second (every 100 ms)
         let now = Instant::now();
         if now.duration_since(self.last_repaint) >= Duration::from_millis(100) {
@@ -798,11 +845,17 @@ impl eframe::App for MyApp {
 
                             for slice in history.iter() {
                                 if slice.time >= earliest_time && slice.time <= latest_time {
-                                    // Note: SpectrographSlice data needs reconsideration if it stores linear amp
-                                    // Assuming for now it stores dB as created by FFT thread before conversion
-                                    for &(freq, db_val) in &slice.data { // Assuming data is (freq, dB)
+                                    // SpectrographSlice.data is now (f64, linear_magnitude: f32)
+                                    // Convert linear magnitude to dB here for coloring
+                                    for &(freq, magnitude) in &slice.data { 
+                                        // Convert linear magnitude to dB
+                                        let db_val = if magnitude > 1e-10 {
+                                            20.0 * magnitude.log10()
+                                        } else {
+                                            min_db_for_color // Assign minimum color value if magnitude is zero/negative
+                                        };
                                         // Normalize based on dB range (e.g., -80dB to 0dB, y_scale = 80)
-                                        let normalized_magnitude = (( (db_val as f32).max(min_db_for_color) - min_db_for_color) / self.y_scale).clamp(0.0, 1.0);
+                                        let normalized_magnitude = ((db_val.max(min_db_for_color) - min_db_for_color) / self.y_scale).clamp(0.0, 1.0);
                                         // Same color mapping logic
                                         let color = egui::Color32::from_rgb(
                                             (255.0 * normalized_magnitude) as u8,

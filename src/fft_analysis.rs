@@ -12,19 +12,20 @@ use realfft::RealFftPlanner;
 use rayon::prelude::*;
 use std::f32::consts::PI;
 use crate::utils::{DEFAULT_BUFFER_SIZE, MAX_FREQ, MIN_FREQ}; // Update imports
-use std::io::Write;  // For write_all
-use crate::SharedMemory;  // Import the struct from main.rs
 use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
 use crate::plot::SpectrographSlice;
 use std::collections::VecDeque;
 use std::time::Instant;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use crossbeam_queue::ArrayQueue;
 use rustfft::num_complex::Complex;
+use tokio::sync::broadcast; // Added import
 
 // Change the constant declaration to be public
 pub const MAX_SPECTROGRAPH_HISTORY: usize = 500;
+
+// Add a type alias for clarity
+type PartialsData = Vec<Vec<(f32, f32)>>;
 
 /// Configuration struct for FFT settings.
 #[derive(Debug, Clone, PartialEq)]  // Add Clone derive
@@ -137,7 +138,7 @@ fn compute_all_fft_data(
         })
         .collect();
 
-    // Compute partials using the new function and the *same* complex_spectrum_output
+    // Compute partials (now linear magnitude) using the new function
     let partials = extract_partials_from_spectrum(
         &complex_spectrum_output, 
         sample_rate, 
@@ -156,10 +157,9 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
-    shared_partials: Option<SharedMemory>,
+    partials_tx: broadcast::Sender<PartialsData>, // Changed parameter: Use broadcast sender
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
     start_time: Option<Arc<Instant>>,
-    current_partials: Arc<Mutex<CurrentPartials>>,
 ) {
     debug!("Starting FFT processing thread");
 
@@ -310,7 +310,7 @@ pub fn start_fft_processing(
             }
 
             // Apply crosstalk filtering if enabled
-            let results = if cached_config.crosstalk_enabled {
+            let results: PartialsData = if cached_config.crosstalk_enabled {
                 filter_crosstalk_frequency_domain(
                     &mut all_channels_partials,
                     cached_config.crosstalk_threshold,
@@ -325,27 +325,40 @@ pub fn start_fft_processing(
                 all_channels_partials
             };
 
-            // Store FFT results in current_partials for resynth
-            if let Ok(mut current) = current_partials.lock() {
-                current.data = results.clone();
+            // --- Send partials via broadcast channel --- 
+            if partials_tx.receiver_count() > 0 { // Only send if someone is listening
+                if let Err(_e) = partials_tx.send(results.clone()) {
+                    // Error implies channel is closed or no receivers. Log if needed.
+                    // warn!("Failed to broadcast partials: {}", e);
+                }
+            } else {
+                // Optional: Log if sending because no receivers are attached
+                // debug!("No receivers for partials broadcast, skipping send.");
             }
+            // --- End Send --- 
 
-            // Update GUI display
+            // Update GUI display (now receives linear magnitudes)
             {
                 let mut spectrum = spectrum_app.lock().unwrap();
-                spectrum.update_partials(results.clone());
+                spectrum.update_partials(results.clone()); // Pass linear partials
                 spectrum.update_fft_line_data(all_channels_line_data);
             }
 
-            // Update spectrograph if needed
+            // Update spectrograph if needed (now receives linear magnitudes)
             if let Some(history) = &spectrograph_history {
                 let elapsed = start_time.as_ref().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
                 let slice = SpectrographSlice {
                     time: elapsed,
+                    // Convert linear magnitude to f64 for the slice data if needed
+                    // or update SpectrographSlice to store f32.
+                    // Also, filtering based on magnitude threshold needs linear comparison.
                     data: results.iter()
                         .flat_map(|channel_data| {
+                            // Convert dB threshold to linear for comparison
+                            let linear_threshold = 10.0_f32.powf(cached_config.magnitude_threshold as f32 / 20.0);
                             channel_data.iter()
-                                .filter(|&&(freq, magnitude)| magnitude > cached_config.magnitude_threshold as f32)
+                                .filter(move |&&(_freq, magnitude)| magnitude >= linear_threshold)
+                                // Convert freq to f64 if needed by SpectrographSlice
                                 .map(|&(freq, magnitude)| (freq as f64, magnitude))
                         })
                         .collect(),
@@ -678,7 +691,7 @@ pub fn filter_crosstalk_frequency_domain(
     threshold: f32,
     reduction: f32,
     harmonic_tolerance: f32,
-    mut root_freq_min: f32,
+    root_freq_min: f32,
     mut root_freq_max: f32,
     freq_match_distance: f32,
     sample_rate: u32
@@ -874,8 +887,8 @@ fn extract_partials_from_spectrum(
     // 1. Calculate frequency step
     let freq_step = sample_rate as f32 / signal_len as f32;
 
-    // Keep threshold in dB for comparison
-    // let linear_magnitude_threshold = 10.0_f32.powf(config.magnitude_threshold as f32 / 20.0);
+    // Convert dB threshold to linear magnitude threshold once
+    let linear_magnitude_threshold = 10.0_f32.powf(config.magnitude_threshold as f32 / 20.0);
 
     // 2. Collect all valid magnitudes above threshold from the complex spectrum
     let mut all_magnitudes: Vec<(f32, f32)> = spectrum
@@ -885,17 +898,11 @@ fn extract_partials_from_spectrum(
             let frequency = i as f32 * freq_step;
             let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
 
-            // Only compute dB if magnitude is significant
-            if magnitude > 1e-10 { // Use a small epsilon to avoid log(0)
-                let db = 20.0 * magnitude.log10();
-                // Only include if above dB threshold and in frequency range
-                if db > config.magnitude_threshold as f32 &&
-                   frequency >= config.min_frequency as f32 &&
-                   frequency <= config.max_frequency as f32 {
-                    Some((frequency, db)) // Return dB magnitude
-                } else {
-                    None
-                }
+            // Filter based on linear magnitude threshold and frequency range
+            if magnitude >= linear_magnitude_threshold &&
+               frequency >= config.min_frequency as f32 &&
+               frequency <= config.max_frequency as f32 {
+                Some((frequency, magnitude)) // Return linear magnitude
             } else {
                 None
             }
