@@ -49,11 +49,10 @@ pub fn start_update_thread(
             if last_update.elapsed().as_secs_f32() >= update_rate {
                 let config_snapshot = config.lock().unwrap().snapshot();
                 debug!(target: "get_results", 
-                    "Update #{} - Config: gain={:.3}, freq_scale={:.3}, smoothing={:.3}, update_rate={:.3}s",
+                    "Update #{} - Config: gain={:.3}, freq_scale={:.3}, update_rate={:.3}s",
                     update_count + 1,
                     config_snapshot.gain,
                     config_snapshot.freq_scale,
-                    config_snapshot.smoothing,
                     config_snapshot.update_rate
                 );
 
@@ -87,7 +86,6 @@ pub fn start_update_thread(
                         partials: current_partials_data, // Use received data directly
                         gain: config_snapshot.gain,
                         freq_scale: config_snapshot.freq_scale,
-                        smoothing: config_snapshot.smoothing,
                         update_rate: config_snapshot.update_rate,
                     };
 
@@ -171,11 +169,10 @@ pub fn start_update_thread_with_sender(
             if last_update.elapsed().as_secs_f32() >= update_rate {
                 let config_snapshot = config.lock().unwrap().snapshot();
                 debug!(target: "get_results", 
-                    "Update #{}: Preparing update - Config (used for freq/smooth/rate): gain={:.3}, freq_scale={:.3}, smoothing={:.3}, update_rate={:.3}s",
+                    "Update #{}: Preparing update - Config (used for freq/rate): gain={:.3}, freq_scale={:.3}, update_rate={:.3}s",
                     update_count + 1,
                     config_snapshot.gain, // Gain from config is NOT used for resynth now
                     config_snapshot.freq_scale,
-                    config_snapshot.smoothing,
                     config_snapshot.update_rate
                 );
 
@@ -208,7 +205,6 @@ pub fn start_update_thread_with_sender(
                         partials: linear_partials_data, // Use received linear partials directly
                         gain: config_snapshot.gain, 
                         freq_scale: config_snapshot.freq_scale,
-                        smoothing: config_snapshot.smoothing,
                         update_rate: config_snapshot.update_rate,
                     };
 

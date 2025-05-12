@@ -24,7 +24,6 @@ pub const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
 /// Configuration for resynthesis
 pub struct ResynthConfig {
     pub gain: f32,
-    pub smoothing: f32,
     pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
     pub update_rate: f32, // How often to update synthesis (in seconds)
     pub needs_restart: Arc<AtomicBool>,  // Flag to signal when stream needs to restart
@@ -34,7 +33,6 @@ impl Default for ResynthConfig {
     fn default() -> Self {
         Self {
             gain: 0.5,  // Set default gain to 0.5
-            smoothing: 0.0,
             freq_scale: 1.0,  // Default to no scaling
             update_rate: DEFAULT_UPDATE_RATE,
             needs_restart: Arc::new(AtomicBool::new(false)),
@@ -47,7 +45,6 @@ impl ResynthConfig {
     pub fn snapshot(&self) -> ResynthConfigSnapshot {
         ResynthConfigSnapshot {
             gain: self.gain,
-            smoothing: self.smoothing,
             freq_scale: self.freq_scale,
             update_rate: self.update_rate,
         }
@@ -58,7 +55,6 @@ impl ResynthConfig {
 #[derive(Clone, Copy)]
 pub struct ResynthConfigSnapshot {
     pub gain: f32,
-    pub smoothing: f32,
     pub freq_scale: f32,
     pub update_rate: f32,
 }
@@ -69,34 +65,7 @@ pub struct SynthUpdate {
     pub partials: Vec<Vec<(f32, f32)>>,
     pub gain: f32,
     pub freq_scale: f32,
-    pub smoothing: f32,  // Add smoothing parameter for crossfade control
     pub update_rate: f32,  // Add update rate parameter
-}
-
-/// State for a single partial
-#[derive(Clone)]
-struct PartialState {
-    freq: f32,               // Current frequency
-    target_freq: f32,        // Target frequency 
-    amp: f32,
-    phase: f32,
-    phase_delta: f32,
-    target_amp: f32,
-    current_amp: f32,
-}
-
-impl PartialState {
-    fn new() -> Self {
-        Self {
-            freq: 0.0,
-            target_freq: 0.0,
-            amp: 0.0,
-            phase: 0.0,
-            phase_delta: 0.0,
-            target_amp: 0.0,
-            current_amp: 0.0,
-        }
-    }
 }
 
 /// Lock-free synthesis engine

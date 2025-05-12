@@ -508,14 +508,6 @@ impl eframe::App for MyApp {
                 
                 ui.separator();
                 
-                // Smoothing slider with new minimum of 0
-                ui.label("Smoothing:");
-                if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                    ui.add(egui::Slider::new(&mut resynth_config.smoothing, 0.0..=0.9999));
-                }
-                
-                ui.separator();
-                
                 // Move Crosstalk checkbox to this row
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
@@ -651,7 +643,6 @@ impl eframe::App for MyApp {
                 { // Scope for resynth_config lock
                     let mut resynth_config = self.resynth_config.lock().unwrap();
                     resynth_config.gain = 0.5; // Set reset gain to 0.5
-                    resynth_config.smoothing = 0.0;
                     resynth_config.freq_scale = 1.0;
                     resynth_config.update_rate = DEFAULT_UPDATE_RATE;
                 } // resynth_config lock released here
