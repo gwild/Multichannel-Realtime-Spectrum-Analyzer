@@ -113,8 +113,11 @@ struct WaveSegment {
     length: usize,           // Length of segment
 }
 
-#[derive(Debug)]
-enum CrossfadeState { Idle, Active { old_pos: usize, fade_len: usize } }
+#[derive(Debug, Clone, Copy)]
+enum CrossfadeState {
+    Idle,
+    Active { fade_progress: usize, fade_len: usize }
+}
 
 struct WaveSynth {
     playback_queue: Arc<Mutex<VecDeque<WaveSegment>>>,  // Shared queue of segments ready for playback
@@ -242,101 +245,145 @@ impl WaveSynth {
     }
 
     fn process_buffer(&mut self, buffer: &mut [f32], channels: usize) {
-        let channels = 2;
+        let channels = 2; // Force stereo
         let frames = buffer.len() / channels;
         let mut queue = self.playback_queue.lock().unwrap();
 
         if queue.is_empty() {
-            // Fill buffer with silence if queue is empty
-            for sample in buffer.iter_mut() {
-                *sample = 0.0;
-            }
+            for sample in buffer.iter_mut() { *sample = 0.0; }
             return;
         }
 
-        // --- Immediate crossfade on rate change ---
         if let Ok(mut flag) = self.rate_change_flag.lock() {
             if *flag {
-                debug!(target: "resynth::playback", "[rate change] Immediate switch to new segment");
+                debug!(target: "resynth::playback", "[rate change] Immediate switch triggered");
                 if queue.len() > 1 {
                     self.prev_segment = queue.pop_front();
-                    debug!(target: "resynth::playback", "Popped segment from queue for rate change, new queue_len={}", queue.len());
+                } else {
+                    self.prev_segment = None; // No previous segment if queue was short
                 }
-                self.sample_counter = 0;
-                self.crossfade_state = Some(CrossfadeState::Idle);
+                self.sample_counter = 0; // Reset playback counter for the new segment
+                self.crossfade_state = Some(CrossfadeState::Idle); // Force Idle state after rate change
                 *flag = false;
+                debug!(target: "resynth::playback", "[rate change] State reset: sample_counter=0, crossfade_state=Idle, queue_len={}", queue.len());
             }
         }
 
-        // --- Main playback loop with state machine ---
-        for frame in 0..frames {
-            match self.crossfade_state.as_ref().unwrap() {
-                CrossfadeState::Active { old_pos, fade_len } => {
-                    let current_segment = queue.front().unwrap();
-                    let prev = self.prev_segment.as_ref().unwrap();
-                    let fade_len = *fade_len;
-                    let crossfade_start = *old_pos;
-                    
-                    for ch in 0..channels {
-                        if ch < current_segment.samples.len() && ch < prev.samples.len() {
-                            let t = self.sample_counter as f32 / (fade_len - 1) as f32;
-                            let fade_in = t;
-                            let fade_out = 1.0 - t;
-                            let prev_idx = crossfade_start + self.sample_counter;
-                            let prev_val = if prev_idx < prev.length { prev.samples[ch][prev_idx] } else { 0.0 };
-                            let curr_val = current_segment.samples[ch][self.sample_counter];
-                            buffer[frame * channels + ch] = prev_val * fade_out + curr_val * fade_in;
+        let mut buffer_idx = 0;
+        while buffer_idx < frames {
+            let frames_remaining_in_buffer = frames - buffer_idx;
+
+            match self.crossfade_state {
+                Some(CrossfadeState::Active { mut fade_progress, fade_len }) => {
+                    let current_segment = queue.front().expect("Queue empty during Active state");
+                    let prev_segment = self.prev_segment.as_ref().expect("Prev segment missing during Active state");
+
+                    let frames_to_process = frames_remaining_in_buffer.min(fade_len - fade_progress);
+
+                    for frame in 0..frames_to_process {
+                        let t = fade_progress as f32 / (fade_len - 1) as f32; // Normalize progress
+                        let fade_in = t;
+                        let fade_out = 1.0 - t;
+
+                        // --- Safely calculate previous index --- 
+                        // Ensure fade_len is not larger than prev_segment length
+                        let safe_fade_len = fade_len.min(prev_segment.length);
+                        // Calculate potential index as isize to check negativity
+                        let potential_prev_idx_isize = prev_segment.length as isize - safe_fade_len as isize + fade_progress as isize;
+                        // Clamp to 0 if negative, otherwise convert to usize
+                        let prev_idx = if potential_prev_idx_isize < 0 {
+                            0
+                        } else {
+                            (potential_prev_idx_isize as usize).min(prev_segment.length - 1) // Ensure it doesn't exceed bounds
+                        };
+                        // --- End safe calculation ---
+
+                        // Current segment fades in from its beginning
+                        let curr_idx = fade_progress.min(current_segment.length - 1); // Ensure it doesn't exceed bounds
+
+                        for ch in 0..channels {
+                            let prev_val = if ch < prev_segment.samples.len() && prev_idx < prev_segment.length { // Check bounds again
+                                prev_segment.samples[ch][prev_idx]
+                            } else { 0.0 };
+
+                            let curr_val = if ch < current_segment.samples.len() && curr_idx < current_segment.length {
+                                current_segment.samples[ch][curr_idx]
+                            } else { 0.0 };
+
+                            buffer[(buffer_idx + frame) * channels + ch] = prev_val * fade_out + curr_val * fade_in;
                         }
+                        fade_progress += 1;
                     }
-                    
-                    if self.sample_counter == fade_len - 1 {
-                        debug!(target: "resynth::playback", "[crossfade] Crossfade complete at sample_counter={}", self.sample_counter);
+
+                    buffer_idx += frames_to_process;
+
+                    if fade_progress >= fade_len {
+                        debug!(target: "resynth::playback", "[crossfade] Crossfade complete (processed {} frames)", frames_to_process);
                         self.crossfade_state = Some(CrossfadeState::Idle);
-                        self.prev_segment = None;
-                        self.crossfade_len = 0;
-                        self.crossfade_start_pos = None;
-                        self.sample_counter = 0;
+                        self.sample_counter = fade_len; // Start playback of current segment after the fade-in portion
+                        self.prev_segment = None; // Clear previous segment
                     } else {
-                        self.sample_counter += 1;
+                        // Update state with new progress if fade is not finished
+                        self.crossfade_state = Some(CrossfadeState::Active { fade_progress, fade_len });
                     }
                 }
-                CrossfadeState::Idle => {
-                    // Normal playback
-                    let current_segment = queue.front().unwrap();
+                Some(CrossfadeState::Idle) => {
+                    let current_segment = queue.front().expect("Queue empty during Idle state");
+                    let frames_left_in_segment = current_segment.length - self.sample_counter;
+                    let frames_to_process = frames_remaining_in_buffer.min(frames_left_in_segment);
+
+                    // Normal playback from current segment
+                    for frame in 0..frames_to_process {
+                        for ch in 0..channels {
+                            let sample_val = if ch < current_segment.samples.len() {
+                                current_segment.samples[ch][self.sample_counter + frame]
+                            } else { 0.0 };
+                            buffer[(buffer_idx + frame) * channels + ch] = sample_val;
+                        }
+                    }
+
+                    self.sample_counter += frames_to_process;
+                    buffer_idx += frames_to_process;
+
+                    // Check if segment finished
                     if self.sample_counter >= current_segment.length {
-                        // If sample_counter is out of bounds, reset and fill rest of buffer with silence
-                        self.sample_counter = 0;
-                        for i in frame..frames {
-                            for ch in 0..channels {
-                                buffer[i * channels + ch] = 0.0;
-                            }
-                        }
-                        break;
-                    }
-                    for ch in 0..channels {
-                        if ch < current_segment.samples.len() {
-                            buffer[frame * channels + ch] = current_segment.samples[ch][self.sample_counter];
-                        }
-                    }
-                    if self.sample_counter >= current_segment.length - 1 {
                         debug!(target: "resynth::playback", "Segment finished (len={}), sample_counter={}, queue_len={}", current_segment.length, self.sample_counter, queue.len());
-                        self.sample_counter = 0;
+
                         if queue.len() > 1 {
-                            self.prev_segment = queue.pop_front();
-                            debug!(target: "resynth::playback", "Popped segment from queue, new queue_len={}", queue.len());
-                            if let (Some(ref prev), Some(current_segment)) = (self.prev_segment.as_ref(), queue.front()) {
-                                self.crossfade_len = (prev.length.min(current_segment.length) / 3).max(1);
-                                debug!(target: "resynth::playback", "[segment] Crossfade window set: {} samples (old: {}, new: {})", self.crossfade_len, prev.length, current_segment.length);
-                                self.crossfade_start_pos = Some(0);
+                            self.prev_segment = queue.pop_front(); // Finished segment becomes prev
+                            debug!(target: "resynth::playback", "Popped segment, new queue_len={}", queue.len());
+
+                            let next_segment = queue.front().expect("Queue has >1 element but front is None");
+                            if let Some(ref prev) = self.prev_segment {
+                                // Calculate fade length based on the shorter of the fading segments
+                                let fade_len = (prev.length.min(next_segment.length) / 3).max(1);
+                                debug!(target: "resynth::playback", "[segment] Transitioning to Active state. Crossfade window: {} samples (old: {}, new: {})", fade_len, prev.length, next_segment.length);
+                                self.crossfade_state = Some(CrossfadeState::Active { fade_progress: 0, fade_len });
+                                self.sample_counter = 0; // Reset counter, it's not used in Active state directly
+                            } else {
+                                // Should not happen if prev_segment was just assigned
+                                warn!(target: "resynth::playback", "Previous segment missing immediately after pop");
+                                self.crossfade_state = Some(CrossfadeState::Idle);
+                                self.sample_counter = 0;
                             }
+                        } else {
+                            // Last segment finished, loop it or play silence? Loop for now.
+                            debug!(target: "resynth::playback", "Last segment finished, looping.");
+                            self.sample_counter = 0; // Reset to loop segment
+                            self.crossfade_state = Some(CrossfadeState::Idle); // Remain Idle
+                            self.prev_segment = None;
                         }
-                    } else {
-                        self.sample_counter += 1;
                     }
+                }
+                None => { // Should not happen, initialize state if it does
+                    warn!(target: "resynth::playback", "Crossfade state was None, resetting to Idle");
+                    self.crossfade_state = Some(CrossfadeState::Idle);
+                    self.sample_counter = 0;
                 }
             }
         }
-        debug!(target: "resynth::playback", "Buffer processed: frames={}, queue_len={}, sample_counter={}, crossfade_state={:?}", frames, queue.len(), self.sample_counter, self.crossfade_state);
+        // This debug log might be less informative now with the loop structure
+        // debug!(target: "resynth::playback", "Buffer processed: frames={}, queue_len={}, sample_counter={}, crossfade_state={:?}", frames, queue.len(), self.sample_counter, self.crossfade_state);
     }
 }
 
@@ -582,3 +629,5 @@ fn setup_audio_stream(
     debug!("Audio stream started successfully");
     Ok(stream)
 }
+
+
