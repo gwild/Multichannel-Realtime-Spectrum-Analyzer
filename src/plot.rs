@@ -838,8 +838,6 @@ impl eframe::App for MyApp {
                     (fft.max_frequency as f32).min(buffer_size as f32 / 2.0)
                 };
 
-                let min_db_for_color = -self.y_scale; // e.g., -80.0 dB
-
                 Plot::new("spectrograph_plot")
                     .legend(Legend::default())
                     .view_aspect(6.0)
@@ -875,25 +873,32 @@ impl eframe::App for MyApp {
 
                             for slice in history.iter() {
                                 if slice.time >= earliest_time && slice.time <= latest_time {
-                                    // SpectrographSlice.data is now (f64, linear_magnitude: f32)
-                                    // Convert linear magnitude to dB here for coloring
-                                    for &(freq, magnitude) in &slice.data { 
-                                        // Convert linear magnitude to dB
-                                        let db_val = if magnitude > 1e-10 {
-                                            20.0 * magnitude.log10()
+                                    // slice.data contains (freq: f64, unnormalized_linear_magnitude: f32)
+                                    for &(freq, unnormalized_magnitude_f32) in &slice.data { 
+                                        let unnormalized_magnitude = unnormalized_magnitude_f32 as f64;
+
+                                        // 1. Calculate the value to scale: 20 * log10(unnormalized magnitude)
+                                        let value_to_scale = if unnormalized_magnitude > 1e-10 { // Avoid log(0)
+                                            20.0 * unnormalized_magnitude.log10()
                                         } else {
-                                            min_db_for_color // Assign minimum color value if magnitude is zero/negative
+                                            // Map silence/low values to ensure intensity is 0
+                                            0.0 
                                         };
-                                        // Normalize based on dB range (e.g., -80dB to 0dB, y_scale = 80)
-                                        let normalized_magnitude = ((db_val.max(min_db_for_color) - min_db_for_color) / self.y_scale).clamp(0.0, 1.0);
-                                        // Same color mapping logic
+
+                                        // 2. Calculate intensity by normalizing value_to_scale against y_scale
+                                        // Intensity = 0.0 if value_to_scale <= 0
+                                        // Intensity = 1.0 if value_to_scale >= y_scale
+                                        let intensity = (value_to_scale / self.y_scale as f64).clamp(0.0, 1.0);
+                                        
+                                        // 3. Apply color based on intensity (Blue -> Green -> Red)
                                         let color = egui::Color32::from_rgb(
-                                            (255.0 * normalized_magnitude) as u8,
-                                            (255.0 * (1.0 - (normalized_magnitude - 0.5).abs() * 2.0)) as u8,
-                                            (255.0 * (1.0 - normalized_magnitude)) as u8,
+                                            (255.0 * intensity) as u8, // Red increases with intensity
+                                            (255.0 * (1.0 - (intensity - 0.5).abs() * 2.0).max(0.0)) as u8, // Green peaks at mid-intensity
+                                            (255.0 * (1.0 - intensity)) as u8, // Blue decreases with intensity
                                         );
+
                                         plot_ui.points(
-                                            egui::plot::Points::new(vec![[slice.time * 1000.0, freq as f64]])
+                                            egui::plot::Points::new(vec![[slice.time * 1000.0, freq]])
                                                 .color(color)
                                                 .radius(2.0)
                                         );
