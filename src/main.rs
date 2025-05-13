@@ -5,7 +5,6 @@ mod utils;
 mod display;
 mod resynth;
 mod get_results;
-mod make_waves;
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -18,9 +17,8 @@ use std::sync::{
 };
 use audio_stream::{CircularBuffer, start_sampling_thread};
 use eframe::NativeOptions;
-use log::{info, error, warn, debug};
+use log::{info, error, warn, debug, LevelFilter};
 use fern::Dispatch;
-use log::LevelFilter;
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
 use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
@@ -111,9 +109,9 @@ async fn shared_memory_updater_loop(
     info!(target: "shared_memory", "Shared memory update loop shutting down.");
 }
 
-// Make main async
+// Make main async and return Result
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), anyhow::Error> {
     // Check if we're already running in a terminal launched by Python or manually
     let is_launched_by_python = std::env::args().any(|arg| arg == "--launched-by-python");
     if !is_launched_by_python {
@@ -150,7 +148,7 @@ async fn main() {
             .spawn()
             .expect("Failed to launch new terminal");
         child.wait().expect("Failed to wait for child process");
-        return;
+        return Ok(());
     }
 
     // Initialize logging first, before any other operations
@@ -207,29 +205,33 @@ async fn main() {
             }
         }
 
-        if !debug_enabled {
+        if !debug_enabled && args.contains(&"--debug".to_string()) { // Ensure this condition captures --debug alone
             println!("Debug flag present but no module specified. Defaulting to global debug. Available modules: resynth, fft, audio, plot, main, all");
-            dispatch = dispatch.level(LevelFilter::Debug); // Default to global debug if no module specified
+            dispatch = dispatch.level(LevelFilter::Debug); // Default to global debug if only --debug is present
         }
 
         dispatch
-            .chain(std::io::stdout())
+            .chain(std::io::stdout()) // Ensure it also goes to xterm's stdout
+            .chain(fern::log_file("debug_explicit.log").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?)
             .apply()
-            .unwrap();
+            .map_err(|e| anyhow!("Logger apply error: {}", e))?;
 
         debug!("Logging initialized with args: {:?}", args);
+        info!("FERN LOGGER INITIALIZED AND ACTIVE in main.rs instance. Debug level: {}", log::max_level());
     } else {
         std::env::set_var("RUST_LOG", "error");
         env_logger::init();
     }
 
     // Check if GStreamer is running, start it if not
-    check_and_start_gstreamer();
+    // check_and_start_gstreamer(); // Temporarily comment out to isolate issues
+    info!("Skipping GStreamer check for this debug run.");
 
     if let Err(e) = run().await {
-        error!("Application error: {:?}", e);
+        error!("Application error in main: {:?}", e); // Clarify source of error log
         std::process::exit(1);
     }
+    Ok(())
 }
 
 // Function to check if GStreamer is running and start it if not
@@ -268,16 +270,23 @@ fn check_and_start_gstreamer() {
 
 // Make run async
 async fn run() -> Result<()> {
+    info!("run() function entered."); // New log
     let pa = Arc::new(pa::PortAudio::new()?);
-    info!("PortAudio initialized.");
+    info!("PortAudio initialized successfully in run()."); // New log
 
     let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
+    info!("Initial device list collected in run(). Count: {}", devices.len()); // New log
     if devices.is_empty() {
         warn!("No devices found. Attempting to reset devices.");
         reset_audio_devices(&pa)?;
+        info!("reset_audio_devices() called."); // New log
     }
 
+    // Add a log after potentially resetting devices, before trying to list them again.
+    info!("Device reset attempted if necessary. Proceeding to list devices.");
+
     let devices = pa.devices()?.collect::<Result<Vec<_>, _>>()?;
+    info!("Final device list collected in run(). Count: {}", devices.len()); // New log
     if devices.is_empty() {
         return Err(anyhow!("No audio devices available after reset."));
     }

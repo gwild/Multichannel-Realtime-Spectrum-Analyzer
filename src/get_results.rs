@@ -2,8 +2,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use log::{debug, warn};
-use crossbeam_queue::ArrayQueue;
+use log::{debug, warn, error};
 use crate::ResynthConfig;
 use crate::resynth::SynthUpdate;
 use tokio::sync::broadcast;
@@ -11,133 +10,9 @@ use tokio::sync::broadcast;
 // Define type alias
 type PartialsData = Vec<Vec<(f32, f32)>>;
 
-pub fn start_update_thread(
-    config: Arc<Mutex<ResynthConfig>>,
-    shutdown_flag: Arc<AtomicBool>,
-    update_queue: Arc<ArrayQueue<SynthUpdate>>,
-    mut partials_rx: broadcast::Receiver<PartialsData>,
-) {
-    debug!(target: "get_results", "Starting update thread for FFT data retrieval");
-
-    thread::spawn(move || {
-        let mut last_update = Instant::now();
-        let mut update_count = 0;
-        let mut last_update_rate = 1.0;  // Track last update rate
-        let mut consecutive_failures = 0;  // Track consecutive queue push failures
-        
-        debug!(target: "get_results", "Update thread started, beginning main loop");
-        
-        while !shutdown_flag.load(Ordering::Relaxed) {
-            let update_rate = {
-                let config = config.lock().unwrap();
-                config.update_rate
-            };
-
-            // If update rate changed, wait for queue to clear
-            if (update_rate - last_update_rate).abs() > 1e-6 {
-                debug!(target: "get_results", 
-                    "Update rate changed: {:.3}s -> {:.3}s, waiting for queue to clear",
-                    last_update_rate, update_rate
-                );
-                while update_queue.len() > 0 && !shutdown_flag.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                last_update_rate = update_rate;
-                last_update = Instant::now();  // Reset timing after rate change
-            }
-
-            if last_update.elapsed().as_secs_f32() >= update_rate {
-                let config_snapshot = config.lock().unwrap().snapshot();
-                debug!(target: "get_results", 
-                    "Update #{} - Config: gain={:.3}, freq_scale={:.3}, update_rate={:.3}s",
-                    update_count + 1,
-                    config_snapshot.gain,
-                    config_snapshot.freq_scale,
-                    config_snapshot.update_rate
-                );
-
-                // --- Get latest partials from broadcast channel --- 
-                let mut latest_partials: Option<PartialsData> = None;
-                loop {
-                    match partials_rx.try_recv() {
-                        Ok(partials) => {
-                            latest_partials = Some(partials);
-                        }
-                        Err(broadcast::error::TryRecvError::Empty) => break, // No new data
-                        Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            warn!(target: "get_results", "Partials receiver lagged by {} messages.", n);
-                            break; // Got latest available
-                        }
-                        Err(broadcast::error::TryRecvError::Closed) => {
-                            warn!(target: "get_results", "Partials broadcast channel closed.");
-                            shutdown_flag.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                }
-                // --- End get partials ---
-
-                // Process if we received new partials
-                if let Some(current_partials_data) = latest_partials {
-                    update_count += 1;
-                    
-                    // Create update with received (linear) partials
-                    let update = SynthUpdate {
-                        partials: current_partials_data, // Use received data directly
-                        gain: config_snapshot.gain,
-                        freq_scale: config_snapshot.freq_scale,
-                        update_rate: config_snapshot.update_rate,
-                    };
-
-                    // Try to push update to queue with backoff on failure
-                    match update_queue.push(update) {
-                        Ok(_) => {
-                            debug!(target: "get_results", 
-                                "Successfully pushed update #{} to synthesis queue", 
-                                update_count
-                            );
-                            consecutive_failures = 0;  // Reset failure counter on success
-                            last_update = Instant::now();
-                        },
-                        Err(_) => {
-                            consecutive_failures += 1;
-                            warn!(target: "get_results", 
-                                "Failed to push update #{} to synthesis queue (attempt {})", 
-                                update_count,
-                                consecutive_failures
-                            );
-                            
-                            // Exponential backoff on consecutive failures
-                            let backoff = Duration::from_millis(
-                                (50 * consecutive_failures as u64).min(1000)
-                            );
-                            thread::sleep(backoff);
-                            
-                            // If too many failures, force a rate change pause
-                            if consecutive_failures > 5 {
-                                warn!(target: "get_results", "Too many consecutive failures, forcing pause");
-                                thread::sleep(Duration::from_millis(500));
-                                consecutive_failures = 0;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Adaptive sleep based on update rate and queue state
-            let queue_usage = update_queue.len() as f32 / update_queue.capacity() as f32;
-            let base_sleep = if queue_usage > 0.8 {
-                // Sleep longer if queue is nearly full
-                Duration::from_millis(50)
-            } else {
-                let time_to_next = (update_rate - last_update.elapsed().as_secs_f32()).max(0.0);
-                Duration::from_secs_f32((time_to_next / 10.0).max(0.001))
-            };
-            thread::sleep(base_sleep);
-        }
-        debug!(target: "get_results", "Update thread shutting down after {} updates", update_count);
-    });
-}
+// The old start_update_thread function that used ArrayQueue and ResynthConfig.snapshot()
+// has been removed entirely as it was causing compilation errors and is no longer used.
+// The active function is start_update_thread_with_sender.
 
 pub fn start_update_thread_with_sender(
     config: Arc<Mutex<ResynthConfig>>,
@@ -148,95 +23,109 @@ pub fn start_update_thread_with_sender(
     debug!(target: "get_results", "Starting update thread for FFT data retrieval (mpsc sender)");
 
     thread::spawn(move || {
-        let mut last_update = Instant::now();
         let mut update_count = 0;
-        let mut last_update_rate = 1.0;
-        let mut consecutive_failures = 0;
-        debug!(target: "get_results", "Update thread started, beginning main loop (mpsc sender)");
-        while !shutdown_flag.load(Ordering::Relaxed) {
-            let update_rate = {
-                let config = config.lock().unwrap();
-                config.update_rate
-            };
-            if (update_rate - last_update_rate).abs() > 1e-6 {
-                debug!(target: "get_results", 
-                    "Update rate changed: {:.3}s -> {:.3}s, pausing for rate change",
-                    last_update_rate, update_rate
-                );
-                last_update_rate = update_rate;
-                last_update = Instant::now();
-            }
-            if last_update.elapsed().as_secs_f32() >= update_rate {
-                let config_snapshot = config.lock().unwrap().snapshot();
-                debug!(target: "get_results", 
-                    "Update #{}: Preparing update - Config (used for freq/rate): gain={:.3}, freq_scale={:.3}, update_rate={:.3}s",
-                    update_count + 1,
-                    config_snapshot.gain, // Gain from config is NOT used for resynth now
-                    config_snapshot.freq_scale,
-                    config_snapshot.update_rate
-                );
+        let mut last_processed_gui_update_rate = config.lock().unwrap().update_rate; // Initialize with current GUI rate
+        let mut last_actual_update_sent_time = Instant::now(); // Tracks time since last SynthUpdate was sent
+        let mut consecutive_send_failures = 0;
 
-                // --- Get latest partials from broadcast channel --- 
-                let mut latest_partials: Option<PartialsData> = None;
+        debug!(target: "get_results", "Update thread started, beginning main loop (mpsc sender). Initial GUI rate: {:.3}s", last_processed_gui_update_rate);
+        
+        while !shutdown_flag.load(Ordering::Relaxed) {
+            let current_gui_config_guard = config.lock().unwrap();
+            let current_gui_update_rate = current_gui_config_guard.update_rate;
+            let current_gain = current_gui_config_guard.gain;
+            let current_freq_scale = current_gui_config_guard.freq_scale;
+            drop(current_gui_config_guard); // Release lock as soon as possible
+
+            let mut should_send_update_now = false;
+
+            // Condition 1: GUI update rate has changed significantly since last processing cycle.
+            if (current_gui_update_rate - last_processed_gui_update_rate).abs() > 1e-6 {
+                debug!(target: "get_results", 
+                       "GUI Update rate changed: {:.3}s -> {:.3}s. Forcing immediate SynthUpdate generation.",
+                       last_processed_gui_update_rate, current_gui_update_rate);
+                last_processed_gui_update_rate = current_gui_update_rate; // Update the rate we've now processed
+                should_send_update_now = true;
+            }
+
+            // Condition 2: Timer for the current (potentially new) GUI update rate has elapsed since the last send.
+            if !should_send_update_now && last_actual_update_sent_time.elapsed().as_secs_f32() >= current_gui_update_rate {
+                debug!(target: "get_results", 
+                       "Scheduled update interval of {:.3}s elapsed. Generating SynthUpdate.", 
+                       current_gui_update_rate);
+                should_send_update_now = true;
+            }
+
+            if should_send_update_now {
+                debug!(target: "get_results", "Condition met to send SynthUpdate.");
+                let mut latest_partials_data_for_this_cycle: Option<PartialsData> = None;
+
                 loop {
                     match partials_rx.try_recv() {
                         Ok(partials) => {
-                            latest_partials = Some(partials);
+                            latest_partials_data_for_this_cycle = Some(partials);
                         }
-                        Err(broadcast::error::TryRecvError::Empty) => break, // No new data
+                        Err(broadcast::error::TryRecvError::Empty) => {
+                            break;
+                        }
                         Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                            warn!(target: "get_results", "Partials receiver (mpsc) lagged by {} messages.", n);
-                            break; // Got latest available
+                            warn!(target: "get_results", "Partials receiver lagged by {} messages. Attempting to clear and get newest.", n);
+                            continue;
                         }
                         Err(broadcast::error::TryRecvError::Closed) => {
-                            warn!(target: "get_results", "Partials broadcast channel closed (mpsc).");
+                            warn!(target: "get_results", "Partials broadcast channel closed (mpsc). Shutting down update thread.");
                             shutdown_flag.store(true, Ordering::Relaxed);
-                            break;
+                            return;
                         }
                     }
                 }
-                // --- End get partials ---
 
-                if let Some(linear_partials_data) = latest_partials {
+                debug!(target: "get_results", "Partials receiver processing complete. latest_partials_data_for_this_cycle is Some: {}", latest_partials_data_for_this_cycle.is_some());
+
+                if let Some(linear_partials_data) = latest_partials_data_for_this_cycle {
                     update_count += 1;
+                    debug!(target: "get_results", 
+                           "Update #{}: Preparing SynthUpdate - Partials count: {}, Gain: {:.2}, FreqScale: {:.2}, GUIRate: {:.3}s",
+                           update_count,
+                           linear_partials_data.len(), 
+                           current_gain, 
+                           current_freq_scale, 
+                           current_gui_update_rate);
+                    debug!(target: "get_results", "Preparing SynthUpdate. Partials data: {} channels, first partial of ch0: {:?}", linear_partials_data.len(), linear_partials_data.get(0).and_then(|ch| ch.get(0)));
 
-                    // Create the update with the received linear partials
-                    let update = SynthUpdate {
-                        partials: linear_partials_data, // Use received linear partials directly
-                        gain: config_snapshot.gain, 
-                        freq_scale: config_snapshot.freq_scale,
-                        update_rate: config_snapshot.update_rate,
+                    let update_payload = SynthUpdate {
+                        partials: linear_partials_data,
+                        gain: current_gain, 
+                        freq_scale: current_freq_scale,
+                        update_rate: current_gui_update_rate,
                     };
 
-                    match update_sender.send(update) {
+                    debug!(target: "get_results", "Attempting to send SynthUpdate to wavegen_thread.");
+                    match update_sender.send(update_payload) {
                         Ok(_) => {
                             debug!(target: "get_results", 
-                                "Successfully sent update #{} to wavegen thread (mpsc)", 
-                                update_count
-                            );
-                            consecutive_failures = 0;
-                            last_update = Instant::now();
+                                   "Successfully sent SynthUpdate #{} to wavegen thread (mpsc)", 
+                                   update_count);
+                            last_actual_update_sent_time = Instant::now();
+                            consecutive_send_failures = 0;
                         },
                         Err(e) => {
-                            consecutive_failures += 1;
+                            consecutive_send_failures += 1;
                             warn!(target: "get_results", 
-                                "Failed to send update #{} to wavegen thread (attempt {}): {}", 
-                                update_count,
-                                consecutive_failures,
-                                e
-                            );
-                            let backoff = Duration::from_millis((50 * consecutive_failures as u64).min(1000));
-                            thread::sleep(backoff);
-                            if consecutive_failures > 5 {
-                                warn!(target: "get_results", "Too many consecutive failures, forcing pause");
-                                thread::sleep(Duration::from_millis(500));
-                                consecutive_failures = 0;
+                                  "Failed to send SynthUpdate #{} to wavegen thread (attempt {}): {}. Wavegen may have shut down.", 
+                                  update_count,
+                                  consecutive_send_failures,
+                                  e);
+                            if consecutive_send_failures > 5 {
+                                error!(target: "get_results", "Too many consecutive send failures or channel closed. Shutting down update thread.");
+                                shutdown_flag.store(true, Ordering::Relaxed);
+                                return;
                             }
                         }
                     }
-                }
+                } 
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(10));
         }
         debug!(target: "get_results", "Update thread shutting down after {} updates (mpsc sender)", update_count);
     });
