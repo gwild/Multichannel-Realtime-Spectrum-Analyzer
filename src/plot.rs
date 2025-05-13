@@ -24,6 +24,8 @@ use egui::FontFamily;
 use egui::Color32;
 use tokio::sync::broadcast; // Added import
 use crate::display::SpectralDisplay; // Added import
+use std::sync::mpsc; // Add this for mpsc::Sender
+use crate::get_results::GuiParameter; // Add this for the enum
 
 // Define type alias
 type PartialsData = Vec<Vec<(f32, f32)>>; 
@@ -109,7 +111,8 @@ pub struct MyApp {
     start_time: Arc<Instant>,
     sample_rate: f64,
     show_results: bool,
-    partials_rx: Option<broadcast::Receiver<PartialsData>>, // Added receiver field
+    partials_rx: Option<broadcast::Receiver<PartialsData>>,
+    gui_param_tx: mpsc::Sender<GuiParameter>, // Add this field
     // Fields for buffer size debouncing
     desired_buffer_size: Option<usize>,
     buffer_debounce_timer: Option<Instant>,
@@ -127,7 +130,8 @@ impl MyApp {
         spectrograph_history: Arc<Mutex<VecDeque<SpectrographSlice>>>,
         start_time: Arc<Instant>,
         sample_rate: f64,
-        mut partials_rx: broadcast::Receiver<PartialsData>, // Added receiver parameter
+        partials_rx: broadcast::Receiver<PartialsData>,
+        gui_param_tx: mpsc::Sender<GuiParameter>, // Add this parameter
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -158,7 +162,8 @@ impl MyApp {
             start_time,
             sample_rate,
             show_results: true,
-            partials_rx: Some(partials_rx), // Store the receiver
+            partials_rx: Some(partials_rx),
+            gui_param_tx, // Store the sender
             // Initialize debounce fields
             desired_buffer_size: None,
             buffer_debounce_timer: None,
@@ -275,7 +280,7 @@ impl eframe::App for MyApp {
         true
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // --- Buffer Size Debounce Check --- 
         let debounce_duration = Duration::from_millis(300);
         let mut size_to_apply_after_debounce: Option<usize> = None; // Variable to hold the size if debounce passes
@@ -466,10 +471,12 @@ impl eframe::App for MyApp {
                 // Volume slider (exactly matching update rate slider pattern)
                 ui.label("Volume:");
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                    ui.add(
+                    if ui.add(
                         egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0)
                             .text(""),
-                    );
+                    ).changed() {
+                        self.gui_param_tx.send(GuiParameter::Gain(resynth_config.gain)).unwrap_or_else(|e| error!("Failed to send Gain update: {}", e));
+                    }
                 }
              
             
@@ -478,11 +485,12 @@ impl eframe::App for MyApp {
                 // Add Frequency Scale control right after Volume
                 ui.label("Freq Scale:");
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
-                    // Create a custom widget with up/down buttons for octave changes
+                    let mut freq_scale_changed = false;
                     ui.horizontal(|ui| {
                         // Down button (divide by 2 = one octave down)
                         if ui.button("▼").clicked() {
                             resynth_config.freq_scale /= 2.0;
+                            freq_scale_changed = true;
                         }
                         
                         // Display current value with 2 decimal places in a compact field
@@ -496,6 +504,7 @@ impl eframe::App for MyApp {
                             if let Ok(new_value) = freq_text.parse::<f32>() {
                                 if new_value > 0.0 {  // Ensure positive value
                                     resynth_config.freq_scale = new_value;
+                                    freq_scale_changed = true;
                                 }
                             }
                         }
@@ -503,8 +512,12 @@ impl eframe::App for MyApp {
                         // Up button (multiply by 2 = one octave up)
                         if ui.button("▲").clicked() {
                             resynth_config.freq_scale *= 2.0;
+                            freq_scale_changed = true;
                         }
                     });
+                    if freq_scale_changed {
+                        self.gui_param_tx.send(GuiParameter::FreqScale(resynth_config.freq_scale)).unwrap_or_else(|e| error!("Failed to send FreqScale update: {}", e));
+                    }
                 }
                 
                 ui.separator();
@@ -560,11 +573,13 @@ impl eframe::App for MyApp {
             ui.horizontal(|ui| {
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
                     ui.label("Resynth Update Rate:");
-                    ui.add(
-                        egui::Slider::new(&mut resynth_config.update_rate, 0.01..=60.0)
+                    if ui.add(
+                        egui::Slider::new(&mut resynth_config.update_rate, 0.01..=30.0)
                             .text("seconds")
                             .logarithmic(true)
-                    );
+                    ).changed() {
+                        self.gui_param_tx.send(GuiParameter::UpdateRate(resynth_config.update_rate)).unwrap_or_else(|e| error!("Failed to send UpdateRate update: {}", e));
+                    }
                 }
             }); 
 
@@ -585,8 +600,7 @@ impl eframe::App for MyApp {
             }
 
             // Calculate nyquist limit based on current buffer size for general use
-            let current_buffer_size = *self.buffer_size.lock().unwrap();
-            let mut nyquist_limit = (self.sample_rate / 2.0).min(current_buffer_size as f64 / 2.0);
+            let current_buffer_size = *self.buffer_size.lock().unwrap(); // THIS STAYS
 
             // 8) Reset button
             let mut needs_buffer_reset = false; // Variable to track if buffer reset is needed
@@ -594,13 +608,14 @@ impl eframe::App for MyApp {
                 { // Scope for fft_config lock
                     let mut fft_config = self.fft_config.lock().unwrap();
                     let current_num_channels = fft_config.num_channels; // Preserve
+                    let current_num_partials = fft_config.num_partials; // Preserve num_partials
 
                     // Start with a fresh default from the struct
                     *fft_config = FFTConfig::default();
 
                     // Re-apply essential overrides that main.rs would do for a default startup:
                     fft_config.num_channels = current_num_channels; // Restore preserved num_channels
-                    fft_config.num_partials = DEFAULT_NUM_PARTIALS; // Reset to the application default
+                    fft_config.num_partials = current_num_partials; // Restore preserved num_partials
 
                     // Replicate frames_per_buffer logic from main.rs using self.sample_rate
                     fft_config.frames_per_buffer = if cfg!(target_os = "linux") {
@@ -661,8 +676,8 @@ impl eframe::App for MyApp {
                     // --- IMPORTANT --- 
                     // If buffer will be reset, recalculate the nyquist limit for *this frame's* slider range
                     // based on the target default buffer size.
-                    nyquist_limit = (self.sample_rate / 2.0).min(DEFAULT_BUFFER_SIZE as f64 / 2.0);
-                    debug!("Reset triggered buffer change, overriding slider range limit for this frame to {}", nyquist_limit);
+                    let nyquist_limit_for_debug_log = (self.sample_rate / 2.0).min(DEFAULT_BUFFER_SIZE as f64 / 2.0);
+                    debug!("Reset triggered buffer change, overriding slider range limit for this frame to {}", nyquist_limit_for_debug_log);
                 }
             }
 

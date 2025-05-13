@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use portaudio as pa;
-use log::{info, error, warn, debug};
+use log::{info, error, debug};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
 use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};

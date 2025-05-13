@@ -286,7 +286,7 @@ pub fn start_fft_processing(
             drop(config);
 
             // Use cached_config instead of taking a new lock
-            let num_partials = cached_config.num_partials;
+            let _num_partials = cached_config.num_partials;
 
             // Process each channel to get both partial and line data
             let mut all_channels_partials = Vec::with_capacity(selected_channels.len());

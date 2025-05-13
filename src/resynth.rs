@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
 use log::{info, error, debug, warn};
-use crate::get_results::{start_update_thread_with_sender};
+use crate::get_results::{start_update_thread_with_sender, GuiParameter};
 use tokio::sync::broadcast;
 
 // Define type alias (same as other files)
@@ -19,9 +19,10 @@ const OUTPUT_BUFFER_SIZE: usize = 4096;  // Smaller on non-Linux platforms
 
 pub const DEFAULT_UPDATE_RATE: f32 = 1.0; // Default update rate in seconds
 // Maximum possible update rate from the GUI slider in plot.rs (currently 0.01 to 60.0 seconds)
-const MAX_POSSIBLE_GUI_UPDATE_RATE_SECONDS: f32 = 60.0;
+const MAX_POSSIBLE_GUI_UPDATE_RATE_SECONDS: f32 = 30.0;
 // This will be our fixed actual length for all generated audio segments.
 const FIXED_AUDIO_SEGMENT_LEN_SECONDS: f32 = MAX_POSSIBLE_GUI_UPDATE_RATE_SECONDS;
+const INSTANT_MUTE_FADE_DURATION_SECONDS: f32 = 0.020; // 20ms for a quick mute
 
 /// Configuration for resynthesis
 pub struct ResynthConfig {
@@ -106,23 +107,30 @@ impl WaveSynth {
     }
 
     /// Called by the outer timed loop in start_resynth_thread to initiate a switch.
-    pub fn prepare_for_crossfade(&mut self, new_segment: AudioSegment, gui_update_rate_for_fade: f32) {
+    pub fn prepare_for_crossfade(&mut self, new_segment: AudioSegment, gui_update_rate_for_fade: f32, new_segment_target_gain: f32) {
         // current_segment is guaranteed to be Some due to initialization in new().
         // The first call to this function will be with the first *actual* (non-silent) segment.
-        debug!(target: "resynth::playback", "New segment received for crossfade. Current playing segment len: {}, New segment len: {}. Fade rate for crossfade: {:.3}s",
+        debug!(target: "resynth::playback", "New segment received for crossfade. Current playing segment len: {}, New segment len: {}. Base fade rate: {:.3}s, Target gain for new segment: {:.3}",
             self.current_segment.as_ref().map_or(0, |s| s.len_frames),
             new_segment.len_frames,
-            gui_update_rate_for_fade
+            gui_update_rate_for_fade,
+            new_segment_target_gain
         );
 
         self.next_segment = Some(new_segment);
         self.next_cursor_frames = 0; // New segment starts from its beginning for the fade-in
 
-        // The fade duration is 1/3 of the *current GUI update rate*.
-        self.total_fade_duration_frames = ((gui_update_rate_for_fade / 3.0) * self.sample_rate).max(1.0) as usize;
+        let fade_duration_seconds = if new_segment_target_gain < 0.001 { // If gain is effectively zero
+            debug!(target: "resynth::playback", "Target gain is near zero ({:.3}). Overriding fade to be very short ({:.3}s) for mute effect.", new_segment_target_gain, INSTANT_MUTE_FADE_DURATION_SECONDS);
+            INSTANT_MUTE_FADE_DURATION_SECONDS
+        } else {
+            gui_update_rate_for_fade / 3.0 // Standard fade: 1/3 of the current GUI update rate
+        };
+        
+        self.total_fade_duration_frames = (fade_duration_seconds * self.sample_rate).max(1.0) as usize;
         self.fade_progress_frames = 0;
         self.play_state = SynthPlayState::Crossfading;
-        debug!(target: "resynth::playback", "Crossfade prepared: {} total fade frames.", self.total_fade_duration_frames);
+        debug!(target: "resynth::playback", "Crossfade prepared: {} total fade frames (derived from {:.3}s duration).", self.total_fade_duration_frames, fade_duration_seconds);
     }
 
     /// Fills the output buffer with audio samples. Called by PortAudio callback.
@@ -140,6 +148,9 @@ impl WaveSynth {
                         if self.current_cursor_frames < curr.len_frames {
                             sample_l = curr.left_samples[self.current_cursor_frames];
                             sample_r = curr.right_samples[self.current_cursor_frames];
+                            if self.current_cursor_frames < 5 { // Log first few samples of a playing segment
+                                debug!(target: "resynth::playback_detail", "Playing frame {}: L={:.4}, R={:.4} from current_segment (len {})", self.current_cursor_frames, sample_l, sample_r, curr.len_frames);
+                            }
                             self.current_cursor_frames += 1;
                         } else {
                             // Current segment (could be initial silence or a played-out real segment) finished.
@@ -181,6 +192,12 @@ impl WaveSynth {
 
                     sample_l = s_l_curr * fade_out_factor + s_l_next * fade_in_factor;
                     sample_r = s_r_curr * fade_out_factor + s_r_next * fade_in_factor;
+
+                    if self.fade_progress_frames < 5 { // Log first few samples of a crossfade
+                        debug!(target: "resynth::playback_detail", 
+                               "Crossfading frame {}: s_l_curr={:.4}, s_r_curr={:.4}, s_l_next={:.4}, s_r_next={:.4}, fade_ratio={:.4} => final_L={:.4}, final_R={:.4}", 
+                               self.fade_progress_frames, s_l_curr, s_r_curr, s_l_next, s_r_next, fade_ratio, sample_l, sample_r);
+                    }
 
                     // Advance cursor for the outgoing current_segment if it's still providing samples
                     if self.current_segment.is_some() && self.current_cursor_frames < self.current_segment.as_ref().unwrap().len_frames {
@@ -244,7 +261,7 @@ impl WaveSynth {
 
 /// Generates audio segments based on SynthUpdate and places them into a shared slot.
 fn start_wavegen_thread(
-    mut update_rx: mpsc::Receiver<SynthUpdate>, // Receives updates from get_results
+    update_rx: mpsc::Receiver<SynthUpdate>, // Receives updates from get_results
     incoming_segment_slot: Arc<Mutex<Option<AudioSegment>>>,
     sample_rate: f32,
     shutdown_flag: Arc<AtomicBool>,
@@ -255,65 +272,112 @@ fn start_wavegen_thread(
 
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
-            match update_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(update) => {
-                    debug!(target: "resynth::wavegen", "Received SynthUpdate. Partials data: {} channels, first partial of ch0: {:?}", update.partials.len(), update.partials.get(0).and_then(|ch| ch.get(0)));
-                    // The GUI update rate from `update.update_rate` is primarily used by get_results for send frequency
-                    // and by the main resynth loop for polling and crossfade duration.
-                    // Here, we always fill the entire fixed_segment_len_frames.
-                    debug!(target: "resynth::wavegen",
-                        "Received SynthUpdate (GUI rate: {:.3}s). Generating full segment of {} frames. Gain: {:.2}, FreqScale: {:.2}",
-                        update.update_rate, fixed_segment_len_frames, update.gain, update.freq_scale);
-
-                    // Initialize buffers to the fixed maximum length, filled with silence (will be overwritten).
-                    let mut left_samples = vec![0.0f32; fixed_segment_len_frames];
-                    let mut right_samples = vec![0.0f32; fixed_segment_len_frames];
-
-                    let stereo_partials_arrays = WaveSynth::combine_partials_to_stereo(&update.partials);
-                    let wavegen_start_time = Instant::now();
-
-                    for ch_idx in 0..2 { // 0 for Left, 1 for Right
-                        let target_buffer = if ch_idx == 0 { &mut left_samples } else { &mut right_samples };
-                        let source_partials = &stereo_partials_arrays[ch_idx];
-
-                        // Synthesize for the entire fixed_segment_len_frames.
-                        for frame_idx in 0..fixed_segment_len_frames { 
-                            let time = frame_idx as f32 / sample_rate;
-                            let mut sample_val = 0.0f32;
-
-                            for &(freq, amp) in source_partials.iter() {
-                                if freq > 0.0 && amp > 0.0 {
-                                    let phase = 2.0 * std::f32::consts::PI * (freq * update.freq_scale) * time;
-                                    sample_val += amp * phase.sin();
-                                }
-                            }
-                            target_buffer[frame_idx] = sample_val * update.gain;
-                        }
-                    }
-                    
-                    let wavegen_duration = wavegen_start_time.elapsed();
-                    debug!(target: "resynth::wavegen", "Finished generating waveform data for {} frames. Duration: {:?}", fixed_segment_len_frames, wavegen_duration);
-
-                    let new_segment = AudioSegment {
-                        left_samples,
-                        right_samples,
-                        len_frames: fixed_segment_len_frames, // The actual length of the sample vectors
-                    };
-
-                    debug!(target: "resynth::wavegen", "Generated new audio segment. Actual Length: {} frames.", new_segment.len_frames);
-                    
-                    let mut slot_guard = incoming_segment_slot.lock().unwrap();
-                    *slot_guard = Some(new_segment);
-                    debug!(target: "resynth::wavegen", "New segment placed in incoming_segment_slot.");
-
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Block for the definitive next update to process for a new segment
+            let mut current_update = match update_rx.recv() { 
+                Ok(upd) => upd,
+                Err(_) => { // Changed from mpsc::RecvError for clarity with blocking recv
                     error!(target: "resynth::wavegen", "Update channel disconnected. Shutting down wavegen thread.");
                     break;
                 }
+            };
+
+            debug!(target: "resynth::wavegen", 
+                   "Starting new segment synthesis with initial Gain: {:.2}, FScale: {:.2}, Partials: {} chans", 
+                   current_update.gain, current_update.freq_scale, current_update.partials.len());
+
+            let mut left_samples = vec![0.0f32; fixed_segment_len_frames];
+            let mut right_samples = vec![0.0f32; fixed_segment_len_frames];
+            // Initial combination of partials based on the starting update
+            let mut stereo_partials_arrays = WaveSynth::combine_partials_to_stereo(&current_update.partials);
+
+            const SUB_CHUNK_FRAMES: usize = 4096; // Approx 85ms at 48kHz. Tune as needed.
+            let wavegen_segment_start_time = Instant::now();
+
+            for frame_chunk_start in (0..fixed_segment_len_frames).step_by(SUB_CHUNK_FRAMES) {
+                if shutdown_flag.load(Ordering::Relaxed) { break; }
+
+                // Before synthesizing this sub-chunk, check for newer updates from get_results
+                match update_rx.try_recv() {
+                    Ok(newly_arrived_update) => {
+                        // Compare critical parameters to see if a meaningful change occurred
+                        if newly_arrived_update.gain != current_update.gain || 
+                           newly_arrived_update.freq_scale != current_update.freq_scale || 
+                           newly_arrived_update.partials.len() != current_update.partials.len() || // Basic check for partials change
+                           !newly_arrived_update.partials.iter().zip(current_update.partials.iter()).all(|(v1,v2)| v1.len() == v2.len()) // Deeper check if needed
+                        {
+                            debug!(target: "resynth::wavegen",
+                                   "Mid-segment parameter change detected. Old Gain: {:.2} -> New Gain: {:.2}. Old FScale: {:.2} -> New FScale {:.2}. Switching params.",
+                                   current_update.gain, newly_arrived_update.gain, current_update.freq_scale, newly_arrived_update.freq_scale);
+                            current_update = newly_arrived_update; // Adopt new parameters
+                            // Re-process partials if they have changed structure or content significantly
+                            stereo_partials_arrays = WaveSynth::combine_partials_to_stereo(&current_update.partials); 
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => { /* No new update, continue with current_update */ }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error!(target: "resynth::wavegen", "Update channel disconnected mid-segment. Shutting down.");
+                        shutdown_flag.store(true, Ordering::Relaxed); // Signal global shutdown if not already
+                        break; 
+                    }
+                }
+                if shutdown_flag.load(Ordering::Relaxed) { break; } // Check again after try_recv
+
+                // Synthesize one sub-chunk using current_update parameters
+                for frame_idx_offset in 0..SUB_CHUNK_FRAMES {
+                    let frame_idx = frame_chunk_start + frame_idx_offset;
+                    if frame_idx >= fixed_segment_len_frames { break; }
+
+                    let time = frame_idx as f32 / sample_rate;
+                    
+                    for ch_idx in 0..2 { // 0 for Left, 1 for Right
+                        let target_buffer = if ch_idx == 0 { &mut left_samples } else { &mut right_samples };
+                        let source_partials = &stereo_partials_arrays[ch_idx];
+                        let mut sample_val = 0.0f32;
+
+                        for &(freq, amp) in source_partials.iter() {
+                            if freq > 0.0 && amp > 0.0 { // Ensure partials are valid
+                                let phase = 2.0 * std::f32::consts::PI * (freq * current_update.freq_scale) * time;
+                                sample_val += amp * phase.sin();
+                            }
+                        }
+                        target_buffer[frame_idx] = sample_val * current_update.gain;
+                    }
+                }
+            } // End of sub-chunk synthesis loop
+
+            if shutdown_flag.load(Ordering::Relaxed) { break; } // Check after main synthesis loop for the segment
+            
+            let segment_synthesis_duration = wavegen_segment_start_time.elapsed();
+            // Log the gain that was active at the *end* of synthesis for this segment.
+            debug!(target: "resynth::wavegen", 
+                   "Finished generating one full segment ({} frames, potentially with mid-params change). Duration: {:?}. Effective Gain at end: {:.2}", 
+                   fixed_segment_len_frames, segment_synthesis_duration, current_update.gain);
+
+            // Detailed sample logging (using the gain from the *final* state of current_update for this segment)
+            let final_gain_for_segment_log = current_update.gain;
+            if fixed_segment_len_frames > 0 {
+                let num_samples_to_log = 5.min(fixed_segment_len_frames);
+                let l_samples_head: Vec<String> = left_samples.iter().take(num_samples_to_log).map(|s| format!("{:.4}", s)).collect();
+                let r_samples_head: Vec<String> = right_samples.iter().take(num_samples_to_log).map(|s| format!("{:.4}", s)).collect();
+                debug!(target: "resynth::wavegen_detail", 
+                       "Generated segment samples (final gain for log: {:.4}). Left[0..{}]: [{}]. Right[0..{}]: [{}]
+", 
+                       final_gain_for_segment_log, 
+                       num_samples_to_log, l_samples_head.join(", "), 
+                       num_samples_to_log, r_samples_head.join(", "));
             }
-        }
+
+            let new_segment = AudioSegment {
+                left_samples,
+                right_samples,
+                len_frames: fixed_segment_len_frames, 
+            };
+            
+            let mut slot_guard = incoming_segment_slot.lock().unwrap();
+            *slot_guard = Some(new_segment);
+            debug!(target: "resynth::wavegen", "New segment placed in incoming_segment_slot.");
+
+        } // End of main `while !shutdown_flag` loop
         info!(target: "resynth::wavegen", "Wavegen thread shutting down.");
     });
 }
@@ -324,9 +388,10 @@ pub fn start_resynth_thread(
     device_index: pa::DeviceIndex,
     sample_rate: f64, // sample_rate for PortAudio and wave generation
     shutdown_flag: Arc<AtomicBool>,
-    mut partials_rx_broadcast: broadcast::Receiver<PartialsData>, // From FFT analysis
+    partials_rx_broadcast: broadcast::Receiver<PartialsData>, // From FFT analysis
     _num_input_channels: usize, // Informational, used by get_results
     _num_partials_config: usize, // Informational, used by get_results
+    gui_param_rx: mpsc::Receiver<GuiParameter>, // NEW: Accept the receiver
 ) {
     debug!(target: "resynth::main", "Initializing resynthesis thread. Sample rate: {}", sample_rate);
     let sample_rate_f32 = sample_rate as f32;
@@ -346,6 +411,7 @@ pub fn start_resynth_thread(
         Arc::clone(&shutdown_flag),
         update_tx_for_wavegen, // Sender for SynthUpdate
         partials_rx_broadcast, // Receiver of PartialsData from FFT
+        gui_param_rx, // NEW: Pass it through
     );
 
     // Start the wave generation thread
@@ -372,13 +438,16 @@ pub fn start_resynth_thread(
 
         while !resynth_thread_shutdown_flag.load(Ordering::Relaxed) {
             // --- PortAudio Stream Management ---
-            let current_resynth_config = resynth_config_accessor.lock().unwrap();
-            if current_resynth_config.needs_restart.load(Ordering::Relaxed) {
+            let current_resynth_config_locked = resynth_config_accessor.lock().unwrap(); // Lock once for this iteration
+            if current_resynth_config_locked.needs_restart.load(Ordering::Relaxed) {
                 needs_pa_restart_due_to_config = true;
-                current_resynth_config.needs_restart.store(false, Ordering::Relaxed); // Consume flag
+                current_resynth_config_locked.needs_restart.store(false, Ordering::Relaxed); // Consume flag
                 debug!(target: "resynth::main", "PA stream restart explicitly requested by config.");
             }
-            drop(current_resynth_config); // Release lock
+            // Extract values needed later before dropping lock
+            let gui_driven_update_rate_for_polling = current_resynth_config_locked.update_rate;
+            let current_target_gain_for_fade_logic = current_resynth_config_locked.gain;
+            drop(current_resynth_config_locked); // Release lock early
 
             let should_attempt_pa_restart = pa_stream.is_none() || needs_pa_restart_due_to_config;
             let backoff_duration = if consecutive_pa_errors > 0 {
@@ -416,22 +485,23 @@ pub fn start_resynth_thread(
             }
 
             // --- Timed Segment Switching Logic ---
-            let gui_driven_update_rate = resynth_config_accessor.lock().unwrap().update_rate;
+            // gui_driven_update_rate is now gui_driven_update_rate_for_polling
+            // current_target_gain_for_fade_logic is available here
             
             // Check for a newly generated segment from wavegen_thread
             let new_segment_option = incoming_segment_slot.lock().unwrap().take();
 
             if let Some(new_segment) = new_segment_option {
-                debug!(target: "resynth::main", "New segment taken from slot. Preparing for crossfade. GUI rate for fade: {:.3}s", gui_driven_update_rate);
-                pa_synth_instance_accessor.lock().unwrap().prepare_for_crossfade(new_segment, gui_driven_update_rate);
+                debug!(target: "resynth::main", "New segment taken from slot. Preparing for crossfade. Base GUI rate for fade: {:.3}s, Current target gain: {:.3}", gui_driven_update_rate_for_polling, current_target_gain_for_fade_logic);
+                pa_synth_instance_accessor.lock().unwrap().prepare_for_crossfade(new_segment, gui_driven_update_rate_for_polling, current_target_gain_for_fade_logic);
             }
             
             // The sleep duration determines how often we check for new segments and potentially switch.
             // This should align with the GUI update rate to make switches timely.
             // A shorter sleep allows faster reaction to new segments in the slot if get_results is faster than GUI rate.
             // Let's sleep for a fraction of the GUI update rate to be responsive.
-            let sleep_time_for_switch_check = (gui_driven_update_rate / 4.0).max(0.005); // Check fairly often, min 5ms
-            thread::sleep(Duration::from_secs_f32(sleep_time_for_switch_check));
+            let sleep_time_for_switch_check = Duration::from_millis(10); // Check much more frequently (100Hz)
+            thread::sleep(sleep_time_for_switch_check);
         }
 
         // Shutdown PA stream

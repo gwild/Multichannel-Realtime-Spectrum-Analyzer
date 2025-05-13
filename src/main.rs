@@ -21,9 +21,8 @@ use log::{info, error, warn, debug, LevelFilter};
 use fern::Dispatch;
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
-use utils::{MIN_FREQ, MAX_FREQ, DEFAULT_BUFFER_SIZE};
+use utils::{DEFAULT_BUFFER_SIZE};
 use crate::resynth::{ResynthConfig, start_resynth_thread};
-use crate::plot::MyApp;
 use std::thread;
 use std::time::Duration;
 use std::collections::VecDeque;
@@ -33,6 +32,8 @@ use std::fs::OpenOptions;
 use chrono;
 use tokio::sync::broadcast;
 use memmap2::MmapMut;
+use crate::get_results::GuiParameter;
+use std::sync::mpsc;
 
 #[derive(Clone)]
 pub struct SharedMemory {
@@ -466,6 +467,13 @@ async fn run() -> Result<()> {
     // Add before thread creation
     let resynth_config = Arc::new(Mutex::new(ResynthConfig::default()));
 
+    // Create the MPSC channel for GUI parameter updates
+    let (gui_param_tx, gui_param_rx) = mpsc::channel::<GuiParameter>();
+
+    // Create the MPSC channel for SynthUpdate (from get_results to wavegen)
+    // This channel is now managed by start_resynth_thread internally.
+    // let (update_tx_for_wavegen, update_rx_for_wavegen) = mpsc::channel::<crate::resynth::SynthUpdate>();
+
     // After input device selection but before thread creation
     println!("\nAvailable Output Devices:");
     let mut output_devices = Vec::new();
@@ -579,29 +587,31 @@ async fn run() -> Result<()> {
 
     // Start resynthesis thread
     info!("Starting resynthesis...");
-    // Create a receiver for the resynthesis update thread
-    let resynth_partials_rx = partials_tx.subscribe();
+    let resynth_partials_rx_broadcast = partials_tx.subscribe();
     let resynth_thread = std::thread::spawn({
-        let resynth_config = Arc::clone(&resynth_config);
-        let shutdown_flag = Arc::clone(&shutdown_flag);
-        let num_channels = selected_channels.len();
-        let num_partials = num_partials;
+        let resynth_config_clone = Arc::clone(&resynth_config);
+        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+        let num_channels_val = selected_channels.len();
+        let num_partials_val = num_partials;
+        // Pass gui_param_rx to start_resynth_thread
+        let gui_param_rx_for_resynth = gui_param_rx;
+
         move || {
             start_resynth_thread(
-                resynth_config,
+                resynth_config_clone,
                 selected_output_device,
                 selected_sample_rate,
-                shutdown_flag,
-                resynth_partials_rx,
-                num_channels,
-                num_partials,
+                shutdown_flag_clone,
+                resynth_partials_rx_broadcast, // This is broadcast::Receiver<PartialsData>
+                num_channels_val,
+                num_partials_val,
+                gui_param_rx_for_resynth, // Pass the GuiParameter receiver here
             );
         }
     });
 
     // Start GUI
     info!("Starting GUI...");
-    // Create a receiver for the GUI
     let plot_partials_rx = partials_tx.subscribe();
     let app = plot::MyApp::new(
         spectrum_app.clone(),
@@ -614,6 +624,7 @@ async fn run() -> Result<()> {
         start_time.clone(),
         selected_sample_rate,
         plot_partials_rx,
+        gui_param_tx, // Pass the sender to MyApp
     );
 
     // Spawn SharedMemory update thread
