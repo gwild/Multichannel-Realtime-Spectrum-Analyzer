@@ -1,10 +1,17 @@
 mod audio_stream;
 mod fft_analysis;
 mod plot;
-mod utils;
 mod display;
 mod resynth;
 mod get_results;
+
+pub const MIN_FREQ: f64 = 20.0;
+pub const MAX_FREQ: f64 = 20000.0;
+pub const MIN_BUFFER_SIZE: usize = 512;
+pub const MAX_BUFFER_SIZE: usize = 65536;
+pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+pub const DEFAULT_FRAMES_PER_BUFFER: u32 = 2048;
+pub const FRAME_SIZES: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
 
 use anyhow::{anyhow, Result};
 use portaudio as pa;
@@ -21,7 +28,6 @@ use log::{info, error, warn, debug, LevelFilter};
 use fern::Dispatch;
 use env_logger;
 use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
-use utils::{DEFAULT_BUFFER_SIZE};
 use crate::resynth::{ResynthConfig, start_resynth_thread};
 use std::thread;
 use std::time::Duration;

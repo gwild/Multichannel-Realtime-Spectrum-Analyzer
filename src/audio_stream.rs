@@ -10,7 +10,7 @@ use portaudio as pa;
 use log::{info, error, debug};
 use anyhow::{anyhow, Result};
 use portaudio::stream::InputCallbackArgs;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
+use crate::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;

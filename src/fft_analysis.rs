@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use realfft::RealFftPlanner;
 use rayon::prelude::*;
 use std::f32::consts::PI;
-use crate::utils::{DEFAULT_BUFFER_SIZE, MAX_FREQ, MIN_FREQ}; // Update imports
+use crate::{DEFAULT_BUFFER_SIZE, MAX_FREQ, MIN_FREQ}; // Update imports
 use crate::DEFAULT_NUM_PARTIALS; // Import the new constant
 use crate::plot::SpectrographSlice;
 use std::collections::VecDeque;

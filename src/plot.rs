@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};// Importing necessary types for G
 // Reminder: Added to implement GUI throttling. Do not modify without permission.
 use std::time::{Duration, Instant};
 use std::sync::RwLock;
-use crate::utils::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
+use crate::{MIN_FREQ, MAX_FREQ, MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, DEFAULT_BUFFER_SIZE};
 use crate::fft_analysis::WindowType;  // Add at top with other imports
 use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
