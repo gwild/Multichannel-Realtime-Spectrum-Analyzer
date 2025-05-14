@@ -116,6 +116,7 @@ pub struct MyApp {
     // Fields for buffer size debouncing
     desired_buffer_size: Option<usize>,
     buffer_debounce_timer: Option<Instant>,
+    gain_update_tx: std::sync::mpsc::Sender<f32>,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -132,6 +133,7 @@ impl MyApp {
         sample_rate: f64,
         partials_rx: broadcast::Receiver<PartialsData>,
         gui_param_tx: mpsc::Sender<GuiParameter>, // Add this parameter
+        gain_update_tx: mpsc::Sender<f32>, // Add this param
     ) -> Self {
         let colors = vec![
             egui::Color32::from_rgb(0, 0, 255),
@@ -167,6 +169,7 @@ impl MyApp {
             // Initialize debounce fields
             desired_buffer_size: None,
             buffer_debounce_timer: None,
+            gain_update_tx,
         };
 
         // FIX IMPLEMENTATION:
@@ -473,9 +476,10 @@ impl eframe::App for MyApp {
                 if let Ok(mut resynth_config) = self.resynth_config.lock() {
                     if ui.add(
                         egui::Slider::new(&mut resynth_config.gain, 0.0..=1.0)
-                            .text(""),
+                            .text("")
                     ).changed() {
                         self.gui_param_tx.send(GuiParameter::Gain(resynth_config.gain)).unwrap_or_else(|e| error!("Failed to send Gain update: {}", e));
+                        self.gain_update_tx.send(resynth_config.gain).unwrap_or_else(|e| error!("Failed to send instant gain update: {}", e));
                     }
                 }
              
@@ -661,6 +665,8 @@ impl eframe::App for MyApp {
                     resynth_config.gain = 0.5; // Set reset gain to 0.5
                     resynth_config.freq_scale = 1.0;
                     resynth_config.update_rate = DEFAULT_UPDATE_RATE;
+                    // Send gain update for instant playback volume reset
+                    self.gain_update_tx.send(0.5).unwrap_or_else(|e| error!("Failed to send instant gain update on reset: {}", e));
                 } // resynth_config lock released here
 
                 // Reset display settings

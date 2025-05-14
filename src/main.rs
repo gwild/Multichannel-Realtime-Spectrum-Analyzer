@@ -225,8 +225,7 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Check if GStreamer is running, start it if not
-    // check_and_start_gstreamer(); // Temporarily comment out to isolate issues
-    info!("Skipping GStreamer check for this debug run.");
+    check_and_start_gstreamer();
 
     if let Err(e) = run().await {
         error!("Application error in main: {:?}", e); // Clarify source of error log
@@ -470,6 +469,9 @@ async fn run() -> Result<()> {
     // Create the MPSC channel for GUI parameter updates
     let (gui_param_tx, gui_param_rx) = mpsc::channel::<GuiParameter>();
 
+    // Create the MPSC channel for instant gain updates
+    let (gain_update_tx, gain_update_rx) = mpsc::channel::<f32>();
+
     // Create the MPSC channel for SynthUpdate (from get_results to wavegen)
     // This channel is now managed by start_resynth_thread internally.
     // let (update_tx_for_wavegen, update_rx_for_wavegen) = mpsc::channel::<crate::resynth::SynthUpdate>();
@@ -595,6 +597,7 @@ async fn run() -> Result<()> {
         let num_partials_val = num_partials;
         // Pass gui_param_rx to start_resynth_thread
         let gui_param_rx_for_resynth = gui_param_rx;
+        let gain_update_rx_for_resynth = gain_update_rx;
 
         move || {
             start_resynth_thread(
@@ -606,6 +609,7 @@ async fn run() -> Result<()> {
                 num_channels_val,
                 num_partials_val,
                 gui_param_rx_for_resynth, // Pass the GuiParameter receiver here
+                gain_update_rx_for_resynth, // Pass the gain update receiver here
             );
         }
     });
@@ -625,6 +629,7 @@ async fn run() -> Result<()> {
         selected_sample_rate,
         plot_partials_rx,
         gui_param_tx, // Pass the sender to MyApp
+        gain_update_tx, // Pass the gain update sender to MyApp
     );
 
     // Spawn SharedMemory update thread
