@@ -57,24 +57,14 @@ async fn shared_memory_updater_loop(
     while !shutdown_flag.load(Ordering::Relaxed) {
         match partials_rx.recv().await {
             Ok(linear_partials) => {
-                // Convert linear magnitudes to dB for Python
-                let db_partials: PartialsData = linear_partials.into_iter().map(|channel_partials| {
-                    channel_partials.into_iter().map(|(freq, magnitude)| {
-                        let db_val = if magnitude > 1e-10 { 
-                            20.0 * magnitude.log10()
-                        } else {
-                            -120.0 // Use a low dB value for silence/zero
-                        };
-                        (freq, db_val.max(-120.0_f32)) // Clamp to a floor
-                    }).collect()
-                }).collect();
-
-                // Serialize dB partials to bytes (simple approach: flatten and write f32 pairs)
+                // Serialize LINEAR partials (unitless magnitudes) to bytes for Python
+                // The received linear_partials already contains (frequency, linear_magnitude)
+                // where linear_magnitude is 0.0 for padded/non-existent partials.
                 let mut bytes_to_write = Vec::<u8>::new();
-                for channel in db_partials {
-                    for (freq, db) in channel {
+                for channel_data in linear_partials { // Iterate directly over the received linear_partials
+                    for (freq, linear_mag) in channel_data { // 'linear_mag' is the original linear magnitude
                         bytes_to_write.extend_from_slice(&freq.to_ne_bytes());
-                        bytes_to_write.extend_from_slice(&db.to_ne_bytes());
+                        bytes_to_write.extend_from_slice(&linear_mag.to_ne_bytes()); // Write the linear magnitude directly
                     }
                 }
 
