@@ -6,3 +6,5 @@
 *.log
 *.tmp
 .vscode/
+
+debug.txt
