@@ -247,7 +247,7 @@ fn check_and_start_gstreamer() {
                 .arg("-e")
                 .arg("bash")
                 .arg("-c")
-                .arg("../stream.sh; read -p 'Press enter to close'")
+                .arg("./stream.sh; read -p 'Press enter to close'")
                 .spawn();
 
             match start_result {
