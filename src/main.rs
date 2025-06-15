@@ -366,21 +366,21 @@ async fn run(args: &Args) -> Result<()> {
         }
         idx
     } else {
-        print!("Enter the index of the desired device: ");
-        io::stdout().flush()?;
-        let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
-        let device_index = user_input
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| anyhow!("Invalid device index"))?;
+    print!("Enter the index of the desired device: ");
+    io::stdout().flush()?;
+    let mut user_input = String::new();
+    io::stdin().read_line(&mut user_input)?;
+    let device_index = user_input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("Invalid device index"))?;
 
-        if device_index >= input_devices.len() {
+    if device_index >= input_devices.len() {
             return Err(anyhow!(
                 "Invalid device index. Please choose a number between 0 and {}",
                 input_devices.len() - 1
             ));
-        }
+    }
         device_index
     };
     let selected_device_index = input_devices[selected_device_index];
@@ -429,23 +429,23 @@ async fn run(args: &Args) -> Result<()> {
         }
         rate_cli
     } else {
-        println!("Supported sample rates:");
-        for (i, rate) in supported_sample_rates.iter().enumerate() {
-            println!("  [{}] - {} Hz", i, rate);
-        }
+    println!("Supported sample rates:");
+    for (i, rate) in supported_sample_rates.iter().enumerate() {
+        println!("  [{}] - {} Hz", i, rate);
+    }
 
-        print!("Enter the index of the desired sample rate: ");
-        io::stdout().flush()?;
+    print!("Enter the index of the desired sample rate: ");
+    io::stdout().flush()?;
         let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
-        let sample_rate_index = user_input
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| anyhow!("Invalid sample rate index"))?;
+    io::stdin().read_line(&mut user_input)?;
+    let sample_rate_index = user_input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow!("Invalid sample rate index"))?;
 
-        if sample_rate_index >= supported_sample_rates.len() {
-            return Err(anyhow!("Invalid sample rate index."));
-        }
+    if sample_rate_index >= supported_sample_rates.len() {
+        return Err(anyhow!("Invalid sample rate index."));
+    }
         supported_sample_rates[sample_rate_index]
     };
     info!("Selected sample rate: {} Hz", selected_sample_rate);
@@ -457,18 +457,18 @@ async fn run(args: &Args) -> Result<()> {
             .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
             .collect()
     } else {
-        println!(
-            "Available channels: 0 to {}",
-            selected_device_info.max_input_channels - 1
-        );
-        println!("Enter channels to use (comma-separated, e.g., 0,1): ");
+    println!(
+        "Available channels: 0 to {}",
+        selected_device_info.max_input_channels - 1
+    );
+    println!("Enter channels to use (comma-separated, e.g., 0,1): ");
         let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
+    io::stdin().read_line(&mut user_input)?;
         user_input
-            .trim()
-            .split(',')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
+        .trim()
+        .split(',')
+        .filter_map(|s| s.parse::<usize>().ok())
+        .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
             .collect()
     };
 
@@ -481,16 +481,16 @@ async fn run(args: &Args) -> Result<()> {
     let num_partials = if let Some(p) = args.num_partials {
         p.max(1)
     } else {
-        println!("Enter number of partials to detect per channel (default is {}): ", DEFAULT_NUM_PARTIALS);
+    println!("Enter number of partials to detect per channel (default is {}): ", DEFAULT_NUM_PARTIALS);
         let mut user_input = String::new();
-        io::stdin().read_line(&mut user_input)?;
+    io::stdin().read_line(&mut user_input)?;
         if user_input.trim().is_empty() {
-            DEFAULT_NUM_PARTIALS
-        } else {
-            user_input
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| anyhow!("Invalid number of partials"))?
+        DEFAULT_NUM_PARTIALS
+    } else {
+        user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid number of partials"))?
                 .max(1)
         }
     };
@@ -571,13 +571,13 @@ async fn run(args: &Args) -> Result<()> {
     let output_device_index = if let Some(idx) = args.output_device {
         idx
     } else {
-        print!("Enter the index of the desired output device: ");
-        io::stdout().flush()?;
+    print!("Enter the index of the desired output device: ");
+    io::stdout().flush()?;
         let mut input_line = String::new();
         io::stdin().read_line(&mut input_line)?;
         input_line
-            .trim()
-            .parse::<usize>()
+        .trim()
+        .parse::<usize>()
             .map_err(|_| anyhow!("Invalid device index"))?
     };
 
