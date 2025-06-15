@@ -33,6 +33,14 @@ struct Args {
     /// Internal flag used when the app relaunches itself in a new terminal. Not meant for users.
     #[arg(long = "launched-by-python", hide = true, default_value_t = false)]
     launched_by_python: bool,
+
+    /// Internal flag from Python launcher (ignored by Rust)
+    #[arg(long = "gui-ipc", hide = true, default_value_t = false)]
+    gui_ipc: bool,
+
+    /// Internal flag to enable extra logs (ignored here)
+    #[arg(long = "enable-logs", hide = true, default_value_t = false)]
+    enable_logs: bool,
 }
 
 pub const MIN_FREQ: f64 = 20.0;
