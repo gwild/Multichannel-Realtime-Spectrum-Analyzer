@@ -34,6 +34,7 @@ crossbeam-queue = "0.3"
 fern = "0.6"
 hound = "3.5"
 memmap2 = "0.9"
+clap = { version = "4.4", features = ["derive"] }
 
 [package.metadata.rust-version]
 version = "1.65.0"

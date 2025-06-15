@@ -5,6 +5,36 @@ mod display;
 mod resynth;
 mod get_results;
 
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Input device index
+    #[arg(short = 'i', long)]
+    input_device: Option<usize>,
+
+    /// Output device index (currently unused)
+    #[arg(short = 'o', long)]
+    output_device: Option<usize>,
+
+    /// Sample rate in Hz (e.g. 44100, 48000)
+    #[arg(short = 'r', long)]
+    sample_rate: Option<f64>,
+
+    /// Input channels to use, comma-separated list such as "0,1"
+    #[arg(short = 'c', long)]
+    channels: Option<String>,
+
+    /// Number of partials to detect per channel
+    #[arg(short = 'p', long)]
+    num_partials: Option<usize>,
+
+    /// Internal flag used when the app relaunches itself in a new terminal. Not meant for users.
+    #[arg(long = "launched-by-python", hide = true, default_value_t = false)]
+    launched_by_python: bool,
+}
+
 pub const MIN_FREQ: f64 = 20.0;
 pub const MAX_FREQ: f64 = 20000.0;
 pub const MIN_BUFFER_SIZE: usize = 512;
@@ -109,8 +139,11 @@ async fn shared_memory_updater_loop(
 // Make main async and return Result
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Check if we're already running in a terminal launched by Python or manually
-    let is_launched_by_python = std::env::args().any(|arg| arg == "--launched-by-python");
+    // Parse command-line arguments once
+    let args = Args::parse();
+
+    // Check if we're already running in the child terminal (flag injected by relaunch)
+    let is_launched_by_python = args.launched_by_python;
     if !is_launched_by_python {
         // Relaunch in a new terminal
         println!("Relaunching in a new terminal for consistent environment...");
@@ -118,14 +151,14 @@ async fn main() -> Result<(), anyhow::Error> {
         let current_dir = std::env::current_dir().expect("Failed to get current directory");
 
         // Build the command, preserving all original arguments
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let orig_args: Vec<String> = std::env::args().skip(1).collect();
         let mut cmd_str = format!("cd '{}' && {} --launched-by-python", 
             current_dir.display(), 
             current_exe.display()
         );
         
         // Add all original arguments
-        for arg in args {
+        for arg in orig_args {
             cmd_str.push_str(&format!(" '{}'", arg));
         }
         
@@ -149,9 +182,9 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Initialize logging first, before any other operations
-    let args: Vec<String> = std::env::args().collect();
+    let args_vec: Vec<String> = std::env::args().collect();
     
-    if args.contains(&"--debug".to_string()) {
+    if args_vec.contains(&"--debug".to_string()) {
         let mut dispatch = Dispatch::new()
             .format(|out, message, record| {
                 out.finish(format_args!(
@@ -165,7 +198,7 @@ async fn main() -> Result<(), anyhow::Error> {
             .level(LevelFilter::Info);  // Default level
 
         let mut debug_enabled = false;
-        for arg in args.iter() {
+        for arg in args_vec.iter() {
             match arg.as_str() {
                 "resynth" => {
                     dispatch = dispatch.level_for("audio_streaming::resynth", LevelFilter::Debug);
@@ -202,7 +235,7 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
 
-        if !debug_enabled && args.contains(&"--debug".to_string()) { // Ensure this condition captures --debug alone
+        if !debug_enabled && args_vec.contains(&"--debug".to_string()) { // Ensure this condition captures --debug alone
             println!("Debug flag present but no module specified. Defaulting to global debug. Available modules: resynth, fft, audio, plot, main, all");
             dispatch = dispatch.level(LevelFilter::Debug); // Default to global debug if only --debug is present
         }
@@ -213,7 +246,7 @@ async fn main() -> Result<(), anyhow::Error> {
             .apply()
             .map_err(|e| anyhow!("Logger apply error: {}", e))?;
 
-        debug!("Logging initialized with args: {:?}", args);
+        debug!("Logging initialized with args: {:?}", args_vec);
         info!("FERN LOGGER INITIALIZED AND ACTIVE in main.rs instance. Debug level: {}", log::max_level());
     } else {
         std::env::set_var("RUST_LOG", "error");
@@ -223,7 +256,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Check if GStreamer is running, start it if not
     check_and_start_gstreamer();
 
-    if let Err(e) = run().await {
+    if let Err(e) = run(&args).await {
         error!("Application error in main: {:?}", e); // Clarify source of error log
         std::process::exit(1);
     }
@@ -243,11 +276,17 @@ fn check_and_start_gstreamer() {
         },
         _ => {
             info!("GStreamer is not running, attempting to start it in a new terminal...");
+            // Build absolute path to stream.sh located beside the binary
+            let script_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("stream.sh")))
+                .unwrap_or_else(|| std::path::PathBuf::from("./stream.sh"));
+
             let start_result = std::process::Command::new("xterm")
                 .arg("-e")
                 .arg("bash")
                 .arg("-c")
-                .arg("./stream.sh; read -p 'Press enter to close'")
+                .arg(format!("'{}; read -p \"Press enter to close\"'", script_path.display()))
                 .spawn();
 
             match start_result {
@@ -265,7 +304,7 @@ fn check_and_start_gstreamer() {
 }
 
 // Make run async
-async fn run() -> Result<()> {
+async fn run(args: &Args) -> Result<()> {
     info!("run() function entered."); // New log
     let pa = Arc::new(pa::PortAudio::new()?);
     info!("PortAudio initialized successfully in run()."); // New log
@@ -308,20 +347,35 @@ async fn run() -> Result<()> {
         return Err(anyhow!("No input audio devices found."));
     }
 
-    print!("Enter the index of the desired device: ");
-    io::stdout().flush()?;
-    let mut user_input = String::new();
-    io::stdin().read_line(&mut user_input)?;
-    let device_index = user_input
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| anyhow!("Invalid device index"))?;
+    // Device selection: use CLI arg if provided, otherwise prompt
+    let selected_device_index = if let Some(idx) = args.input_device {
+        if idx >= input_devices.len() {
+            return Err(anyhow!(
+                "Invalid device index {} provided via --input-device. Must be 0..{}",
+                idx,
+                input_devices.len() - 1
+            ));
+        }
+        idx
+    } else {
+        print!("Enter the index of the desired device: ");
+        io::stdout().flush()?;
+        let mut user_input = String::new();
+        io::stdin().read_line(&mut user_input)?;
+        let device_index = user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid device index"))?;
 
-    if device_index >= input_devices.len() {
-        return Err(anyhow!("Invalid device index. Please choose a number between 0 and {}", input_devices.len() - 1));
-    }
-    
-    let selected_device_index = input_devices[device_index];
+        if device_index >= input_devices.len() {
+            return Err(anyhow!(
+                "Invalid device index. Please choose a number between 0 and {}",
+                input_devices.len() - 1
+            ));
+        }
+        device_index
+    };
+    let selected_device_index = input_devices[selected_device_index];
     let selected_device_info = pa.device_info(selected_device_index)?;
     info!(
         "Selected device: {} ({} channels)",
@@ -361,39 +415,54 @@ async fn run() -> Result<()> {
         return Err(anyhow!("No supported sample rates for the selected device."));
     }
 
-    println!("Supported sample rates:");
-    for (i, rate) in supported_sample_rates.iter().enumerate() {
-        println!("  [{}] - {} Hz", i, rate);
-    }
+    let selected_sample_rate = if let Some(rate_cli) = args.sample_rate {
+        if !supported_sample_rates.contains(&rate_cli) {
+            return Err(anyhow!("Sample rate {} is not supported by selected device", rate_cli));
+        }
+        rate_cli
+    } else {
+        println!("Supported sample rates:");
+        for (i, rate) in supported_sample_rates.iter().enumerate() {
+            println!("  [{}] - {} Hz", i, rate);
+        }
 
-    print!("Enter the index of the desired sample rate: ");
-    io::stdout().flush()?;
-    user_input.clear();
-    io::stdin().read_line(&mut user_input)?;
-    let sample_rate_index = user_input
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| anyhow!("Invalid sample rate index"))?;
+        print!("Enter the index of the desired sample rate: ");
+        io::stdout().flush()?;
+        let mut user_input = String::new();
+        io::stdin().read_line(&mut user_input)?;
+        let sample_rate_index = user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid sample rate index"))?;
 
-    if sample_rate_index >= supported_sample_rates.len() {
-        return Err(anyhow!("Invalid sample rate index."));
-    }
-    let selected_sample_rate = supported_sample_rates[sample_rate_index];
+        if sample_rate_index >= supported_sample_rates.len() {
+            return Err(anyhow!("Invalid sample rate index."));
+        }
+        supported_sample_rates[sample_rate_index]
+    };
     info!("Selected sample rate: {} Hz", selected_sample_rate);
 
-    println!(
-        "Available channels: 0 to {}",
-        selected_device_info.max_input_channels - 1
-    );
-    println!("Enter channels to use (comma-separated, e.g., 0,1): ");
-    user_input.clear();
-    io::stdin().read_line(&mut user_input)?;
-    let selected_channels: Vec<usize> = user_input
-        .trim()
-        .split(',')
-        .filter_map(|s| s.parse::<usize>().ok())
-        .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
-        .collect();
+    let selected_channels: Vec<usize> = if let Some(ref ch_str) = args.channels {
+        ch_str
+            .split(',')
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
+            .collect()
+    } else {
+        println!(
+            "Available channels: 0 to {}",
+            selected_device_info.max_input_channels - 1
+        );
+        println!("Enter channels to use (comma-separated, e.g., 0,1): ");
+        let mut user_input = String::new();
+        io::stdin().read_line(&mut user_input)?;
+        user_input
+            .trim()
+            .split(',')
+            .filter_map(|s| s.parse::<usize>().ok())
+            .filter(|&ch| ch < selected_device_info.max_input_channels as usize)
+            .collect()
+    };
 
     if selected_channels.is_empty() {
         return Err(anyhow!("No valid channels selected."));
@@ -401,17 +470,21 @@ async fn run() -> Result<()> {
     info!("Selected channels: {:?}", selected_channels);
 
     // Add prompt for number of partials here
-    println!("Enter number of partials to detect per channel (default is {}): ", DEFAULT_NUM_PARTIALS);
-    user_input.clear();
-    io::stdin().read_line(&mut user_input)?;
-    let num_partials = if user_input.trim().is_empty() {
-        DEFAULT_NUM_PARTIALS
+    let num_partials = if let Some(p) = args.num_partials {
+        p.max(1)
     } else {
-        user_input
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| anyhow!("Invalid number of partials"))?
-            .max(1) // Ensure at least 1 partial
+        println!("Enter number of partials to detect per channel (default is {}): ", DEFAULT_NUM_PARTIALS);
+        let mut user_input = String::new();
+        io::stdin().read_line(&mut user_input)?;
+        if user_input.trim().is_empty() {
+            DEFAULT_NUM_PARTIALS
+        } else {
+            user_input
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| anyhow!("Invalid number of partials"))?
+                .max(1)
+        }
     };
     info!("Using {} partials per channel", num_partials);
 
@@ -487,14 +560,18 @@ async fn run() -> Result<()> {
         return Err(anyhow!("No stereo output devices found."));
     }
 
-    print!("Enter the index of the desired output device: ");
-    io::stdout().flush()?;
-    user_input.clear();
-    io::stdin().read_line(&mut user_input)?;
-    let output_device_index = user_input
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| anyhow!("Invalid device index"))?;
+    let output_device_index = if let Some(idx) = args.output_device {
+        idx
+    } else {
+        print!("Enter the index of the desired output device: ");
+        io::stdout().flush()?;
+        let mut input_line = String::new();
+        io::stdin().read_line(&mut input_line)?;
+        input_line
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid device index"))?
+    };
 
     if output_device_index >= output_devices.len() {
         return Err(anyhow!("Invalid output device index"));
