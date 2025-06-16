@@ -287,8 +287,8 @@ fn check_and_start_gstreamer() {
             // Build absolute path to stream.sh located beside the binary
             let script_path = std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("stream.sh")))
-                .unwrap_or_else(|| std::path::PathBuf::from("./stream.sh"));
+                .and_then(|p| p.parent().and_then(|d| d.parent().map(|pd| pd.join("stream.sh"))))
+                .unwrap_or_else(|| std::path::PathBuf::from("../stream.sh"));
 
             let start_result = std::process::Command::new("xterm")
                 .arg("-e")
