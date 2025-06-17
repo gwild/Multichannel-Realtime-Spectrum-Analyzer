@@ -934,7 +934,7 @@ impl eframe::App for MyApp {
                 if self.show_results {
                     let display = SpectralDisplay::new(&absolute_values);
                     for line in display.format_all() {
-                        ui.label(egui::RichText::new(line).size(8.0));
+                        ui.label(egui::RichText::new(line).size(12.0));
                     }
                 }
             });
