@@ -543,12 +543,18 @@ impl eframe::App for MyApp {
                 let mut fft_config = self.fft_config.lock().unwrap();
                 ui.horizontal(|ui| {
                     ui.label("Min Frequency:");
-                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, MIN_FREQ..=200.0).text("Hz"));
-                    
-                    ui.label("Max Frequency:");
                     let buffer_size = *self.buffer_size.lock().unwrap();
                     let nyquist_limit = (buffer_size as f64 / 2.0).min(*MAX_FREQ);
+                    ui.add(egui::Slider::new(&mut fft_config.min_frequency, MIN_FREQ..=nyquist_limit).text("Hz"));
+                    
+                    ui.label("Max Frequency:");
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
+
+                    // Ensure min_frequency is always less than max_frequency
+                    if fft_config.min_frequency >= fft_config.max_frequency {
+                        fft_config.min_frequency = fft_config.max_frequency * 0.5;
+                        debug!("Adjusted min_frequency to {} Hz (half of max_frequency)", fft_config.min_frequency);
+                    }
 
                     ui.label("Magnitude Threshold:");
                     ui.add(egui::Slider::new(&mut fft_config.magnitude_threshold, 0.0..=60.0));
@@ -985,12 +991,16 @@ impl eframe::App for MyApp {
                     // 5. Apply the modified style back to the context
                     plot_ui.ctx().set_style(style);
                     
-                    // Explicitly set plot bounds to ensure consistent x-axis
-                    let current_max_freq = self.fft_config.lock().unwrap().max_frequency;
+                    // Explicitly set plot bounds to match min and max frequency settings
+                    let fft_config = self.fft_config.lock().unwrap();
+                    let min_freq = fft_config.min_frequency;
+                    let max_freq = fft_config.max_frequency;
                     let bounds = egui::plot::PlotBounds::from_min_max(
-                        [0.0, 0.0], // Min X, Min Y
-                        [current_max_freq as f64, self.y_scale as f64] // Max X, Max Y
+                        [min_freq, 0.0], // Min X, Min Y
+                        [max_freq, self.y_scale as f64] // Max X, Max Y
                     );
+                    debug!("Setting plot bounds to X: [{} to {}] Hz, Y: [0 to {}]", 
+                           min_freq, max_freq, self.y_scale);
                     
                     // Add detailed plot update debug log with buffer resize status
                     let buffer_resize_status = if let Ok(buffer) = self.audio_buffer.read() {
@@ -1003,7 +1013,7 @@ impl eframe::App for MyApp {
                     debug!(target: "audio_streaming::plot", 
                            "Plot Render: cycle={}, max_freq={}, buffer_resize={}, received_data={}, partials_count={}", 
                            unsafe { PLOT_UPDATE_COUNT }, 
-                           current_max_freq, 
+                           max_freq, 
                            buffer_resize_status,
                            received_count > 0,
                            all_bar_charts.len());
@@ -1040,16 +1050,17 @@ impl eframe::App for MyApp {
                     }
                 };
                 
-                let max_freq = {
+                let (min_freq, max_freq) = {
                     let fft = self.fft_config.lock().unwrap();
                     let buffer_size = *self.buffer_size.lock().unwrap();
-                    (fft.max_frequency as f32).min(buffer_size as f32 / 2.0)
+                    let max = (fft.max_frequency as f32).min(buffer_size as f32 / 2.0);
+                    (fft.min_frequency as f32, max)
                 };
 
                 Plot::new("spectrograph_plot")
                     .legend(Legend::default())
                     .view_aspect(6.0)
-                    .include_y(0.0)
+                    .include_y(min_freq as f64)
                     .include_y(max_freq as f64)
                     .x_axis_formatter(move |value, _range| {
                         let timestamp = start_timestamp + chrono::Duration::milliseconds((value * 1000.0) as i64);
@@ -1075,7 +1086,7 @@ impl eframe::App for MyApp {
                         let history = self.spectrograph_history.lock().unwrap();
                         if !history.is_empty() {
                             plot_ui.set_plot_bounds(egui::plot::PlotBounds::from_min_max(
-                                [earliest_time * 1000.0, 0.0],
+                                [earliest_time * 1000.0, min_freq as f64],
                                 [latest_time * 1000.0, max_freq as f64]
                             ));
 
