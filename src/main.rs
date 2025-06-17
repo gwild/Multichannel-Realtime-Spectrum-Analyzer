@@ -613,6 +613,11 @@ async fn run(args: &Args) -> Result<()> {
         output_sample_rate: Arc::new(Mutex::new(selected_output_sample_rate)),
     }));
 
+    // Write control file for external processes
+    let control_path = "/dev/shm/audio_control";
+    let mut control_file = std::fs::File::create(&control_path)?;
+    writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
+
     // Shared state for shutdown and timers
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_complete = Arc::new(AtomicBool::new(false));
