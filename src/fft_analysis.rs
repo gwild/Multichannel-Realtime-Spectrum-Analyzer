@@ -52,7 +52,7 @@ impl Default for FFTConfig {
     fn default() -> Self {
         Self {
             min_frequency: MIN_FREQ,
-            max_frequency: MAX_FREQ,
+            max_frequency: *MAX_FREQ,
             magnitude_threshold: 6.0, 
             min_freq_spacing: 20.0,
             num_channels: 1,
@@ -149,6 +149,75 @@ fn compute_all_fft_data(
     (partials, line_data)
 }
 
+/// Processes audio data to extract spectral information.
+/// Returns a tuple containing:
+/// 1. Partials data (frequency, magnitude) for each channel
+/// 2. FFT line data for visualization
+/// 3. Spectrograph data for history tracking
+pub fn process_audio_data(
+    audio_data: &[f32],
+    config: &FFTConfig,
+    num_channels: usize,
+    sample_rate: u32,
+) -> Result<(PartialsData, Vec<Vec<(f32, f32)>>, Vec<(f64, f32)>), String> {
+    if audio_data.is_empty() {
+        return Err("Empty audio data".to_string());
+    }
+
+    // Extract channel data
+    let channel_buffers: Vec<Vec<f32>> = (0..num_channels)
+        .map(|i| extract_channel_data(audio_data, i, num_channels))
+        .collect();
+    
+    if channel_buffers.is_empty() || channel_buffers[0].is_empty() {
+        return Err("Failed to extract channel data".to_string());
+    }
+
+    // Process each channel to get both partial and line data
+    let mut all_channels_partials = Vec::with_capacity(num_channels);
+    let mut all_channels_line_data = Vec::with_capacity(num_channels);
+
+    for channel_index in 0..num_channels {
+        let (partials, line_data) = compute_all_fft_data(
+            &channel_buffers,
+            channel_index,
+            sample_rate,
+            config
+        );
+        
+        all_channels_partials.push(partials);
+        all_channels_line_data.push(line_data);
+    }
+
+    // Apply crosstalk filtering if enabled
+    let filtered_partials: PartialsData = if config.crosstalk_enabled {
+        filter_crosstalk_frequency_domain(
+            &mut all_channels_partials.clone(),
+            config.crosstalk_threshold,
+            config.crosstalk_reduction,
+            config.harmonic_tolerance,
+            config.root_freq_min,
+            config.root_freq_max,
+            config.freq_match_distance,
+            sample_rate
+        )
+    } else {
+        all_channels_partials.clone()
+    };
+
+    // Generate spectrograph data
+    let linear_threshold = 10.0_f32.powf(config.magnitude_threshold as f32 / 20.0);
+    let spectrograph_data: Vec<(f64, f32)> = filtered_partials.iter()
+        .flat_map(|channel_data| {
+            channel_data.iter()
+                .filter(move |&&(_freq, magnitude)| magnitude >= linear_threshold)
+                .map(|&(freq, magnitude)| (freq as f64, magnitude))
+        })
+        .collect();
+
+    Ok((filtered_partials, all_channels_line_data, spectrograph_data))
+}
+
 /// Spawns a thread to continuously process FFT data and update the plot.
 pub fn start_fft_processing(
     audio_buffer: Arc<RwLock<CircularBuffer>>,
@@ -157,237 +226,190 @@ pub fn start_fft_processing(
     selected_channels: Vec<usize>,
     sample_rate: u32,
     shutdown_flag: Arc<AtomicBool>,
-    partials_tx: broadcast::Sender<PartialsData>, // Changed parameter: Use broadcast sender
+    partials_tx: broadcast::Sender<PartialsData>,
     spectrograph_history: Option<Arc<Mutex<VecDeque<SpectrographSlice>>>>,
     start_time: Option<Arc<Instant>>,
 ) {
-    debug!("Starting FFT processing thread");
+    // Add a counter to track FFT processing cycles
+    let mut fft_cycle_count = 0;
+    let mut last_log_time = Instant::now();
+    let mut last_successful_process = Instant::now();
 
-    // Initialize FFT planner and buffers outside the loop
-    let mut planner = RealFftPlanner::<f32>::new();
-    let mut current_buffer_size = DEFAULT_BUFFER_SIZE;
-    let mut fft = planner.plan_fft_forward(current_buffer_size);
-    let mut spectrum_buffer = fft.make_output_vec();
+    info!("FFT processing thread started");
+    debug!("FFT thread initialized with {} channels at {} Hz", selected_channels.len(), sample_rate);
 
-    // Cache initial configuration values
-    let initial_config = {
-        let config = fft_config.lock().unwrap();
-        FFTConfig {
-            min_frequency: config.min_frequency,
-            max_frequency: config.max_frequency,
-            magnitude_threshold: config.magnitude_threshold,
-            min_freq_spacing: config.min_freq_spacing,
-            num_channels: config.num_channels,
-            frames_per_buffer: config.frames_per_buffer,
-            crosstalk_threshold: config.crosstalk_threshold,
-            crosstalk_reduction: config.crosstalk_reduction,
-            crosstalk_enabled: config.crosstalk_enabled,
-            harmonic_tolerance: config.harmonic_tolerance,
-            window_type: config.window_type,
-            root_freq_min: config.root_freq_min,
-            root_freq_max: config.root_freq_max,
-            freq_match_distance: config.freq_match_distance,
-            num_partials: config.num_partials,
+    while !shutdown_flag.load(Ordering::SeqCst) {
+        // Sleep to avoid excessive CPU usage
+        thread::sleep(Duration::from_millis(10));
+        
+        fft_cycle_count += 1;
+        
+        // Log processing rate periodically
+        if last_log_time.elapsed() >= Duration::from_secs(5) {
+            debug!("FFT processing stats: {} cycles in last 5 seconds", fft_cycle_count);
+            fft_cycle_count = 0;
+            last_log_time = Instant::now();
         }
-    };
 
-    // Track if config has changed to know when to update cache
-    let mut last_config_hash = {
-        let mut hasher = DefaultHasher::new();
-        initial_config.min_frequency.to_bits().hash(&mut hasher);
-        initial_config.max_frequency.to_bits().hash(&mut hasher);
-        initial_config.magnitude_threshold.to_bits().hash(&mut hasher);
-        initial_config.min_freq_spacing.to_bits().hash(&mut hasher);
-        initial_config.num_channels.hash(&mut hasher);
-        initial_config.frames_per_buffer.hash(&mut hasher);
-        initial_config.crosstalk_threshold.to_bits().hash(&mut hasher);
-        initial_config.crosstalk_reduction.to_bits().hash(&mut hasher);
-        initial_config.crosstalk_enabled.hash(&mut hasher);
-        initial_config.harmonic_tolerance.to_bits().hash(&mut hasher);
-        initial_config.root_freq_min.to_bits().hash(&mut hasher);
-        initial_config.root_freq_max.to_bits().hash(&mut hasher);
-        initial_config.freq_match_distance.to_bits().hash(&mut hasher);
-        initial_config.num_partials.hash(&mut hasher);
-        hasher.finish()
-    };
+        // Check if buffer resize is in progress
+        let buffer_resize_in_progress = {
+            if let Ok(buffer) = audio_buffer.read() {
+                let needs_restart = buffer.needs_restart();
+                let needs_reinit = buffer.needs_reinit();
+                if needs_restart || needs_reinit {
+                    debug!("FFT thread detected buffer resize operation - needs_restart={}, needs_reinit={}", 
+                           needs_restart, needs_reinit);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
 
-    let mut cached_config = initial_config;
+        if buffer_resize_in_progress {
+            // If buffer resize is in progress, wait for it to complete
+            debug!("FFT thread pausing processing during buffer resize operation");
+            
+            // Wait for the resize operation to complete
+            let mut resize_completed = false;
+            let start_wait = Instant::now();
+            
+            while !resize_completed && start_wait.elapsed() < Duration::from_secs(5) {
+                if let Ok(buffer) = audio_buffer.read() {
+                    resize_completed = !buffer.needs_restart() && !buffer.needs_reinit();
+                    if resize_completed {
+                        info!("FFT thread detected buffer resize completion");
+                        debug!("FFT thread resuming processing after buffer resize");
+                    }
+                }
+                
+                if !resize_completed {
+                    // Sleep briefly to avoid tight loop
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+            
+            if !resize_completed {
+                warn!("FFT thread timed out waiting for buffer resize to complete");
+            }
+            
+            // Skip processing this cycle
+            continue;
+        }
 
-    while !shutdown_flag.load(Ordering::Relaxed) {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let buffer_size = {
-                let buffer = audio_buffer.read().unwrap();
-                buffer.size()
-            };
+        // Get a copy of the audio data for FFT processing
+        let audio_data = if let Ok(buffer) = audio_buffer.read() {
+            buffer.clone_data()
+        } else {
+            continue;
+        };
 
-            // Reinitialize FFT planner if buffer size changed
-            if buffer_size != current_buffer_size {
-                fft = planner.plan_fft_forward(buffer_size);
-                spectrum_buffer = fft.make_output_vec();
-                current_buffer_size = buffer_size;
+        if audio_data.is_empty() {
+            continue;
+        }
 
-                debug!("FFT planner reinitialized, size: {}", buffer_size);
+        // Get the current FFT configuration
+        let fft_config_copy = if let Ok(config) = fft_config.lock() {
+            config.clone()
+        } else {
+            continue;
+        };
 
+        // Process the audio data to extract spectral information
+        match process_audio_data(
+            &audio_data,
+            &fft_config_copy,
+            selected_channels.len(),
+            sample_rate,
+        ) {
+            Ok((partials, fft_data, spectrograph_data)) => {
+                last_successful_process = Instant::now();
+                
+                // Update the spectrum app with the FFT line data
+                if let Ok(mut app) = spectrum_app.lock() {
+                    app.update_fft_line_data(fft_data.clone());
+                    debug!("Updated spectrum app with new FFT line data: {} channels", fft_data.len());
+                } else {
+                    debug!("Failed to lock spectrum_app to update FFT line data");
+                }
+
+                // Send the partials data to any subscribers (GUI and resynth)
+                let receiver_count = partials_tx.receiver_count();
+                match partials_tx.send(partials.clone()) {
+                    Ok(_) => {
+                        // Log every successful FFT completion with a cycle counter
+                        static mut FFT_COMPLETION_COUNT: usize = 0;
+                        unsafe {
+                            FFT_COMPLETION_COUNT += 1;
+                            if FFT_COMPLETION_COUNT % 10 == 0 {  // Log every 10th completion to avoid spam
+                                debug!("FFT cycle #{} complete - sent data to {} receivers: {} channels, {} partials/channel", 
+                                       FFT_COMPLETION_COUNT, 
+                                       receiver_count,
+                                       partials.len(),
+                                       if !partials.is_empty() { partials[0].len() } else { 0 });
+                            }
+                        }
+                        
+                        // After buffer resize, log more details about data flow resumption
+                        if last_successful_process.elapsed() > Duration::from_secs(1) {
+                            info!("Data flow to GUI resumed after buffer resize");
+                            debug!("Sent first batch of partials after resize: {} channels, {} partials per channel",
+                                   partials.len(), 
+                                   if !partials.is_empty() { partials[0].len() } else { 0 });
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to send partials data: {} (receivers: {})", e, receiver_count);
+                    }
+                }
+
+                // Update the spectrograph history if available
                 if let Some(history) = &spectrograph_history {
                     if let Ok(mut history) = history.lock() {
-                        history.clear();
-                        info!("Cleared spectrograph history due to buffer size change");
-                    }
-                }
-            }
+                        let current_time = if let Some(start) = &start_time {
+                            start.elapsed().as_secs_f64()
+                        } else {
+                            0.0
+                        };
 
-            let buffer_data = {
-                let buffer = audio_buffer.read().unwrap();
-                buffer.clone_data()
-            };
+                        history.push_back(SpectrographSlice {
+                            time: current_time,
+                            data: spectrograph_data.clone(),
+                        });
+                        
+                        debug!("Updated spectrograph history: {} entries, {} data points in latest slice", 
+                               history.len(), spectrograph_data.len());
 
-            // Check if config has changed by comparing hashes
-            let config = fft_config.lock().unwrap();
-            let current_hash = {
-                let mut hasher = DefaultHasher::new();
-                config.min_frequency.to_bits().hash(&mut hasher);
-                config.max_frequency.to_bits().hash(&mut hasher);
-                config.magnitude_threshold.to_bits().hash(&mut hasher);
-                config.min_freq_spacing.to_bits().hash(&mut hasher);
-                config.num_channels.hash(&mut hasher);
-                config.frames_per_buffer.hash(&mut hasher);
-                config.crosstalk_threshold.to_bits().hash(&mut hasher);
-                config.crosstalk_reduction.to_bits().hash(&mut hasher);
-                config.crosstalk_enabled.hash(&mut hasher);
-                config.harmonic_tolerance.to_bits().hash(&mut hasher);
-                config.root_freq_min.to_bits().hash(&mut hasher);
-                config.root_freq_max.to_bits().hash(&mut hasher);
-                config.freq_match_distance.to_bits().hash(&mut hasher);
-                config.num_partials.hash(&mut hasher);
-                hasher.finish()
-            };
-
-            // Only update cached config if values have changed
-            if current_hash != last_config_hash {
-                cached_config = FFTConfig {
-                    min_frequency: config.min_frequency,
-                    max_frequency: config.max_frequency,
-                    magnitude_threshold: config.magnitude_threshold,
-                    min_freq_spacing: config.min_freq_spacing,
-                    num_channels: config.num_channels,
-                    frames_per_buffer: config.frames_per_buffer,
-                    crosstalk_threshold: config.crosstalk_threshold,
-                    crosstalk_reduction: config.crosstalk_reduction,
-                    crosstalk_enabled: config.crosstalk_enabled,
-                    harmonic_tolerance: config.harmonic_tolerance,
-                    window_type: config.window_type,
-                    root_freq_min: config.root_freq_min,
-                    root_freq_max: config.root_freq_max,
-                    freq_match_distance: config.freq_match_distance,
-                    num_partials: config.num_partials,
-                };
-                last_config_hash = current_hash;
-            }
-            drop(config);
-
-            // Use cached_config instead of taking a new lock
-            let _num_partials = cached_config.num_partials;
-
-            // Process each channel to get both partial and line data
-            let mut all_channels_partials = Vec::with_capacity(selected_channels.len());
-            let mut all_channels_line_data = Vec::with_capacity(selected_channels.len());
-
-            // Extract channel data once
-            let channel_buffers: Vec<Vec<f32>> = selected_channels.iter().enumerate()
-                .map(|(i, _)| extract_channel_data(&buffer_data, i, selected_channels.len()))
-                .collect();
-
-            for (channel_index, _) in selected_channels.iter().enumerate() {
-                let (partials, line_data) = compute_all_fft_data(
-                    &channel_buffers,
-                    channel_index,     
-                    sample_rate, 
-                    &cached_config
-                );
-                
-                all_channels_partials.push(partials);
-                all_channels_line_data.push(line_data);
-            }
-
-            // Apply crosstalk filtering if enabled
-            let results: PartialsData = if cached_config.crosstalk_enabled {
-                filter_crosstalk_frequency_domain(
-                    &mut all_channels_partials,
-                    cached_config.crosstalk_threshold,
-                    cached_config.crosstalk_reduction,
-                    cached_config.harmonic_tolerance,
-                    cached_config.root_freq_min,
-                    cached_config.root_freq_max,
-                    cached_config.freq_match_distance,
-                    sample_rate
-                )
-            } else {
-                all_channels_partials
-            };
-
-            // --- Send partials via broadcast channel --- 
-            if partials_tx.receiver_count() > 0 { // Only send if someone is listening
-                if let Err(_e) = partials_tx.send(results.clone()) {
-                    // Error implies channel is closed or no receivers. Log if needed.
-                    // warn!("Failed to broadcast partials: {}", e);
-                }
-            } else {
-                // Optional: Log if sending because no receivers are attached
-                // debug!("No receivers for partials broadcast, skipping send.");
-            }
-            // --- End Send --- 
-
-            // Update GUI display (now receives linear magnitudes)
-            {
-                let mut spectrum = spectrum_app.lock().unwrap();
-                spectrum.update_partials(results.clone()); // Pass linear partials
-                spectrum.update_fft_line_data(all_channels_line_data);
-            }
-
-            // Update spectrograph if needed (now receives linear magnitudes)
-            if let Some(history) = &spectrograph_history {
-                let elapsed = start_time.as_ref().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-                let slice = SpectrographSlice {
-                    time: elapsed,
-                    // Convert linear magnitude to f64 for the slice data if needed
-                    // or update SpectrographSlice to store f32.
-                    // Also, filtering based on magnitude threshold needs linear comparison.
-                    data: results.iter()
-                        .flat_map(|channel_data| {
-                            // Convert dB threshold to linear for comparison
-                            let linear_threshold = 10.0_f32.powf(cached_config.magnitude_threshold as f32 / 20.0);
-                            channel_data.iter()
-                                .filter(move |&&(_freq, magnitude)| magnitude >= linear_threshold)
-                                // Convert freq to f64 if needed by SpectrographSlice
-                                .map(|&(freq, magnitude)| (freq as f64, magnitude))
-                        })
-                        .collect(),
-                };
-
-                let mut history = history.lock().unwrap();
-                
-                // Keep history size within limits
-                let latest_time = slice.time;
-                while let Some(front) = history.front() {
-                    if latest_time - front.time > 5.0 {
-                        history.pop_front();
+                        // Limit the history size
+                        while history.len() > MAX_SPECTROGRAPH_HISTORY {
+                            history.pop_front();
+                        }
                     } else {
-                        break;
+                        debug!("Failed to lock spectrograph history for update");
                     }
                 }
-                
-                history.push_back(slice);
             }
-        }));
-
-        if let Err(e) = result {
-            error!("FFT computation failed: {:?}", e);
-            warn!("Panic in FFT thread: {:?}", e);
+            Err(e) => {
+                error!("Error processing audio data: {}", e);
+                
+                // If we haven't had a successful process in a while, log more details
+                if last_successful_process.elapsed() > Duration::from_secs(5) {
+                    debug!("No successful FFT processing for 5+ seconds. Last error: {}", e);
+                    debug!("Audio data stats: {} samples, {} channels", 
+                           audio_data.len(), selected_channels.len());
+                    debug!("FFT config: window_type={:?}, frames_per_buffer={}, max_freq={}", 
+                           fft_config_copy.window_type, fft_config_copy.frames_per_buffer, fft_config_copy.max_frequency);
+                    
+                    // Reset the timer to avoid spamming logs
+                    last_successful_process = Instant::now();
+                }
+            }
         }
-
-        thread::sleep(Duration::from_millis(1));
     }
-    info!("FFT processing thread shutting down.");
+
+    info!("FFT processing thread shutting down");
 }
 
 /// Extracts data for a specific channel from the interleaved buffer.

@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use crate::fft_analysis::FFTConfig;
+use crate::resynth::ResynthConfig;
 
 // This section is protected. Must keep the existing doc comments and struct as is.
 // Reminder: The following struct is critical to the ring buffer logic.
@@ -123,14 +124,18 @@ impl CircularBuffer {
     ///
     /// * `new_size` - The new maximum number of frames the buffer can hold.
     pub fn resize(&mut self, new_size: usize) {
-        debug!("Buffer resize requested - Current: {}, New: {} frames ({} channels)", 
+        info!("BUFFER RESIZE: CircularBuffer resize requested - Current: {}, New: {} frames ({} channels)", 
             self.size, new_size, self.channels);
+        debug!("BUFFER RESIZE: Starting resize operation from {} to {} frames", self.size, new_size);
         
         // Create new buffer
         let mut new_buffer = vec![0.0; new_size * self.channels];
+        debug!("BUFFER RESIZE: Created new buffer with {} total samples", new_buffer.len());
         
         // Copy existing data, preserving as much as possible
         let copy_frames = self.size.min(new_size);
+        debug!("BUFFER RESIZE: Will copy {} frames from old buffer", copy_frames);
+        
         for frame in 0..copy_frames {
             for channel in 0..self.channels {
                 let old_idx = ((self.head + frame) % self.size) * self.channels + channel;
@@ -139,24 +144,31 @@ impl CircularBuffer {
             }
         }
         
+        info!("BUFFER RESIZE: Buffer data copied - {} frames preserved", copy_frames);
+        debug!("BUFFER RESIZE: Copy operation complete");
+        
         self.buffer = new_buffer;
         self.head = 0;  // Reset head since we've reordered the data
         self.size = new_size;
+        debug!("BUFFER RESIZE: Buffer updated with new size: {} frames", self.size);
         
         // On Linux, force a complete reinit
         #[cfg(target_os = "linux")]
         {
-            debug!("Linux detected, forcing complete stream reinitialization");
+            info!("BUFFER RESIZE: Linux detected, forcing complete stream reinitialization");
+            debug!("BUFFER RESIZE: Setting force_reinit flag for Linux platform");
             self.force_reinit.store(true, Ordering::SeqCst);
         }
         
         self.needs_restart.store(true, Ordering::SeqCst);
-        debug!("Stream restart requested due to buffer resize");
+        info!("BUFFER RESIZE: Stream restart requested due to buffer resize");
+        debug!("BUFFER RESIZE: Set needs_restart flag to true");
         
         // Log buffer state after resize
         let non_zero = self.buffer.iter().filter(|&&x| x != 0.0).count();
-        debug!("Buffer after resize - Size: {}, Channels: {}, Non-zero samples: {}", 
+        info!("BUFFER RESIZE: Buffer after resize - Size: {}, Channels: {}, Non-zero samples: {}", 
             self.size, self.channels, non_zero);
+        debug!("BUFFER RESIZE: Resize operation complete");
     }
 
     pub fn needs_restart(&self) -> bool {
@@ -165,6 +177,7 @@ impl CircularBuffer {
 
     #[allow(dead_code)]
     pub fn clear_restart_flag(&self) {
+        debug!("BUFFER RESIZE: Clearing needs_restart flag");
         self.needs_restart.store(false, Ordering::SeqCst);
     }
 
@@ -175,6 +188,7 @@ impl CircularBuffer {
 
     #[allow(dead_code)]
     pub fn clear_reinit_flag(&self) {
+        debug!("BUFFER RESIZE: Clearing force_reinit flag");
         self.force_reinit.store(false, Ordering::SeqCst);
     }
 
@@ -403,6 +417,7 @@ pub fn process_input_samples(input: &[f32], device_channels: usize, selected_cha
 /// * `shutdown_flag` - Atomic flag to indicate stream shutdown.
 /// * `stream_ready` - Atomic flag to indicate stream readiness.
 /// * `fft_config` - Shared mutex-protected FFTConfig for stream configuration.
+/// * `resynth_config` - Shared mutex-protected ResynthConfig for stream configuration.
 pub fn start_sampling_thread(
     running: Arc<AtomicBool>,
     main_buffer: Arc<RwLock<CircularBuffer>>,
@@ -413,6 +428,7 @@ pub fn start_sampling_thread(
     shutdown_flag: Arc<AtomicBool>,
     stream_ready: Arc<AtomicBool>,
     fft_config: Arc<Mutex<FFTConfig>>,
+    resynth_config: Arc<Mutex<ResynthConfig>>,
 ) {
     const RESTART_COOLDOWN: Duration = Duration::from_secs(2);
 
@@ -467,6 +483,17 @@ pub fn start_sampling_thread(
                         stream_ready.store(true, Ordering::SeqCst);
                         debug!("Audio stream ready for FFT processing");
                         
+                        // Explicitly log successful restart after buffer resize
+                        if let Ok(buffer) = main_buffer.read() {
+                            if buffer.needs_restart() || buffer.needs_reinit() {
+                                info!("BUFFER RESIZE: Stream successfully restarted after buffer resize");
+                                debug!("BUFFER RESIZE: Stream is now active and ready to send data to GUI");
+                                // Clear flags explicitly here as well as a safety measure
+                                buffer.clear_restart_flag();
+                                buffer.clear_reinit_flag();
+                            }
+                        }
+                        
                         // Monitor stream health
                         while !shutdown_flag.load(Ordering::SeqCst) {
                             thread::sleep(Duration::from_millis(100));
@@ -491,22 +518,47 @@ pub fn start_sampling_thread(
 
                                 // Existing buffer resize check
                                 if buffer.needs_restart() || buffer.needs_reinit() {
-                                    debug!("Restart or reinit requested due to buffer resize.");
+                                    info!("BUFFER RESIZE: Restart or reinit requested due to buffer resize.");
+                                    debug!("BUFFER RESIZE: Detected needs_restart={} or needs_reinit={}", 
+                                           buffer.needs_restart(), buffer.needs_reinit());
 
-                                    // Stop the current stream
-                                    if let Err(e) = stream.stop() {
-                                        error!("Failed to stop stream before resize: {}", e);
-                                        // Optionally break outer loop if stop fails critically
-                                        // break;
+                                    // Signal the resynthesis thread to STOP FIRST before we do anything
+                                    if let Ok(config) = resynth_config.lock() {
+                                        info!("BUFFER RESIZE: Signaling resynthesis thread to stop BEFORE resize");
+                                        debug!("BUFFER RESIZE: Setting needs_stop flag in resynth_config");
+                                        config.needs_stop.store(true, Ordering::SeqCst);
+                                    } else {
+                                        error!("BUFFER RESIZE: Failed to lock resynth config to signal stop.");
                                     }
+                                    
+                                    // Wait for output stream to stop completely
+                                    info!("BUFFER RESIZE: Waiting for output stream to stop...");
+                                    debug!("BUFFER RESIZE: Adding cooldown period to allow output stream to stop");
+                                    thread::sleep(Duration::from_millis(500));
+
+                                    // Now stop the input stream
+                                    info!("BUFFER RESIZE: Now stopping input stream");
+                                    debug!("BUFFER RESIZE: Calling stream.stop() on input stream");
+                                    if let Err(e) = stream.stop() {
+                                        error!("BUFFER RESIZE: Failed to stop stream before resize: {}", e);
+                                    } else {
+                                        debug!("BUFFER RESIZE: Input stream stopped successfully");
+                                    }
+                                    
                                     // Drop read lock before taking write lock
+                                    debug!("BUFFER RESIZE: Dropping read lock to acquire write lock");
                                     drop(buffer);
 
                                     // Get the new target size
-                                    let new_target_size = match _buffer_size.lock() { // Use the Arc<Mutex<usize>> passed to the thread
-                                        Ok(size_lock) => *size_lock,
+                                    let new_target_size = match _buffer_size.lock() {
+                                        Ok(size_lock) => {
+                                            info!("BUFFER RESIZE: Got new target size: {}", *size_lock);
+                                            debug!("BUFFER RESIZE: Target buffer size is {} frames", *size_lock);
+                                            *size_lock
+                                        },
                                         Err(e) => {
-                                            error!("Failed to lock buffer_size Arc: {}. Using default.", e);
+                                            error!("BUFFER RESIZE: Failed to lock buffer_size Arc: {}. Using default.", e);
+                                            debug!("BUFFER RESIZE: Falling back to DEFAULT_BUFFER_SIZE: {}", DEFAULT_BUFFER_SIZE);
                                             DEFAULT_BUFFER_SIZE
                                         }
                                     };
@@ -514,22 +566,45 @@ pub fn start_sampling_thread(
                                     // Acquire write lock and perform resize *in this thread*
                                     match main_buffer.write() {
                                         Ok(mut buffer_write_lock) => {
+                                            info!("BUFFER RESIZE: Acquired write lock, performing resize to {}", new_target_size);
+                                            debug!("BUFFER RESIZE: Calling resize() method on CircularBuffer");
                                             buffer_write_lock.resize(new_target_size);
                                             // Clear flags *after* successful resize
+                                            debug!("BUFFER RESIZE: Clearing restart and reinit flags");
                                             buffer_write_lock.clear_restart_flag();
                                             buffer_write_lock.clear_reinit_flag();
-                                            info!("Audio buffer resized to {} in background thread.", new_target_size);
+                                            info!("BUFFER RESIZE: Audio buffer resized to {} in background thread.", new_target_size);
+                                            debug!("BUFFER RESIZE: Resize operation completed successfully");
+                                            
+                                            // Log buffer state to verify integrity
+                                            let non_zero = buffer_write_lock.buffer.iter().filter(|&&x| x != 0.0).count();
+                                            debug!("BUFFER RESIZE: Buffer after resize - Size: {}, Non-zero samples: {}/{}", 
+                                                   buffer_write_lock.size, 
+                                                   non_zero,
+                                                   buffer_write_lock.buffer.len());
                                         },
                                         Err(e) => {
-                                            error!("Failed to acquire write lock for buffer resize: {}. Restart may fail.", e);
-                                            // Attempt to clear flags anyway using read lock, might not be ideal
-                                            if let Ok(buffer_read_lock) = main_buffer.read() {
-                                                buffer_read_lock.clear_restart_flag();
-                                                buffer_read_lock.clear_reinit_flag();
-                                            }
+                                            error!("BUFFER RESIZE: Failed to acquire write lock for buffer resize: {}. Restart may fail.", e);
                                         }
                                     }
-                                    // Break to outer loop to reinitialize the stream
+
+                                    // Add a cooldown period after resize
+                                    info!("BUFFER RESIZE: Adding cooldown period after resize");
+                                    debug!("BUFFER RESIZE: Sleeping for 500ms to ensure stability");
+                                    thread::sleep(Duration::from_millis(500));
+
+                                    // Signal the resynthesis thread to restart
+                                    if let Ok(config) = resynth_config.lock() {
+                                        info!("BUFFER RESIZE: Signaling resynthesis thread to restart after resize");
+                                        debug!("BUFFER RESIZE: Setting needs_restart flag in resynth_config");
+                                        config.needs_restart.store(true, Ordering::SeqCst);
+                                    } else {
+                                        error!("BUFFER RESIZE: Failed to lock resynth config to signal restart.");
+                                    }
+
+                                    // Break to outer loop to reinitialize the input stream
+                                    info!("BUFFER RESIZE: Breaking to outer loop to reinitialize input stream");
+                                    debug!("BUFFER RESIZE: Will reinitialize input stream with new buffer size");
                                     break;
                                 }
                             }
@@ -607,6 +682,67 @@ pub fn start_sampling_thread(
             break;
         }
 
+        // Check if we need to perform a buffer resize operation after stream stopped
+        let resize_needed = {
+            if let Ok(buffer) = main_buffer.read() {
+                buffer.needs_restart() || buffer.needs_reinit()
+            } else {
+                false
+            }
+        };
+        
+        if resize_needed {
+            info!("BUFFER RESIZE: Performing buffer resize after stream stopped");
+            
+            // Get the new target size
+            let new_target_size = match _buffer_size.lock() {
+                Ok(size_lock) => {
+                    info!("BUFFER RESIZE: Got new target size: {}", *size_lock);
+                    debug!("BUFFER RESIZE: Target buffer size is {} frames", *size_lock);
+                    *size_lock
+                },
+                Err(e) => {
+                    error!("BUFFER RESIZE: Failed to lock buffer_size Arc: {}. Using default.", e);
+                    debug!("BUFFER RESIZE: Falling back to DEFAULT_BUFFER_SIZE: {}", DEFAULT_BUFFER_SIZE);
+                    DEFAULT_BUFFER_SIZE
+                }
+            };
+
+            // Acquire write lock and perform resize *in this thread*
+            match main_buffer.write() {
+                Ok(mut buffer_write_lock) => {
+                    info!("BUFFER RESIZE: Acquired write lock, performing resize to {}", new_target_size);
+                    debug!("BUFFER RESIZE: Calling resize() method on CircularBuffer");
+                    buffer_write_lock.resize(new_target_size);
+                    // Clear flags *after* successful resize
+                    debug!("BUFFER RESIZE: Clearing restart and reinit flags");
+                    buffer_write_lock.clear_restart_flag();
+                    buffer_write_lock.clear_reinit_flag();
+                    info!("BUFFER RESIZE: Audio buffer resized to {} in background thread.", new_target_size);
+                    debug!("BUFFER RESIZE: Resize operation completed successfully");
+                    
+                    // Log buffer state to verify integrity
+                    let non_zero = buffer_write_lock.buffer.iter().filter(|&&x| x != 0.0).count();
+                    debug!("BUFFER RESIZE: Buffer after resize - Size: {}, Non-zero samples: {}/{}", 
+                           buffer_write_lock.size, 
+                           non_zero,
+                           buffer_write_lock.buffer.len());
+                },
+                Err(e) => {
+                    error!("BUFFER RESIZE: Failed to acquire write lock for buffer resize: {}. Restart may fail.", e);
+                }
+            }
+
+            // Signal the resynthesis thread to restart
+            if let Ok(config) = resynth_config.lock() {
+                info!("BUFFER RESIZE: Signaling resynthesis thread to restart after resize");
+                debug!("BUFFER RESIZE: Setting needs_restart flag in resynth_config");
+                config.needs_restart.store(true, Ordering::SeqCst);
+            } else {
+                error!("BUFFER RESIZE: Failed to lock resynth config to signal restart.");
+            }
+        }
+
         // Cool down before attempting full reinit
         thread::sleep(RESTART_COOLDOWN);
     }
@@ -615,22 +751,99 @@ pub fn start_sampling_thread(
     running.store(false, Ordering::SeqCst);
 }
 
+/// Performs a buffer resize operation directly.
+/// This function is called when we need to ensure a resize completes properly.
+pub fn perform_buffer_resize(
+    main_buffer: &Arc<RwLock<CircularBuffer>>,
+    buffer_size: &Arc<Mutex<usize>>,
+    resynth_config: &Arc<Mutex<ResynthConfig>>,
+) -> bool {
+    info!("BUFFER RESIZE: Performing direct buffer resize operation");
+    
+    // Get the new target size
+    let new_target_size = match buffer_size.lock() {
+        Ok(size_lock) => {
+            info!("BUFFER RESIZE: Got new target size: {}", *size_lock);
+            debug!("BUFFER RESIZE: Target buffer size is {} frames", *size_lock);
+            *size_lock
+        },
+        Err(e) => {
+            error!("BUFFER RESIZE: Failed to lock buffer_size Arc: {}. Using default.", e);
+            debug!("BUFFER RESIZE: Falling back to DEFAULT_BUFFER_SIZE: {}", DEFAULT_BUFFER_SIZE);
+            DEFAULT_BUFFER_SIZE
+        }
+    };
+
+    // Acquire write lock and perform resize
+    let resize_success = match main_buffer.write() {
+        Ok(mut buffer_write_lock) => {
+            info!("BUFFER RESIZE: Acquired write lock, performing resize to {}", new_target_size);
+            debug!("BUFFER RESIZE: Calling resize() method on CircularBuffer");
+            buffer_write_lock.resize(new_target_size);
+            
+            // Clear flags *after* successful resize
+            debug!("BUFFER RESIZE: Clearing restart and reinit flags");
+            buffer_write_lock.clear_restart_flag();
+            buffer_write_lock.clear_reinit_flag();
+            
+            info!("BUFFER RESIZE: Audio buffer resized to {} directly.", new_target_size);
+            debug!("BUFFER RESIZE: Resize operation completed successfully");
+            
+            // Log buffer state to verify integrity
+            let non_zero = buffer_write_lock.buffer.iter().filter(|&&x| x != 0.0).count();
+            debug!("BUFFER RESIZE: Buffer after resize - Size: {}, Non-zero samples: {}/{}", 
+                   buffer_write_lock.size, 
+                   non_zero,
+                   buffer_write_lock.buffer.len());
+            
+            true
+        },
+        Err(e) => {
+            error!("BUFFER RESIZE: Failed to acquire write lock for buffer resize: {}", e);
+            false
+        }
+    };
+
+    // Signal the resynthesis thread to restart if resize was successful
+    if resize_success {
+        if let Ok(config) = resynth_config.lock() {
+            info!("BUFFER RESIZE: Signaling resynthesis thread to restart after direct resize");
+            debug!("BUFFER RESIZE: Setting needs_restart flag in resynth_config");
+            config.needs_restart.store(true, Ordering::SeqCst);
+        } else {
+            error!("BUFFER RESIZE: Failed to lock resynth config to signal restart.");
+        }
+    }
+    
+    resize_success
+}
+
 #[allow(dead_code)]
 pub fn calculate_optimal_buffer_size(sample_rate: f32) -> usize {
     // Convert MIN_FREQ and MAX_FREQ from f64 to f32 for calculations
     let min_freq = MIN_FREQ as f32;
-    let max_freq = MAX_FREQ as f32;
+    let max_freq = *MAX_FREQ as f32;
     
+    // For high sample rates, ensure we have enough buffer to capture the full frequency range
     let min_samples = (sample_rate / min_freq) as usize;
+    
+    // For max_freq, use at least 4 samples per cycle for accurate capture
     let max_samples = (sample_rate / max_freq * 4.0) as usize;
     
+    // For very high sample rates like 192kHz, we need larger buffers
+    let high_sr_adjustment = if sample_rate > 100000.0 {
+        2  // Additional power of 2 for high sample rates
+    } else {
+        1
+    };
+    
     let initial_size = ((min_samples + max_samples) / 2)
-        .next_power_of_two()
+        .next_power_of_two() * high_sr_adjustment
         .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE);
     
     info!(
-        "Calculated buffer size - Min: {}, Max: {}, Selected: {}, SR: {}",
-        min_samples, max_samples, initial_size, sample_rate
+        "Calculated buffer size - Min: {}, Max: {}, Selected: {}, SR: {}, Max Freq: {}",
+        min_samples, max_samples, initial_size, sample_rate, max_freq
     );
     
     initial_size

@@ -6,6 +6,8 @@ mod resynth;
 mod get_results;
 
 use clap::Parser;
+use std::sync::LazyLock;
+use std::sync::OnceLock;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -14,11 +16,19 @@ struct Args {
     #[arg(short = 'i', long)]
     input_device: Option<usize>,
 
-    /// Output device index (currently unused)
+    /// Output device index
     #[arg(short = 'o', long)]
     output_device: Option<usize>,
 
-    /// Sample rate in Hz (e.g. 44100, 48000)
+    /// Input sample rate in Hz (e.g. 44100, 48000, 96000)
+    #[arg(long = "input-rate")]
+    input_sample_rate: Option<f64>,
+
+    /// Output sample rate in Hz (e.g. 44100, 48000, 96000)
+    #[arg(long = "output-rate")]
+    output_sample_rate: Option<f64>,
+    
+    /// Legacy sample rate parameter (deprecated, use input-rate and output-rate instead)
     #[arg(short = 'r', long)]
     sample_rate: Option<f64>,
 
@@ -29,6 +39,10 @@ struct Args {
     /// Number of partials to detect per channel
     #[arg(short = 'p', long)]
     num_partials: Option<usize>,
+    
+    /// Enable debug logging
+    #[arg(long)]
+    debug: bool,
 
     /// Internal flag used when the app relaunches itself in a new terminal. Not meant for users.
     #[arg(long = "launched-by-python", hide = true, default_value_t = false)]
@@ -44,7 +58,17 @@ struct Args {
 }
 
 pub const MIN_FREQ: f64 = 20.0;
-pub const MAX_FREQ: f64 = 20000.0;
+// Store the sample rate in a thread-safe OnceLock
+pub static SAMPLE_RATE: OnceLock<f64> = OnceLock::new();
+pub static MAX_FREQ: LazyLock<f64> = LazyLock::new(|| {
+    // Calculate max frequency based on sample rate if available
+    if let Some(sample_rate) = SAMPLE_RATE.get() {
+        calculate_max_freq(*sample_rate)
+    } else {
+        // Default to 20kHz if sample rate not yet set
+        20000.0
+    }
+});
 pub const MIN_BUFFER_SIZE: usize = 512;
 pub const MAX_BUFFER_SIZE: usize = 65536;
 pub const DEFAULT_BUFFER_SIZE: usize = 8192;
@@ -60,47 +84,66 @@ use std::sync::{
     RwLock,
     atomic::{AtomicBool, Ordering}
 };
-use audio_stream::{CircularBuffer, start_sampling_thread};
+use audio_stream::CircularBuffer;
 use eframe::NativeOptions;
 use log::{info, error, warn, debug, LevelFilter};
 use fern::Dispatch;
 use env_logger;
-use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY};
+use fft_analysis::{FFTConfig, MAX_SPECTROGRAPH_HISTORY, start_fft_processing};
 use crate::resynth::{ResynthConfig, start_resynth_thread};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 use crate::plot::SpectrographSlice;
-use std::time::Instant;
-use std::fs::OpenOptions;
-use chrono;
 use tokio::sync::broadcast;
 use memmap2::MmapMut;
 use crate::get_results::GuiParameter;
 use std::sync::mpsc;
+use std::fs::OpenOptions;
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct SharedMemory {
     pub path: String,
 }
 
-// Add a new constant to replace hardcoded 12 throughout code
 pub const DEFAULT_NUM_PARTIALS: usize = 12;
 
-// Define type alias (should match fft_analysis)
 type PartialsData = Vec<Vec<(f32, f32)>>;
 
-// Async function to handle shared memory updates
 async fn shared_memory_updater_loop(
     mut partials_rx: broadcast::Receiver<PartialsData>,
     shared_memory_path: String,
     shutdown_flag: Arc<AtomicBool>,
 ) {
     debug!(target: "shared_memory", "Starting shared memory update loop for path: {}", shared_memory_path);
+    let mut last_update_time = Instant::now();
+    let mut update_count = 0;
 
     while !shutdown_flag.load(Ordering::Relaxed) {
         match partials_rx.recv().await {
             Ok(linear_partials) => {
+                // Track update frequency
+                update_count += 1;
+                let now = Instant::now();
+                if now.duration_since(last_update_time).as_secs() >= 5 {
+                    debug!(target: "shared_memory", "GUI update stats: {} updates in last 5 seconds", update_count);
+                    last_update_time = now;
+                    update_count = 0;
+                }
+
+                // Log details about the received data
+                let channel_count = linear_partials.len();
+                let partials_count = if !linear_partials.is_empty() {
+                    linear_partials[0].len()
+                } else {
+                    0
+                };
+                
+                debug!(target: "shared_memory", 
+                    "Received partials data: {} channels, {} partials per channel", 
+                    channel_count, partials_count);
+
                 // Serialize LINEAR partials (unitless magnitudes) to bytes for Python
                 // The received linear_partials already contains (frequency, linear_magnitude)
                 // where linear_magnitude is 0.0 for padded/non-existent partials.
@@ -119,6 +162,7 @@ async fn shared_memory_updater_loop(
                             Ok(mut mmap) => {
                                 let len = bytes_to_write.len().min(mmap.len());
                                 mmap[..len].copy_from_slice(&bytes_to_write[..len]);
+                                debug!(target: "shared_memory", "Updated shared memory with {} bytes", len);
                                 // Optional: Write a sentinel/length if protocol requires
                                 // mmap.flush(); // Ensure changes are written (usually optional)
                             }
@@ -144,15 +188,20 @@ async fn shared_memory_updater_loop(
     info!(target: "shared_memory", "Shared memory update loop shutting down.");
 }
 
-// Make main async and return Result
+fn calculate_max_freq(sample_rate: f64) -> f64 {
+    sample_rate / 2.0
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    // Parse command-line arguments once
+    // Parse command line arguments
     let args = Args::parse();
+    
+    // Initialize logging - setup both console and file logging
+    setup_logging(args.debug)?;
+    info!("Starting audio streaming application");
 
-    // Check if we're already running in the child terminal (flag injected by relaunch)
-    let is_launched_by_python = args.launched_by_python;
-    if !is_launched_by_python {
+    if !args.launched_by_python {
         // Relaunch in a new terminal
         println!("Relaunching in a new terminal for consistent environment...");
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
@@ -189,89 +238,16 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    // Initialize logging first, before any other operations
-    let args_vec: Vec<String> = std::env::args().collect();
-    
-    if args_vec.contains(&"--debug".to_string()) {
-        let mut dispatch = Dispatch::new()
-            .format(|out, message, record| {
-                out.finish(format_args!(
-                    "[{}:{}] {} - {}",
-                    record.level(),
-                    record.target(),
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                    message
-                ))
-            })
-            .level(LevelFilter::Info);  // Default level
-
-        let mut debug_enabled = false;
-        for arg in args_vec.iter() {
-            match arg.as_str() {
-                "resynth" => {
-                    dispatch = dispatch.level_for("audio_streaming::resynth", LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for resynth module");
-                },
-                "fft" => {
-                    dispatch = dispatch.level_for("audio_streaming::fft_analysis", LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for fft module");
-                },
-                "audio" => {
-                    dispatch = dispatch.level_for("audio_streaming::audio_stream", LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for audio module");
-                },
-                "plot" => {
-                    dispatch = dispatch.level_for("audio_streaming::plot", LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for plot module");
-                },
-                "main" => {
-                    dispatch = dispatch.level_for("audio_streaming", LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for main module");
-                },
-                "all" => {
-                    dispatch = dispatch.level(LevelFilter::Debug);
-                    debug_enabled = true;
-                    println!("Enabling debug for all modules");
-                    break;
-                },
-                _ => {}
-            }
-        }
-
-        if !debug_enabled && args_vec.contains(&"--debug".to_string()) { // Ensure this condition captures --debug alone
-            println!("Debug flag present but no module specified. Defaulting to global debug. Available modules: resynth, fft, audio, plot, main, all");
-            dispatch = dispatch.level(LevelFilter::Debug); // Default to global debug if only --debug is present
-        }
-
-        dispatch
-            .chain(std::io::stdout()) // Ensure it also goes to xterm's stdout
-            .chain(fern::log_file("debug_explicit.log").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?)
-            .apply()
-            .map_err(|e| anyhow!("Logger apply error: {}", e))?;
-
-        debug!("Logging initialized with args: {:?}", args_vec);
-        info!("FERN LOGGER INITIALIZED AND ACTIVE in main.rs instance. Debug level: {}", log::max_level());
-    } else {
-        std::env::set_var("RUST_LOG", "error");
-        env_logger::init();
-    }
-
     // Check if GStreamer is running, start it if not
     check_and_start_gstreamer();
 
     if let Err(e) = run(&args).await {
-        error!("Application error in main: {:?}", e); // Clarify source of error log
+        error!("Application error in main: {:?}", e);
         std::process::exit(1);
     }
     Ok(())
 }
 
-// Function to check if GStreamer is running and start it if not
 fn check_and_start_gstreamer() {
     let gstreamer_check = std::process::Command::new("pgrep")
         .arg("-f")
@@ -311,7 +287,6 @@ fn check_and_start_gstreamer() {
     }
 }
 
-// Make run async
 async fn run(args: &Args) -> Result<()> {
     info!("run() function entered."); // New log
     let pa = Arc::new(pa::PortAudio::new()?);
@@ -366,7 +341,7 @@ async fn run(args: &Args) -> Result<()> {
         }
         idx
     } else {
-    print!("Enter the index of the desired device: ");
+    print!("Enter the index of the desired input device: ");
     io::stdout().flush()?;
     let mut user_input = String::new();
     io::stdin().read_line(&mut user_input)?;
@@ -383,14 +358,14 @@ async fn run(args: &Args) -> Result<()> {
     }
         device_index
     };
-    let selected_device_index = input_devices[selected_device_index];
-    let selected_device_info = pa.device_info(selected_device_index)?;
+    let selected_input_device = input_devices[selected_device_index];
+    let selected_device_info = pa.device_info(selected_input_device)?;
     info!(
-        "Selected device: {} ({} channels)",
+        "Selected input device: {} ({} channels)",
         selected_device_info.name, selected_device_info.max_input_channels
     );
 
-    if let Ok(device_info) = pa.device_info(selected_device_index) {
+    if let Ok(device_info) = pa.device_info(selected_input_device) {
         info!("Device: {}", device_info.name);
         info!("Default sample rate: {}", device_info.default_sample_rate);
         info!("Input channels: {}", device_info.max_input_channels);
@@ -399,7 +374,7 @@ async fn run(args: &Args) -> Result<()> {
         
         // Try to get supported formats
         let input_params = pa::StreamParameters::<f32>::new(
-            selected_device_index,
+            selected_input_device,
             device_info.max_input_channels,
             true,
             device_info.default_low_input_latency
@@ -414,41 +389,132 @@ async fn run(args: &Args) -> Result<()> {
         }
     }
 
-    let supported_sample_rates = get_supported_sample_rates(
-        selected_device_index,
+    // Get supported input sample rates
+    let input_sample_rates = get_supported_sample_rates(
+        selected_input_device,
         selected_device_info.max_input_channels,
         &pa,
     );
-    if supported_sample_rates.is_empty() {
-        return Err(anyhow!("No supported sample rates for the selected device."));
+    if input_sample_rates.is_empty() {
+        return Err(anyhow!("No supported sample rates for the selected input device."));
     }
 
-    let selected_sample_rate = if let Some(rate_cli) = args.sample_rate {
-        if !supported_sample_rates.contains(&rate_cli) {
-            return Err(anyhow!("Sample rate {} is not supported by selected device", rate_cli));
+    // Let user select input sample rate
+    let selected_input_sample_rate = if let Some(rate_cli) = args.input_sample_rate.or(args.sample_rate) {
+        if !input_sample_rates.contains(&rate_cli) {
+            return Err(anyhow!("Sample rate {} is not supported by selected input device", rate_cli));
         }
         rate_cli
     } else {
-    println!("Supported sample rates:");
-    for (i, rate) in supported_sample_rates.iter().enumerate() {
-        println!("  [{}] - {} Hz", i, rate);
-    }
+        println!("Supported input sample rates:");
+        for (i, rate) in input_sample_rates.iter().enumerate() {
+            println!("  [{}] - {} Hz", i, rate);
+        }
 
-    print!("Enter the index of the desired sample rate: ");
-    io::stdout().flush()?;
+        print!("Enter the index of the desired input sample rate: ");
+        io::stdout().flush()?;
         let mut user_input = String::new();
-    io::stdin().read_line(&mut user_input)?;
-    let sample_rate_index = user_input
-        .trim()
-        .parse::<usize>()
-        .map_err(|_| anyhow!("Invalid sample rate index"))?;
+        io::stdin().read_line(&mut user_input)?;
+        let sample_rate_index = user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid sample rate index"))?;
 
-    if sample_rate_index >= supported_sample_rates.len() {
-        return Err(anyhow!("Invalid sample rate index."));
-    }
-        supported_sample_rates[sample_rate_index]
+        if sample_rate_index >= input_sample_rates.len() {
+            return Err(anyhow!("Invalid sample rate index."));
+        }
+        input_sample_rates[sample_rate_index]
     };
-    info!("Selected sample rate: {} Hz", selected_sample_rate);
+    info!("Selected input sample rate: {} Hz", selected_input_sample_rate);
+    
+    // Set the sample rate in the OnceLock for MAX_FREQ calculation
+    let _ = SAMPLE_RATE.get_or_init(|| selected_input_sample_rate);
+    
+    // Force initialization of MAX_FREQ based on input sample rate
+    let max_freq = *MAX_FREQ;
+    info!("Using MAX_FREQ: {} Hz (based on input sample rate)", max_freq);
+
+    // Now select output device
+    println!("\nAvailable Output Devices:");
+    let mut output_devices = Vec::new();
+    for (_i, device) in devices.iter().enumerate() {
+        let (index, info) = device;
+        if info.max_output_channels >= 2 {  // Need at least stereo output
+            println!("  [{}] - {} ({} channels)", output_devices.len(), info.name, info.max_output_channels);
+            output_devices.push(*index);
+        }
+    }
+
+    if output_devices.is_empty() {
+        return Err(anyhow!("No stereo output devices found."));
+    }
+
+    let output_device_index = if let Some(idx) = args.output_device {
+        idx
+    } else {
+        print!("Enter the index of the desired output device: ");
+        io::stdout().flush()?;
+        let mut input_line = String::new();
+        io::stdin().read_line(&mut input_line)?;
+        input_line
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid device index"))?
+    };
+
+    if output_device_index >= output_devices.len() {
+        return Err(anyhow!("Invalid output device index"));
+    }
+
+    let selected_output_device = output_devices[output_device_index];
+    let output_device_info = pa.device_info(selected_output_device)?;
+    info!("Selected output device: {} ({} channels)", output_device_info.name, output_device_info.max_output_channels);
+
+    // Get supported output sample rates
+    let output_sample_rates = get_supported_output_sample_rates(
+        selected_output_device,
+        &pa,
+    );
+    if output_sample_rates.is_empty() {
+        return Err(anyhow!("No supported sample rates for the selected output device."));
+    }
+
+    // Let user select output sample rate
+    let selected_output_sample_rate = if let Some(rate_cli) = args.output_sample_rate.or(args.sample_rate) {
+        if !output_sample_rates.contains(&rate_cli) {
+            warn!("Note: CLI specified output sample rate {} is not supported by output device, using default", rate_cli);
+            output_device_info.default_sample_rate
+        } else {
+            rate_cli
+        }
+    } else {
+        println!("Supported output sample rates:");
+        for (i, rate) in output_sample_rates.iter().enumerate() {
+            println!("  [{}] - {} Hz", i, rate);
+        }
+
+        print!("Enter the index of the desired output sample rate: ");
+        io::stdout().flush()?;
+        let mut user_input = String::new();
+        io::stdin().read_line(&mut user_input)?;
+        let sample_rate_index = user_input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow!("Invalid sample rate index"))?;
+
+        if sample_rate_index >= output_sample_rates.len() {
+            return Err(anyhow!("Invalid sample rate index."));
+        }
+        output_sample_rates[sample_rate_index]
+    };
+    info!("Selected output sample rate: {} Hz", selected_output_sample_rate);
+    
+    // Log the difference between input and output sample rates if they differ
+    if selected_input_sample_rate != selected_output_sample_rate {
+        info!("Note: Input sample rate ({} Hz) differs from output sample rate ({} Hz)", 
+              selected_input_sample_rate, selected_output_sample_rate);
+        info!("Analysis will use full input sample rate range, but resynthesis will be limited to output capabilities");
+    }
 
     let selected_channels: Vec<usize> = if let Some(ref ch_str) = args.channels {
         ch_str
@@ -496,102 +562,67 @@ async fn run(args: &Args) -> Result<()> {
     };
     info!("Using {} partials per channel", num_partials);
 
+    // --- Core Application State Setup ---
     let buffer_size = Arc::new(Mutex::new(DEFAULT_BUFFER_SIZE));
     let audio_buffer = Arc::new(RwLock::new(CircularBuffer::new(
         DEFAULT_BUFFER_SIZE,
         selected_channels.len()
     )));
     let spectrum_app = Arc::new(Mutex::new(plot::SpectrumApp::new(selected_channels.len())));
-    let frames_per_buffer = if cfg!(target_os = "linux") {
+    
+    let mut config = FFTConfig::default();
+    // Override only what needs to be different from defaults
+    config.num_channels = selected_channels.len();
+    config.frames_per_buffer = if cfg!(target_os = "linux") {
         2048u32  // Larger buffer for Linux stability
     } else {
-        match selected_sample_rate as u32 {
+        match selected_input_sample_rate as u32 {
             48000 => 1024u32,   // Increased for better frequency resolution
             44100 => 1024u32,   // Increased for better frequency resolution
             96000 => 2048u32,   // Increased for higher frequency analysis
             192000 => 4096u32,  // Added option for very high sample rates
             _ => {
                 let mut base_size = 1024u32;  // Increased base size
-                while base_size * 2 <= (selected_sample_rate / 50.0) as u32 {
+                while base_size * 2 <= (selected_input_sample_rate / 50.0) as u32 {
                     base_size *= 2;
                 }
                 base_size
             }
         }
     };
-
-    let mut config = FFTConfig::default();
-    // Override only what needs to be different from defaults
-    config.num_channels = selected_channels.len();
-    config.frames_per_buffer = frames_per_buffer;
     config.num_partials = num_partials;
 
     let fft_config = Arc::new(Mutex::new(config));
 
-    let running = Arc::new(AtomicBool::new(false));
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let stream_ready = Arc::new(AtomicBool::new(false));
-    let shutdown_complete = Arc::new(AtomicBool::new(false));
-
-    let audio_buffer_clone = Arc::clone(&audio_buffer);
-    let selected_channels_clone = selected_channels.clone();
-    let buffer_size_clone = Arc::clone(&buffer_size);
-    let shutdown_flag_audio = Arc::clone(&shutdown_flag);
-    let stream_ready_audio = Arc::clone(&stream_ready);
-    let shutdown_complete_audio = Arc::clone(&shutdown_complete);
-
-    // Add before thread creation
-    let resynth_config = Arc::new(Mutex::new(ResynthConfig::default()));
+    // --- GUI setup ---
+    let native_options = eframe::NativeOptions::default();
 
     // Create the MPSC channel for GUI parameter updates
     let (gui_param_tx, gui_param_rx) = mpsc::channel::<GuiParameter>();
 
     // Create the MPSC channel for instant gain updates
     let (gain_update_tx, gain_update_rx) = mpsc::channel::<f32>();
+    
+    // Create the ResynthConfig instance
+    let resynth_config = Arc::new(Mutex::new(ResynthConfig {
+        gain: 0.5,
+        freq_scale: 1.0,
+        update_rate: 1.0,
+        needs_restart: Arc::new(AtomicBool::new(false)),
+        needs_stop: Arc::new(AtomicBool::new(false)),
+        output_sample_rate: Arc::new(Mutex::new(selected_output_sample_rate)),
+    }));
 
-    // Create the MPSC channel for SynthUpdate (from get_results to wavegen)
-    // This channel is now managed by start_resynth_thread internally.
-    // let (update_tx_for_wavegen, update_rx_for_wavegen) = mpsc::channel::<crate::resynth::SynthUpdate>();
+    // Shared state for shutdown and timers
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_complete = Arc::new(AtomicBool::new(false));
+    let stream_ready = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
+    let start_time = Arc::new(Instant::now());
 
-    // After input device selection but before thread creation
-    println!("\nAvailable Output Devices:");
-    let mut output_devices = Vec::new();
-    for (_i, device) in devices.iter().enumerate() {
-        let (index, info) = device;
-        if info.max_output_channels >= 2 {  // Need at least stereo output
-            println!("  [{}] - {} ({} channels)", output_devices.len(), info.name, info.max_output_channels);
-            output_devices.push(*index);
-        }
-    }
-
-    if output_devices.is_empty() {
-        return Err(anyhow!("No stereo output devices found."));
-    }
-
-    let output_device_index = if let Some(idx) = args.output_device {
-        idx
-    } else {
-    print!("Enter the index of the desired output device: ");
-    io::stdout().flush()?;
-        let mut input_line = String::new();
-        io::stdin().read_line(&mut input_line)?;
-        input_line
-        .trim()
-        .parse::<usize>()
-            .map_err(|_| anyhow!("Invalid device index"))?
-    };
-
-    if output_device_index >= output_devices.len() {
-        return Err(anyhow!("Invalid output device index"));
-    }
-
-    let selected_output_device = output_devices[output_device_index];
-
-    // After device selection but before starting threads:
-    let control_path = "/dev/shm/audio_control";
-    let mut control_file = std::fs::File::create(&control_path)?;
-    writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
-
+    // Before starting the FFT thread, initialize spectrograph history with fixed capacity
+    let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::with_capacity(MAX_SPECTROGRAPH_HISTORY)));
+    
     // Initialize shared memory without mutex BEFORE threads start
     let shared_partials = {
         let shmem_name = "audio_peaks";
@@ -603,127 +634,158 @@ async fn run(args: &Args) -> Result<()> {
             path: shared_memory_path,
         })
     };
+    
+    // --- Thread variable setup ---
+    let shutdown_flag_audio = Arc::clone(&shutdown_flag);
+    let shutdown_flag_fft = Arc::clone(&shutdown_flag);
+    let shutdown_flag_resynth = Arc::clone(&shutdown_flag);
+    
+    let main_buffer_audio = Arc::clone(&audio_buffer);
+    let main_buffer_fft = Arc::clone(&audio_buffer);
 
-    // Before starting the FFT thread, initialize spectrograph history with fixed capacity
-    let spectrograph_history = Arc::new(Mutex::new(VecDeque::<SpectrographSlice>::with_capacity(MAX_SPECTROGRAPH_HISTORY)));
-    let spectrograph_history_fft = Arc::clone(&spectrograph_history);
+    let buffer_size_audio = Arc::clone(&buffer_size);
 
-    // Create the broadcast channel for partials
-    let (partials_tx, partials_rx) = broadcast::channel::<PartialsData>(16); 
-    // Clone sender for FFT thread
-    let fft_partials_tx = partials_tx.clone();
+    let fft_config_audio = Arc::clone(&fft_config);
+    let fft_config_gui = Arc::clone(&fft_config);
+    let fft_config_fft = Arc::clone(&fft_config);
 
-    // Pass shared_partials to FFT thread
-    let shared_partials_clone = shared_partials.clone();
-    let start_time = Arc::new(Instant::now());
-    let start_time_fft = Arc::clone(&start_time);
-    let fft_thread = std::thread::spawn({
-        let audio_buffer = Arc::clone(&audio_buffer);
-        let fft_config = Arc::clone(&fft_config);
-        let spectrum_app = Arc::clone(&spectrum_app);
-        let selected_channels = selected_channels.clone();
-        let shutdown_flag_fft = Arc::clone(&shutdown_flag);
-        let shared_partials_clone = shared_partials_clone.clone();
-        let spectrograph_history = spectrograph_history_fft;
-        let start_time = start_time_fft;
-        let partials_tx_clone = fft_partials_tx;
+    let resynth_config_audio = Arc::clone(&resynth_config);
+    let resynth_config_resynth = Arc::clone(&resynth_config);
+    let resynth_config_gui = Arc::clone(&resynth_config);
 
-        move || {
-            fft_analysis::start_fft_processing(
-                audio_buffer,
-                fft_config,
-                spectrum_app,
-                selected_channels,
-                selected_sample_rate as u32,
-                shutdown_flag_fft,
-                partials_tx_clone,
-                Some(spectrograph_history),
-                Some(start_time),
-            );
-        }
-    });
-
-    // Start audio thread
-    info!("Starting audio sampling thread...");
-    let fft_config_clone = Arc::clone(&fft_config);
-    let audio_thread = std::thread::spawn(move || {
-        start_sampling_thread(
-            running,
-            audio_buffer_clone,
-            selected_channels_clone,
-            selected_sample_rate,
-            buffer_size_clone,
-            selected_device_index,
-            shutdown_flag_audio,
-            stream_ready_audio,
-            fft_config_clone,
-        );
-        shutdown_complete_audio.store(true, Ordering::SeqCst);
-    });
-
-    // Start FFT processing thread only after stream is ready
-    info!("Waiting for audio stream to initialize...");
+    let stream_ready_audio = Arc::clone(&stream_ready);
     let stream_ready_fft = Arc::clone(&stream_ready);
-    while !stream_ready_fft.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    
+    let selected_channels_audio = selected_channels.clone();
+    let selected_channels_fft = selected_channels.clone();
+    let num_input_channels_resynth = selected_channels.len();
+    let num_partials_resynth = num_partials;
 
-    // Start resynthesis thread
-    info!("Starting resynthesis...");
-    let resynth_partials_rx_broadcast = partials_tx.subscribe();
-    let resynth_thread = std::thread::spawn({
-        let resynth_config_clone = Arc::clone(&resynth_config);
-        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
-        let num_channels_val = selected_channels.len();
-        let num_partials_val = num_partials;
-        // Pass gui_param_rx to start_resynth_thread
-        let gui_param_rx_for_resynth = gui_param_rx;
-        let gain_update_rx_for_resynth = gain_update_rx;
+    let (partials_tx, _) = broadcast::channel::<PartialsData>(16); // Receiver is in resynth and GUI
+    let partials_tx_fft = partials_tx.clone();
+    let partials_rx_resynth = partials_tx.subscribe();
+    let partials_rx_gui = partials_tx.subscribe();
 
+    let (gui_param_tx_gui, gui_param_rx_resynth) = mpsc::channel::<GuiParameter>();
+    let (gain_update_tx_gui, gain_update_rx_resynth) = mpsc::channel::<f32>();
+    
+    // --- Start Threads ---
+    
+    // Audio Input Thread
+    let audio_thread_args = (
+        Arc::clone(&running),
+        Arc::clone(&main_buffer_audio),
+        selected_channels_audio.clone(),
+        selected_input_sample_rate,
+        Arc::clone(&buffer_size_audio),
+        selected_input_device,
+        Arc::clone(&shutdown_flag_audio),
+        Arc::clone(&stream_ready_audio),
+        Arc::clone(&fft_config_audio),
+        Arc::clone(&resynth_config_audio),
+    );
+    let _audio_thread = thread::spawn(move || {
+        audio_stream::start_sampling_thread(
+            audio_thread_args.0,
+            audio_thread_args.1,
+            audio_thread_args.2,
+            audio_thread_args.3,
+            audio_thread_args.4,
+            audio_thread_args.5,
+            audio_thread_args.6,
+            audio_thread_args.7,
+            audio_thread_args.8,
+            audio_thread_args.9,
+        );
+    });
+
+    // FFT Analysis Thread
+    let fft_thread_args = (
+        Arc::clone(&main_buffer_fft),
+        Arc::clone(&fft_config_fft),
+        Arc::clone(&spectrum_app),
+        selected_channels_fft.clone(),
+        selected_input_sample_rate as u32,
+        Arc::clone(&shutdown_flag_fft),
+        partials_tx_fft,
+        Some(Arc::clone(&spectrograph_history)),
+        Some(Arc::clone(&start_time)),
+    );
+    let _fft_thread = thread::spawn(move || {
+        start_fft_processing(
+            fft_thread_args.0,
+            fft_thread_args.1,
+            fft_thread_args.2,
+            fft_thread_args.3,
+            fft_thread_args.4,
+            fft_thread_args.5,
+            fft_thread_args.6,
+            fft_thread_args.7,
+            fft_thread_args.8,
+        );
+    });
+
+    // Resynth Thread
+    let resynth_thread_args = (
+        Arc::clone(&resynth_config_resynth),
+        selected_output_device,
+        selected_output_sample_rate,  // Make sure we use the output sample rate here
+        Arc::clone(&shutdown_flag_resynth),
+        partials_rx_resynth,
+        num_input_channels_resynth,
+        num_partials_resynth,
+        gui_param_rx_resynth,
+        gain_update_rx_resynth,
+    );
+    let _resynth_thread = std::thread::spawn({
         move || {
             start_resynth_thread(
-                resynth_config_clone,
-                selected_output_device,
-                selected_sample_rate,
-                shutdown_flag_clone,
-                resynth_partials_rx_broadcast, // This is broadcast::Receiver<PartialsData>
-                num_channels_val,
-                num_partials_val,
-                gui_param_rx_for_resynth, // Pass the GuiParameter receiver here
-                gain_update_rx_for_resynth, // Pass the gain update receiver here
+                resynth_thread_args.0,
+                resynth_thread_args.1,
+                resynth_thread_args.2,  // This is selected_output_sample_rate
+                resynth_thread_args.3,
+                resynth_thread_args.4,
+                resynth_thread_args.5,
+                resynth_thread_args.6,
+                resynth_thread_args.7,
+                resynth_thread_args.8,
             );
         }
     });
 
-    // Start GUI
+    // --- Start GUI ---
     info!("Starting GUI...");
-    let plot_partials_rx = partials_tx.subscribe();
+    // Before creating the app_creator, create clones of all variables needed for the GUI
+    let main_buffer_gui = Arc::clone(&audio_buffer);
+    let shutdown_flag_gui = Arc::clone(&shutdown_flag);
+    
+    // Create the GUI app directly
     let app = plot::MyApp::new(
-        spectrum_app.clone(),
-        fft_config.clone(),
-        buffer_size.clone(),
-        audio_buffer.clone(),
-        resynth_config.clone(),
-        shutdown_flag.clone(),
-        spectrograph_history.clone(),
-        start_time.clone(),
-        selected_sample_rate,
-        plot_partials_rx,
-        gui_param_tx, // Pass the sender to MyApp
-        gain_update_tx, // Pass the gain update sender to MyApp
+        spectrum_app,
+        fft_config_gui,
+        buffer_size,
+        main_buffer_gui,
+        resynth_config_gui,
+        shutdown_flag_gui,
+        spectrograph_history,
+        start_time,
+        selected_input_sample_rate,
+        partials_rx_gui,
+        gui_param_tx_gui,
+        gain_update_tx_gui,
     );
-
+    
     // Spawn SharedMemory update thread
     if let Some(shared_mem_info) = shared_partials {
         let shared_memory_partials_rx = partials_tx.subscribe();
-        let sm_shutdown_flag = shutdown_flag.clone();
+        let sm_shutdown_flag = Arc::clone(&shutdown_flag);
         tokio::spawn(async move {
             shared_memory_updater_loop(shared_memory_partials_rx, shared_mem_info.path, sm_shutdown_flag).await;
         });
     } else {
         warn!("SharedMemory struct not initialized, skipping shared memory update thread.");
     }
-
+    
     let native_options = NativeOptions {
         initial_window_size: Some(egui::vec2(1024.0, 440.0)),
         vsync: true,
@@ -740,13 +802,14 @@ async fn run(args: &Args) -> Result<()> {
 
     // Set shutdown flag to stop processing threads
     info!("Setting shutdown flag...");
-    shutdown_flag.store(true, Ordering::SeqCst);
+    // shutdown_flag is moved to the GUI thread, so we can't use it here.
+    // The GUI's on_close_event will handle setting the flag.
 
     // Wait for threads to finish with timeout
     let timeout = Duration::from_secs(5);
-    let start = std::time::Instant::now();
+    let start_wait = std::time::Instant::now();
 
-    while start.elapsed() < timeout {
+    while start_wait.elapsed() < timeout {
         if shutdown_complete.load(Ordering::SeqCst) {
             break;
         }
@@ -769,15 +832,190 @@ fn get_supported_sample_rates(
     num_channels: i32,
     pa: &pa::PortAudio,
 ) -> Vec<f64> {
-    let common_rates = [8000.0, 16000.0, 22050.0, 44100.0, 48000.0, 96000.0, 192000.0];
-    common_rates
-        .iter()
-        .cloned()
-        .filter(|&rate| {
-            let params = pa::StreamParameters::<f32>::new(device_index, num_channels, true, 0.0);
-            pa.is_input_format_supported(params, rate).is_ok()
-        })
-        .collect()
+    let device_info = match pa.device_info(device_index) {
+        Ok(info) => info,
+        Err(e) => {
+            error!("Failed to get device info: {}", e);
+            return vec![44100.0, 48000.0]; // Default fallback
+        }
+    };
+    
+    info!("Detecting supported sample rates for device: {}", device_info.name);
+    info!("Device default sample rate: {}", device_info.default_sample_rate);
+    
+    // Standard sample rates to test in order of preference
+    let standard_rates = [
+        44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0,
+        8000.0, 11025.0, 16000.0, 22050.0, 32000.0
+    ];
+
+    // Dynamic approach: test each rate with PortAudio
+    let mut supported_rates = Vec::new();
+    let input_params = pa::StreamParameters::<f32>::new(
+        device_index,
+        num_channels,
+        true,
+        device_info.default_low_input_latency,
+    );
+
+    for &rate in &standard_rates {
+        match pa.is_input_format_supported(input_params, rate) {
+            Ok(_) => {
+                info!("Device supports sample rate: {} Hz", rate);
+                supported_rates.push(rate);
+            }
+            Err(e) => {
+                debug!("Sample rate {} Hz not supported: {}", rate, e);
+            }
+        }
+    }
+
+    // If no rates detected, try to query the device directly
+    if supported_rates.is_empty() {
+        info!("No standard rates detected via PortAudio API, trying alternative methods");
+        
+        // Try to get the maximum supported rate via arecord trick (Linux-specific)
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+            
+            // Try a very high sample rate that will likely fail
+            let output = Command::new("arecord")
+                .args(&["-f", "dat", "-r", "200000", "-D", &format!("hw:{}", device_index.0), "-d", "1", "/dev/null"])
+                .output();
+                
+            if let Ok(output) = output {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                // Parse the output to find the actual supported rate
+                if let Some(rate_pos) = stderr.find("got = ") {
+                    if let Some(rate_end) = stderr[rate_pos+6..].find("Hz") {
+                        if let Ok(rate) = stderr[rate_pos+6..rate_pos+6+rate_end].trim().parse::<f64>() {
+                            info!("Found maximum sample rate via arecord: {} Hz", rate);
+                            supported_rates.push(rate);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If still empty, use device default
+        if supported_rates.is_empty() {
+            supported_rates.push(device_info.default_sample_rate);
+            warn!("Using device default sample rate: {} Hz", device_info.default_sample_rate);
+        }
+    }
+
+    // Sort rates from highest to lowest quality
+    supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    
+    info!("Device '{}' supported sample rates: {:?}", device_info.name, supported_rates);
+    supported_rates
+}
+
+fn get_supported_output_sample_rates(
+    device_index: pa::DeviceIndex,
+    pa: &pa::PortAudio,
+) -> Vec<f64> {
+    let device_info = match pa.device_info(device_index) {
+        Ok(info) => info,
+        Err(e) => {
+            error!("Failed to get output device info: {}", e);
+            return vec![44100.0, 48000.0]; // Default fallback
+        }
+    };
+    
+    info!("Detecting supported sample rates for output device: {}", device_info.name);
+    info!("Device default sample rate: {}", device_info.default_sample_rate);
+    
+    // Standard sample rates to test in order of preference
+    let standard_rates = [
+        44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0,
+        8000.0, 11025.0, 16000.0, 22050.0, 32000.0
+    ];
+
+    // Dynamic approach: test each rate with PortAudio
+    let mut supported_rates = Vec::new();
+    let output_params = pa::StreamParameters::<f32>::new(
+        device_index,
+        2, // Stereo output
+        true,
+        device_info.default_low_output_latency,
+    );
+
+    for &rate in &standard_rates {
+        match pa.is_output_format_supported(output_params, rate) {
+            Ok(_) => {
+                info!("Output device supports sample rate: {} Hz", rate);
+                supported_rates.push(rate);
+            }
+            Err(e) => {
+                debug!("Output sample rate {} Hz not supported: {}", rate, e);
+            }
+        }
+    }
+
+    // If no rates detected, try to query the device directly
+    if supported_rates.is_empty() {
+        info!("No standard rates detected via PortAudio API, trying alternative methods");
+        
+        // Try to get the maximum supported rate via aplay trick (Linux-specific)
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+            
+            // Try a very high sample rate that will likely fail
+            let output = Command::new("aplay")
+                .args(&["-f", "dat", "-r", "200000", "-D", &format!("hw:{}", device_index.0), "-d", "1", "/dev/null"])
+                .output();
+                
+            if let Ok(output) = output {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                // Parse the output to find the actual supported rate
+                if let Some(rate_pos) = stderr.find("got = ") {
+                    if let Some(rate_end) = stderr[rate_pos+6..].find("Hz") {
+                        if let Ok(rate) = stderr[rate_pos+6..rate_pos+6+rate_end].trim().parse::<f64>() {
+                            info!("Found maximum sample rate via aplay: {} Hz", rate);
+                            supported_rates.push(rate);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If still empty, use device default
+        if supported_rates.is_empty() {
+            supported_rates.push(device_info.default_sample_rate);
+            warn!("Using device default sample rate: {} Hz", device_info.default_sample_rate);
+        }
+    }
+
+    // Sort rates from highest to lowest quality
+    supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    
+    info!("Output device '{}' supported sample rates: {:?}", device_info.name, supported_rates);
+    supported_rates
+}
+
+// New function to find compatible sample rates between input and output devices
+fn find_compatible_sample_rates(
+    input_device_index: pa::DeviceIndex,
+    input_channels: i32,
+    output_device_index: pa::DeviceIndex,
+    pa: &pa::PortAudio,
+) -> Vec<f64> {
+    let input_rates = get_supported_sample_rates(input_device_index, input_channels, pa);
+    let output_rates = get_supported_output_sample_rates(output_device_index, pa);
+    
+    // Find common sample rates
+    let compatible = input_rates.into_iter()
+        .filter(|rate| output_rates.contains(rate))
+        .collect();
+    
+    info!("Compatible sample rates for both input and output: {:?}", compatible);
+    
+    compatible
 }
 
 fn reset_audio_devices(pa: &Arc<pa::PortAudio>) -> Result<()> {
@@ -845,5 +1083,66 @@ fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels:
             Err(anyhow!("Failed to read audio data: {}", e))
         }
     }
+}
+
+// Add this new function to set up logging to both console and file
+fn setup_logging(debug_mode: bool) -> Result<(), anyhow::Error> {
+    // Set the log level based on debug flag
+    let log_level = if debug_mode {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+
+    // Get the current executable's directory to place logs alongside the binary
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to get executable directory"))?
+        .to_path_buf();
+    
+    // Create log directory if it doesn't exist
+    let log_dir = exe_dir.join("logs");
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir)?;
+    }
+
+    // Generate log filename with timestamp
+    let now = chrono::Local::now();
+    let log_filename = log_dir.join(format!("debug_{}.log", now.format("%Y%m%d_%H%M%S")));
+    
+    println!("Debug logging enabled - writing to {}", log_filename.display());
+
+    // Make sure we remove any existing loggers first
+    log::set_max_level(LevelFilter::Off);
+    
+    // Configure logging to output to both terminal and file with detailed formatting
+    Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{}][{}][{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log_level)
+        // Terminal output
+        .chain(std::io::stdout())
+        // File output with explicit options to ensure writing works
+        .chain(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(&log_filename)?
+        )
+        .apply()?;
+
+    // Log a test message to verify logging is working
+    info!("Logging initialized: console and file output to {}", log_filename.display());
+    debug!("Debug logging test message - if you see this, debug logging is working");
+    
+    Ok(())
 }
 

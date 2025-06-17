@@ -177,7 +177,7 @@ impl MyApp {
         // current runtime Nyquist limit (sets the slider's *range* correctly).
         {
             let buffer_s = instance.buffer_size.lock().unwrap();
-            let nyquist_limit = (*buffer_s as f64 / 2.0).min(MAX_FREQ); // Use runtime buffer size
+            let nyquist_limit = (*buffer_s as f64 / 2.0).min(*MAX_FREQ); // Use runtime buffer size
             let mut cfg = instance.fft_config.lock().unwrap();
             if cfg.max_frequency > nyquist_limit {
                 cfg.max_frequency = nyquist_limit;
@@ -193,6 +193,14 @@ impl MyApp {
     }
 
     pub fn update_buffer_size(&mut self, new_size: usize) {
+        let current_size = match self.buffer_size.lock() {
+            Ok(guard) => *guard,
+            Err(_) => 0
+        };
+        
+        info!("BUFFER RESIZE: Starting buffer resize process from {} to {}", 
+              current_size, new_size);
+          
         let validated_size = new_size
             .next_power_of_two()
             .max(512)
@@ -200,43 +208,85 @@ impl MyApp {
 
         // Only log size adjustments at info level
         if validated_size != new_size {
-            info!("Buffer size adjusted: {} → {}", new_size, validated_size);
+            info!("BUFFER RESIZE: Size adjusted: {} → {}", new_size, validated_size);
         }
 
         // Log detailed calculations at debug level
-        debug!("Buffer validation: min={}, max={}, power_of_2={}",
+        debug!("BUFFER RESIZE: Validation - min={}, max={}, power_of_2={}",
                MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, validated_size);
 
         // Update the target buffer size value
         if let Ok(mut size) = self.buffer_size.lock() {
+            info!("BUFFER RESIZE: Updating buffer_size from {} to {}", *size, validated_size);
             *size = validated_size;
         } else {
-            error!("Failed to lock buffer_size for update.");
+            error!("BUFFER RESIZE: Failed to lock buffer_size for update.");
             return; // Don't proceed if we can't update the size
         }
 
-        // Signal the audio thread to handle the resize by setting the flag
-        if let Ok(buffer) = self.audio_buffer.read() {
-             // Use read lock just to access the flag Arc
-            buffer.needs_restart.store(true, Ordering::SeqCst);
-            #[cfg(target_os = "linux")]
-            {
-                debug!("Linux detected, forcing complete stream reinitialization via flag");
-                buffer.force_reinit.store(true, Ordering::SeqCst);
-            }
-            info!("Signaled audio thread to restart due to buffer size change request to {}", validated_size);
+        // First try to perform a direct buffer resize to ensure it completes properly
+        info!("BUFFER RESIZE: Attempting direct buffer resize operation");
+        let direct_resize_success = crate::audio_stream::perform_buffer_resize(
+            &self.audio_buffer,
+            &self.buffer_size,
+            &self.resynth_config
+        );
+        
+        if direct_resize_success {
+            info!("BUFFER RESIZE: Direct buffer resize completed successfully");
         } else {
-             error!("Failed to lock audio_buffer to signal restart.");
+            // If direct resize failed, signal the audio thread to handle the resize
+            info!("BUFFER RESIZE: Direct resize failed, signaling audio thread");
+            if let Ok(buffer) = self.audio_buffer.read() {
+                // Use read lock just to access the flag Arc
+                info!("BUFFER RESIZE: Setting needs_restart flag");
+                buffer.needs_restart.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "linux")]
+                {
+                    info!("BUFFER RESIZE: Linux detected, setting force_reinit flag");
+                    buffer.force_reinit.store(true, Ordering::SeqCst);
+                }
+                info!("BUFFER RESIZE: Signaled audio thread to restart due to buffer size change request to {}", validated_size);
+            } else {
+                error!("BUFFER RESIZE: Failed to lock audio_buffer to signal restart.");
+            }
+        }
+        
+        // Update FFT config to adjust max_frequency if needed based on new buffer size
+        if let Ok(mut fft_config) = self.fft_config.lock() {
+            // Calculate new Nyquist limit based on input sample rate
+            let nyquist_limit = (self.sample_rate / 2.0).min(validated_size as f64 / 2.0);
+            
+            info!("BUFFER RESIZE: Checking FFT config - current max_frequency: {}, new nyquist_limit: {}", 
+                  fft_config.max_frequency, nyquist_limit);
+            
+            // If current max_frequency exceeds the new Nyquist limit, adjust it
+            if fft_config.max_frequency > nyquist_limit {
+                info!("BUFFER RESIZE: Adjusting max_frequency from {} to {} Hz due to buffer resize", 
+                       fft_config.max_frequency, nyquist_limit);
+                fft_config.max_frequency = nyquist_limit;
+            }
+            
+            // Also adjust root_freq_max if needed
+            if fft_config.root_freq_max as f64 > nyquist_limit {
+                info!("BUFFER RESIZE: Adjusting root_freq_max from {} to {} Hz due to buffer resize", 
+                       fft_config.root_freq_max, nyquist_limit);
+                fft_config.root_freq_max = nyquist_limit as f32;
+            }
+        } else {
+            error!("BUFFER RESIZE: Failed to lock fft_config to adjust frequencies.");
         }
 
+        info!("BUFFER RESIZE: Process completed for size {}", validated_size);
+        
         // Explicitly request repaint to update UI state if needed
         self.last_repaint = Instant::now();
     }
 
-    // Helper method to get the current nyquist limit
+    // Helper method to get the current nyquist limit based on input sample rate
     fn get_nyquist_limit(&self) -> f32 {
-        let buffer_size = *self.buffer_size.lock().unwrap();
-        buffer_size as f32 / 2.0
+        let sample_rate = self.sample_rate as f32;
+        (sample_rate / 2.0) as f32
     }
 
     pub fn update_ui(&mut self, ui: &mut egui::Ui) {
@@ -278,12 +328,91 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn on_close_event(&mut self) -> bool {
-        info!("Closing GUI window...");
+        info!("GUI close event detected, setting shutdown flag");
         self.shutdown_flag.store(true, Ordering::SeqCst);
         true
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Track GUI update cycles for debugging
+        static mut LAST_UPDATE_LOG: Option<Instant> = None;
+        static mut UPDATE_COUNT: usize = 0;
+        static mut PLOT_UPDATE_COUNT: usize = 0;
+        
+        unsafe {
+            UPDATE_COUNT += 1;
+            
+            // Log every update cycle
+            PLOT_UPDATE_COUNT += 1;
+            // Log every GUI update to track rendering frequency
+            debug!("GUI update #{} - frame time: {:?}", 
+                   PLOT_UPDATE_COUNT, 
+                   self.last_repaint.elapsed());
+            
+            if let Some(last_time) = LAST_UPDATE_LOG {
+                if last_time.elapsed() >= Duration::from_secs(5) {
+                    debug!("GUI update stats: {} frames in last 5 seconds", UPDATE_COUNT);
+                    LAST_UPDATE_LOG = Some(Instant::now());
+                    UPDATE_COUNT = 0;
+                }
+            } else {
+                LAST_UPDATE_LOG = Some(Instant::now());
+            }
+        }
+        
+        // Check if buffer resize operation is in progress
+        let buffer_resize_in_progress = {
+            if let Ok(buffer) = self.audio_buffer.read() {
+                let needs_restart = buffer.needs_restart();
+                let needs_reinit = buffer.needs_reinit();
+                if needs_restart || needs_reinit {
+                    debug!("GUI update: Buffer resize in progress - needs_restart={}, needs_reinit={}", 
+                           needs_restart, needs_reinit);
+                }
+                needs_restart || needs_reinit
+            } else {
+                false
+            }
+        };
+
+        // Force more frequent updates during and immediately after buffer resize
+        static mut RESIZE_RECOVERY_TIMER: Option<Instant> = None;
+        static mut RESIZE_RECOVERY_COUNT: usize = 0;
+        
+        if buffer_resize_in_progress {
+            unsafe {
+                // Start recovery timer when resize begins
+                RESIZE_RECOVERY_TIMER = Some(Instant::now());
+                RESIZE_RECOVERY_COUNT = 0;
+                debug!("GUI detected buffer resize in progress - starting recovery timer");
+            }
+        }
+        
+        // Check if we're in the recovery period after a resize
+        let in_recovery_period = unsafe {
+            if let Some(timer) = RESIZE_RECOVERY_TIMER {
+                if !buffer_resize_in_progress && timer.elapsed() < Duration::from_secs(5) {
+                    // We're in recovery period - resize flags cleared but still need frequent updates
+                    RESIZE_RECOVERY_COUNT += 1;
+                    debug!("GUI in post-resize recovery period: {}ms elapsed, count={}", 
+                           timer.elapsed().as_millis(),
+                           RESIZE_RECOVERY_COUNT);
+                    true
+                } else if !buffer_resize_in_progress && timer.elapsed() >= Duration::from_secs(5) {
+                    // Recovery period ended
+                    debug!("GUI post-resize recovery period complete after {} updates", RESIZE_RECOVERY_COUNT);
+                    RESIZE_RECOVERY_TIMER = None;
+                    RESIZE_RECOVERY_COUNT = 0;
+                    false
+                } else {
+                    // Still in resize
+                    buffer_resize_in_progress
+                }
+            } else {
+                false
+            }
+        };
+
         // --- Buffer Size Debounce Check --- 
         let debounce_duration = Duration::from_millis(300);
         let mut size_to_apply_after_debounce: Option<usize> = None; // Variable to hold the size if debounce passes
@@ -294,6 +423,7 @@ impl eframe::App for MyApp {
                     let current_size = *self.buffer_size.lock().unwrap();
                     if desired_val != current_size {
                         size_to_apply_after_debounce = Some(desired_val); // Capture the value
+                        debug!("Buffer size debounce complete - applying new size: {}", desired_val);
                     }
                 }
                 // Clear timer and desired size regardless of whether we applied
@@ -304,52 +434,92 @@ impl eframe::App for MyApp {
 
         // Apply the change using the captured value
         if let Some(new_size) = size_to_apply_after_debounce {
+            debug!("Calling update_buffer_size with size: {}", new_size);
             self.update_buffer_size(new_size); // Call the actual update function
         }
         // --- End Debounce Check ---
 
-        // --- Receive and process partials --- 
-        if let Some(rx) = self.partials_rx.as_mut() { // Check if receiver exists
-            let mut latest_partials: Option<PartialsData> = None;
+        // Try to receive the latest partials data
+        let mut latest_partials: Option<PartialsData> = None;
+        let mut received_count = 0;
+        
+        // Try to get the latest partials data
+        if let Some(rx) = self.partials_rx.as_mut() {
             loop {
-                 match rx.try_recv() {
-                    Ok(partials) => { latest_partials = Some(partials); }
-                    Err(broadcast::error::TryRecvError::Empty) => break,
+                match rx.try_recv() {
+                    Ok(partials) => { 
+                        received_count += 1;
+                        debug!("GUI received partials update #{}: {} channels, {} partials per channel", 
+                               received_count,
+                               partials.len(), 
+                               if !partials.is_empty() { partials[0].len() } else { 0 });
+                        latest_partials = Some(partials); 
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => {
+                        if received_count == 0 {
+                            debug!("GUI received no new partials data this frame");
+                        }
+                        break;
+                    },
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                        warn!(target: "plot", "GUI partials receiver lagged by {} messages.", n);
-                        // latest_partials might contain the newest after lag
-                        break; // Process the latest one we got (if any)
+                        warn!("GUI partials receiver lagged by {} messages", n);
+                        break;
                     }
                     Err(broadcast::error::TryRecvError::Closed) => {
-                        warn!(target: "plot", "Partials broadcast channel closed for GUI.");
-                        self.partials_rx = None; // Stop trying to receive
+                        warn!("GUI partials channel closed");
+                        self.partials_rx = None;
                         break;
                     }
                 }
             }
-
-            if let Some(linear_partials) = latest_partials {
-                // Convert linear magnitudes to dB for display
-                let db_partials: PartialsData = linear_partials.into_iter().map(|channel_partials| {
-                    channel_partials.into_iter().map(|(freq, magnitude)| {
-                        let db_val = if magnitude > 1e-10 { // Avoid log(0)
-                            20.0 * magnitude.log10()
-                        } else {
-                            -100.0 // Or some other very low dB value
-                        };
-                        (freq, db_val.max(-100.0)) // Clamp dB to a minimum floor, e.g., -100dB
-                    }).collect()
-                }).collect();
-
-                // Update the shared SpectrumApp state with dB values
-                if let Ok(mut spectrum) = self.spectrum.lock() {
-                    spectrum.update_partials(db_partials);
-                }
-            }
         } else {
-            // Optional: Indicate somehow that data is not updating if receiver is gone
+            debug!("GUI has no partials receiver - data flow broken");
         }
-        // --- End receive and process partials ---
+
+        // Process the latest partials data if we got any
+        if let Some(linear_partials) = latest_partials {
+            debug!("GUI processing partials data - update #{}", unsafe { PLOT_UPDATE_COUNT });
+            // Convert linear magnitudes to dB for display
+            let db_partials: PartialsData = linear_partials.into_iter().map(|channel_partials| {
+                channel_partials.into_iter().map(|(freq, magnitude)| {
+                    let db_val = if magnitude > 1e-10 { // Avoid log(0)
+                        20.0 * magnitude.log10()
+                    } else {
+                        -100.0 // Or some other very low dB value
+                    };
+                    (freq, db_val.max(-100.0)) // Clamp dB to a minimum floor, e.g., -100dB
+                }).collect()
+            }).collect();
+
+            // Update the shared SpectrumApp state with dB values
+            if let Ok(mut spectrum) = self.spectrum.lock() {
+                debug!("GUI updating spectrum display with {} channels of data", db_partials.len());
+                spectrum.update_partials(db_partials);
+            } else {
+                error!("GUI failed to lock spectrum app for partials update");
+            }
+        }
+
+        // Request continuous repaints to keep UI responsive
+        // If buffer resize is in progress or in recovery period, request more frequent repaints
+        if buffer_resize_in_progress || in_recovery_period {
+            if buffer_resize_in_progress {
+                debug!("GUI requesting immediate repaint due to buffer resize operation");
+            } else if in_recovery_period {
+                debug!("GUI requesting immediate repaint during recovery period");
+            }
+            
+            // Force immediate repaint during resize/recovery
+            ctx.request_repaint();
+            self.last_repaint = Instant::now();
+        } else {
+            // Normal operation - throttle repaints to avoid excessive CPU usage
+            let now = Instant::now();
+            if now.duration_since(self.last_repaint) > Duration::from_millis(50) {
+                ctx.request_repaint();
+                self.last_repaint = now;
+            }
+        }
 
         // Throttling: Limit repaint to at most 10 times per second (every 100 ms)
         let now = Instant::now();
@@ -377,7 +547,7 @@ impl eframe::App for MyApp {
                     
                     ui.label("Max Frequency:");
                     let buffer_size = *self.buffer_size.lock().unwrap();
-                    let nyquist_limit = (buffer_size as f64 / 2.0).min(MAX_FREQ);
+                    let nyquist_limit = (buffer_size as f64 / 2.0).min(*MAX_FREQ);
                     ui.add(egui::Slider::new(&mut fft_config.max_frequency, 0.0..=nyquist_limit).text("Hz"));
 
                     ui.label("Magnitude Threshold:");
@@ -595,10 +765,12 @@ impl eframe::App for MyApp {
                 // Update max_frequency if needed
                 if fft_config.max_frequency > nyquist_limit {
                     fft_config.max_frequency = nyquist_limit;
+                    debug!("Adjusted max_frequency to nyquist limit: {} Hz", nyquist_limit);
                     
                     // Also update root_freq_max to match the same nyquist limit
                     if fft_config.root_freq_max > nyquist_limit as f32 {
                         fft_config.root_freq_max = nyquist_limit as f32;
+                        debug!("Adjusted root_freq_max to nyquist limit: {} Hz", nyquist_limit);
                     }
                 }
             }
@@ -819,8 +991,23 @@ impl eframe::App for MyApp {
                         [0.0, 0.0], // Min X, Min Y
                         [current_max_freq as f64, self.y_scale as f64] // Max X, Max Y
                     );
-                    // Add Debug log here
-                    debug!(target: "audio_streaming::plot", "Plot Update: current_max_freq = {}, bounds = {:?}", current_max_freq, bounds);
+                    
+                    // Add detailed plot update debug log with buffer resize status
+                    let buffer_resize_status = if let Ok(buffer) = self.audio_buffer.read() {
+                        format!("needs_restart={}, needs_reinit={}", 
+                               buffer.needs_restart(), buffer.needs_reinit())
+                    } else {
+                        "buffer_lock_failed".to_string()
+                    };
+                    
+                    debug!(target: "audio_streaming::plot", 
+                           "Plot Render: cycle={}, max_freq={}, buffer_resize={}, received_data={}, partials_count={}", 
+                           unsafe { PLOT_UPDATE_COUNT }, 
+                           current_max_freq, 
+                           buffer_resize_status,
+                           received_count > 0,
+                           all_bar_charts.len());
+                    
                     plot_ui.set_plot_bounds(bounds);
 
                     // Plot the data using the new style

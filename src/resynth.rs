@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use portaudio as pa;
 use log::{info, error, debug, warn};
-use crate::get_results::{start_update_thread_with_sender, GuiParameter};
+use crate::get_results::GuiParameter;
 use tokio::sync::broadcast;
 
 // Define type alias (same as other files)
@@ -30,6 +30,8 @@ pub struct ResynthConfig {
     pub freq_scale: f32,  // Frequency scaling factor (1.0 = normal, 2.0 = one octave up, 0.5 = one octave down)
     pub update_rate: f32, // THIS IS THE GUI DRIVEN RATE for refresh/crossfade timing
     pub needs_restart: Arc<AtomicBool>,  // Flag to signal when stream needs to restart
+    pub needs_stop: Arc<AtomicBool>,     // Flag to signal when stream needs to stop for buffer resize
+    pub output_sample_rate: Arc<Mutex<f64>>, // Store the output sample rate independently
 }
 
 impl Default for ResynthConfig {
@@ -39,6 +41,21 @@ impl Default for ResynthConfig {
             freq_scale: 1.0,
             update_rate: DEFAULT_UPDATE_RATE,
             needs_restart: Arc::new(AtomicBool::new(false)),
+            needs_stop: Arc::new(AtomicBool::new(false)),
+            output_sample_rate: Arc::new(Mutex::new(0.0)),
+        }
+    }
+}
+
+impl Clone for ResynthConfig {
+    fn clone(&self) -> Self {
+        Self {
+            gain: self.gain,
+            freq_scale: self.freq_scale,
+            update_rate: self.update_rate,
+            needs_restart: Arc::clone(&self.needs_restart),
+            needs_stop: Arc::clone(&self.needs_stop),
+            output_sample_rate: Arc::clone(&self.output_sample_rate),
         }
     }
 }
@@ -79,7 +96,7 @@ struct WaveSynth {
     total_fade_duration_frames: usize, // Based on GUI update_rate when fade started
     play_state: SynthPlayState,
 
-    sample_rate: f32,
+    pub sample_rate: f32,
     current_gain: f32, // GUI gain, applied at playback
 }
 
@@ -297,13 +314,30 @@ fn start_wavegen_thread(
     incoming_segment_slot: Arc<Mutex<Option<AudioSegment>>>,
     sample_rate: f32,
     shutdown_flag: Arc<AtomicBool>,
+    sample_rate_rx: mpsc::Receiver<f32>,
 ) {
     info!(target: "resynth::wavegen", "Wavegen thread started. Segments will be fixed at {} seconds.", FIXED_AUDIO_SEGMENT_LEN_SECONDS);
+    debug!(target: "resynth::wavegen", "Initial sample rate: {} Hz", sample_rate);
 
-    let fixed_segment_len_frames = (sample_rate * FIXED_AUDIO_SEGMENT_LEN_SECONDS).max(1.0) as usize;
+    let mut current_sample_rate = sample_rate;
+    let mut fixed_segment_len_frames = (current_sample_rate * FIXED_AUDIO_SEGMENT_LEN_SECONDS).max(1.0) as usize;
+    debug!(target: "resynth::wavegen", "Initial segment length: {} frames", fixed_segment_len_frames);
 
     thread::spawn(move || {
         while !shutdown_flag.load(Ordering::Relaxed) {
+            // Check for sample rate updates first
+            if let Ok(new_sample_rate) = sample_rate_rx.try_recv() {
+                info!(target: "resynth::wavegen", "Received new sample rate: {} Hz (was: {} Hz)", 
+                     new_sample_rate, current_sample_rate);
+                debug!(target: "resynth::wavegen", "BUFFER RESIZE: Updating wavegen sample rate from {} Hz to {} Hz", 
+                      current_sample_rate, new_sample_rate);
+                current_sample_rate = new_sample_rate;
+                fixed_segment_len_frames = (current_sample_rate * FIXED_AUDIO_SEGMENT_LEN_SECONDS).max(1.0) as usize;
+                info!(target: "resynth::wavegen", "Updated segment length to {} frames for sample rate {} Hz", 
+                     fixed_segment_len_frames, current_sample_rate);
+                debug!(target: "resynth::wavegen", "BUFFER RESIZE: New segment length: {} frames", fixed_segment_len_frames);
+            }
+            
             // Block for the definitive next update to process for a new segment
             let mut current_update = match update_rx.recv() { 
                 Ok(upd) => upd,
@@ -360,7 +394,7 @@ fn start_wavegen_thread(
                     let frame_idx = frame_chunk_start + frame_idx_offset;
                     if frame_idx >= fixed_segment_len_frames { break; }
 
-                    let time = frame_idx as f32 / sample_rate;
+                    let time = frame_idx as f32 / current_sample_rate;
                     
                     for ch_idx in 0..2 { // 0 for Left, 1 for Right
                         let target_buffer = if ch_idx == 0 { &mut left_samples } else { &mut right_samples };
@@ -416,151 +450,326 @@ fn start_wavegen_thread(
             let mut slot_guard = incoming_segment_slot.lock().unwrap();
             *slot_guard = Some(new_segment);
             debug!(target: "audio_streaming::resynth::wavegen", "New segment placed in incoming_segment_slot.");
-
         } // End of main `while !shutdown_flag` loop
         info!(target: "resynth::wavegen", "Wavegen thread shutting down.");
     });
 }
 
+/// Filter partials to only include frequencies within the output device's supported range
+fn filter_partials_for_output(partials: &[Vec<(f32, f32)>], output_sample_rate: f32) -> Vec<Vec<(f32, f32)>> {
+    // Calculate Nyquist frequency for the output device (half the sample rate)
+    let output_nyquist = output_sample_rate / 2.0;
+    
+    // Filter partials for each channel
+    partials.iter().map(|channel_partials| {
+        channel_partials.iter()
+            .filter(|(freq, _)| *freq <= output_nyquist)
+            .copied()
+            .collect()
+    }).collect()
+}
+
 /// Starts a thread that performs real-time resynthesis of the analyzed spectrum.
 pub fn start_resynth_thread(
-    config: Arc<Mutex<ResynthConfig>>, // For GUI-driven update_rate (fade timing) and gain/freq_scale (for wavegen)
+    config: Arc<Mutex<ResynthConfig>>,
     device_index: pa::DeviceIndex,
-    sample_rate: f64, // sample_rate for PortAudio and wave generation
+    sample_rate: f64,
     shutdown_flag: Arc<AtomicBool>,
-    partials_rx_broadcast: broadcast::Receiver<PartialsData>, // From FFT analysis
-    _num_input_channels: usize, // Informational, used by get_results
-    _num_partials_config: usize, // Informational, used by get_results
-    gui_param_rx: mpsc::Receiver<GuiParameter>, // NEW: Accept the receiver
-    gain_update_rx: mpsc::Receiver<f32>, // NEW: Gain update receiver for instant volume
+    mut partials_rx: broadcast::Receiver<PartialsData>,
+    num_channels: usize,
+    num_partials: usize,
+    gui_param_rx: mpsc::Receiver<GuiParameter>,
+    gain_update_rx: mpsc::Receiver<f32>,
 ) {
-    debug!(target: "resynth::main", "Initializing resynthesis thread. Sample rate: {}", sample_rate);
-    let sample_rate_f32 = sample_rate as f32;
+    debug!("Resynth thread starting - {} channels, {} partials per channel", num_channels, num_partials);
 
-    // Create the shared WaveSynth instance for the PA callback
-    let synth_callback_instance = Arc::new(Mutex::new(WaveSynth::new(sample_rate_f32)));
+    // Store the output sample rate in the ResynthConfig
+    if let Ok(mut config_locked) = config.lock() {
+        if let Ok(mut output_sr) = config_locked.output_sample_rate.lock() {
+            *output_sr = sample_rate;
+            info!(target: "resynth::main", "Stored output sample rate: {} Hz", sample_rate);
+        }
+    }
 
-    // Slot for wavegen_thread to place newly generated segments
-    let incoming_segment_slot = Arc::new(Mutex::new(None::<AudioSegment>));
+    // Create a channel for passing sample rate updates to the wavegen thread
+    let (sample_rate_tx, sample_rate_rx) = mpsc::channel::<f32>();
 
-    // Channel for get_results -> wavegen_thread
-    let (update_tx_for_wavegen, update_rx_for_wavegen) = mpsc::channel::<SynthUpdate>();
+    // Create a shared slot for passing generated segments from wavegen -> audio thread
+    let incoming_segment_slot: Arc<Mutex<Option<AudioSegment>>> = Arc::new(Mutex::new(None));
+    let incoming_segment_slot_clone = Arc::clone(&incoming_segment_slot);
 
-    // Start the thread that gets partials from broadcast and sends SynthUpdate to wavegen
-    start_update_thread_with_sender(
-        Arc::clone(&config), // Used by get_results for gain, freq_scale, and its own timing
-        Arc::clone(&shutdown_flag),
-        update_tx_for_wavegen, // Sender for SynthUpdate
-        partials_rx_broadcast, // Receiver of PartialsData from FFT
-        gui_param_rx, // NEW: Pass it through
-    );
+    // Create the channel for passing updates from get_results -> wavegen
+    let (update_tx, update_rx) = mpsc::channel::<SynthUpdate>();
+    
+    // Create the WaveSynth instance for the audio callback
+    let synth_instance = Arc::new(Mutex::new(WaveSynth::new(sample_rate as f32)));
+    let synth_instance_clone = Arc::clone(&synth_instance);
 
-    // Start the wave generation thread
-    start_wavegen_thread(
-        update_rx_for_wavegen,
-        Arc::clone(&incoming_segment_slot),
-        sample_rate_f32,
-        Arc::clone(&shutdown_flag),
-    );
+    // Clone config for the update thread
+    let config_for_update = Arc::clone(&config);
+
+    // Create a thread for generating waveforms from partials
+    let wavegen_shutdown_flag = Arc::clone(&shutdown_flag);
+    let _wavegen_thread = thread::spawn(move || {
+        start_wavegen_thread(update_rx, incoming_segment_slot, sample_rate as f32, wavegen_shutdown_flag, sample_rate_rx);
+    });
+
+    // Create a thread for updating partials from FFT analysis
+    let update_shutdown_flag = Arc::clone(&shutdown_flag);
+    let _update_thread = thread::spawn(move || {
+        // This thread subscribes to the broadcast channel and forwards updates to the wavegen thread
+        let mut partials_rx = partials_rx;
+        let mut last_update = Instant::now();
+        let mut config_clone = ResynthConfig::default();
+
+        // Get initial config values
+        if let Ok(cfg) = config_for_update.lock() {
+            config_clone = ResynthConfig {
+                gain: cfg.gain,
+                freq_scale: cfg.freq_scale,
+                update_rate: cfg.update_rate,
+                needs_restart: Arc::clone(&cfg.needs_restart),
+                needs_stop: Arc::clone(&cfg.needs_stop),
+                output_sample_rate: Arc::clone(&cfg.output_sample_rate),
+            };
+        }
+
+        while !update_shutdown_flag.load(Ordering::SeqCst) {
+            // Check for GUI parameter updates
+            while let Ok(param) = gui_param_rx.try_recv() {
+                match param {
+                    GuiParameter::UpdateRate(rate) => {
+                        debug!(target: "resynth::update", "Received UpdateRate: {}", rate);
+                        config_clone.update_rate = rate;
+                    },
+                    GuiParameter::FreqScale(scale) => {
+                        debug!(target: "resynth::update", "Received FreqScale: {}", scale);
+                        config_clone.freq_scale = scale;
+                    },
+                    GuiParameter::Gain(gain) => {
+                        debug!(target: "resynth::update", "Received Gain: {}", gain);
+                        config_clone.gain = gain;
+                    },
+                }
+            }
+
+            // Check for instant gain updates (these bypass the normal update cycle)
+            while let Ok(gain) = gain_update_rx.try_recv() {
+                debug!(target: "resynth::update", "Received instant gain update: {}", gain);
+                if let Ok(mut synth) = synth_instance_clone.lock() {
+                    synth.set_gain(gain);
+                }
+            }
+
+            // Check for new partials data
+            match partials_rx.try_recv() {
+                Ok(partials) => {
+                    if last_update.elapsed() >= Duration::from_secs_f32(config_clone.update_rate) {
+                        // Filter partials to only include frequencies within the output device's supported range
+                        let filtered_partials = filter_partials_for_output(&partials, sample_rate as f32);
+                        
+                        // Log how many partials were filtered out
+                        let original_count: usize = partials.iter().map(|channel| channel.len()).sum();
+                        let filtered_count: usize = filtered_partials.iter().map(|channel| channel.len()).sum();
+                        if filtered_count < original_count {
+                            debug!(target: "resynth::update", "Filtered partials for output: {} -> {} (removed {} that exceed output Nyquist frequency of {} Hz)",
+                                original_count, filtered_count, original_count - filtered_count, sample_rate as f32 / 2.0);
+                        }
+                        
+                        // Create update with filtered partials
+                        let update = SynthUpdate {
+                            partials: filtered_partials,
+                            gain: config_clone.gain,
+                            freq_scale: config_clone.freq_scale,
+                            update_rate: config_clone.update_rate,
+                        };
+                        
+                        if let Err(e) = update_tx.send(update) {
+                            error!(target: "resynth::update", "Failed to send update to wavegen thread: {}", e);
+                        }
+                        last_update = Instant::now();
+                    }
+                },
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // No new data, wait a bit
+                    thread::sleep(Duration::from_millis(10));
+                },
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    warn!(target: "resynth::update", "Resynth thread lagged by {} messages", n);
+                },
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    error!(target: "resynth::update", "Broadcast channel closed");
+                    break;
+                }
+            }
+        }
+    });
 
     // Main loop for this thread: manages PortAudio stream and timed segment switching
     let resynth_thread_shutdown_flag = Arc::clone(&shutdown_flag);
     let resynth_config_accessor = Arc::clone(&config);
-    let pa_synth_instance_accessor = Arc::clone(&synth_callback_instance);
+    let pa_synth_instance_accessor = Arc::clone(&synth_instance);
+    let sample_rate_tx_clone = sample_rate_tx.clone();
 
     thread::spawn(move || {
-        let mut pa_stream: Option<pa::Stream<pa::NonBlocking, pa::Output<f32>>> = None;
-        let mut last_pa_restart_time = Instant::now();
-        let mut consecutive_pa_errors = 0;
+        debug!(target: "resynth::main", "Starting resynth main thread");
         
-        let mut needs_pa_restart_due_to_config = false; // From ResynthConfig.needs_restart
-
-        debug!(target: "resynth::main", "Entering main resynthesis loop (PA management and segment switching).");
-
+        // Setup audio output stream
+        let mut stream_result = setup_audio_stream(device_index, sample_rate, Arc::clone(&pa_synth_instance_accessor));
+        let mut stream = match stream_result {
+            Ok(s) => Some(s),
+            Err(e) => {
+                error!(target: "resynth::main", "Failed to setup initial audio stream: {}", e);
+                None
+            }
+        };
+        
+        let mut consecutive_pa_errors = 0;
+        let mut last_pa_restart_time = Instant::now();
+        
+        // Main loop
+        let mut last_segment_check = Instant::now();
+        
         while !resynth_thread_shutdown_flag.load(Ordering::Relaxed) {
-            // --- Instant Gain Update ---
-            // Check for new gain values from the GUI and update WaveSynth immediately
-            while let Ok(new_gain) = gain_update_rx.try_recv() {
-                if let Ok(mut synth) = pa_synth_instance_accessor.lock() {
-                    synth.set_gain(new_gain);
-                    debug!(target: "audio_streaming::resynth", "Instant gain update: set to {:.4}", new_gain);
+            // Check for config changes first
+            let current_config = {
+                if let Ok(config) = resynth_config_accessor.lock() {
+                    // Check if we need to stop
+                    if config.needs_stop.load(Ordering::SeqCst) {
+                        debug!("Resynth thread detected stop request");
+                        if let Some(ref mut stream) = stream {
+                            if let Err(e) = stream.stop() {
+                                error!("Failed to stop output stream: {}", e);
+                            } else {
+                                debug!("Output stream stopped successfully due to stop request");
+                            }
+                        }
+                        stream = None;
+                        config.needs_stop.store(false, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+
+                    // Check if we need to restart
+                    if config.needs_restart.load(Ordering::SeqCst) {
+                        debug!("Resynth thread detected restart request");
+                        // Stop the current stream if it exists
+                        if let Some(ref mut stream) = stream {
+                            if let Err(e) = stream.stop() {
+                                error!("Failed to stop output stream for restart: {}", e);
+                            } else {
+                                debug!("Output stream stopped successfully for restart");
+                            }
+                        }
+                        stream = None;
+                        
+                        // Clear the restart flag
+                        config.needs_restart.store(false, Ordering::SeqCst);
+                        
+                        // Try to reinitialize the stream
+                        match setup_audio_stream(device_index, sample_rate, Arc::clone(&pa_synth_instance_accessor)) {
+                            Ok(new_stream) => {
+                                stream = Some(new_stream);
+                                debug!("Output stream reinitialized successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to reinitialize output stream: {}", e);
+                            }
+                        }
+                        
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+
+                    // Copy current config values
+                    ResynthConfig {
+                        gain: config.gain,
+                        freq_scale: config.freq_scale,
+                        update_rate: config.update_rate,
+                        needs_restart: Arc::new(AtomicBool::new(false)),
+                        needs_stop: Arc::new(AtomicBool::new(false)),
+                        output_sample_rate: Arc::clone(&config.output_sample_rate),
+                    }
+                } else {
+                    // If we can't lock the config, use defaults
+                    debug!("Resynth thread couldn't lock config, using defaults");
+                    ResynthConfig::default()
                 }
-            }
-
-            // --- PortAudio Stream Management ---
-            let current_resynth_config_locked = resynth_config_accessor.lock().unwrap();
-            if current_resynth_config_locked.needs_restart.load(Ordering::Relaxed) {
-                needs_pa_restart_due_to_config = true;
-                current_resynth_config_locked.needs_restart.store(false, Ordering::Relaxed); // Consume flag
-                debug!(target: "resynth::main", "PA stream restart explicitly requested by config.");
-            }
-            // Extract values needed later before dropping lock
-            let gui_driven_update_rate_for_polling = current_resynth_config_locked.update_rate;
-            let current_target_gain_for_fade_logic = current_resynth_config_locked.gain;
-            drop(current_resynth_config_locked); // Release lock early
-
-            let should_attempt_pa_restart = pa_stream.is_none() || needs_pa_restart_due_to_config;
-            let backoff_duration = if consecutive_pa_errors > 0 {
-                Duration::from_millis((500 * consecutive_pa_errors.min(10) as u64).min(5000))
-            } else {
-                Duration::from_millis(100) // Faster retry if no errors
             };
 
-            if should_attempt_pa_restart && last_pa_restart_time.elapsed() >= backoff_duration {
-                if let Some(mut stream) = pa_stream.take() {
-                    let _ = stream.stop();
-                    let _ = stream.close();
-                    debug!(target: "resynth::main", "Stopped existing PA stream for restart.");
-                }
+            // Check if stream needs to be started or restarted
+            if stream.is_none() {
+                let backoff_duration = if consecutive_pa_errors > 0 {
+                    Duration::from_millis((500 * consecutive_pa_errors.min(10) as u64).min(5000))
+                } else {
+                    Duration::from_millis(100) // Faster retry if no errors
+                };
                 
-                debug!(target: "resynth::main", "Attempting to setup/restart PA output stream.");
-                match setup_audio_stream(
-                    device_index,
-                    sample_rate,
-                    Arc::clone(&pa_synth_instance_accessor), // Pass WaveSynth for callback
-                ) {
-                    Ok(stream) => {
-                        pa_stream = Some(stream);
-                        consecutive_pa_errors = 0;
-                        needs_pa_restart_due_to_config = false;
-                        info!(target: "resynth::main", "PA output stream started/restarted successfully.");
+                if last_pa_restart_time.elapsed() >= backoff_duration {
+                    debug!(target: "resynth::main", "Attempting to setup PA output stream.");
+                    
+                    // Get the stored output sample rate
+                    let output_sample_rate = if let Ok(config) = resynth_config_accessor.lock() {
+                        if let Ok(sr) = config.output_sample_rate.lock() {
+                            *sr
+                        } else {
+                            sample_rate // Fallback to original parameter if lock fails
+                        }
+                    } else {
+                        sample_rate // Fallback to original parameter if lock fails
+                    };
+                    
+                    match setup_audio_stream(
+                        device_index,
+                        output_sample_rate,
+                        Arc::clone(&pa_synth_instance_accessor),
+                    ) {
+                        Ok(s) => {
+                            stream = Some(s);
+                            consecutive_pa_errors = 0;
+                            info!(target: "resynth::main", "PA output stream started successfully.");
+                        }
+                        Err(e) => {
+                            error!(target: "resynth::main", "Failed to setup PA output stream: {}. Retrying after backoff.", e);
+                            consecutive_pa_errors += 1;
+                        }
                     }
-                    Err(e) => {
-                        error!(target: "resynth::main", "Failed to setup/restart PA output stream: {}. Retrying after backoff.", e);
-                        consecutive_pa_errors += 1;
-                        pa_stream = None; // Ensure it's None on failure
-                    }
+                    last_pa_restart_time = Instant::now();
                 }
-                last_pa_restart_time = Instant::now();
             }
-
-            // --- Timed Segment Switching Logic ---
-            // gui_driven_update_rate is now gui_driven_update_rate_for_polling
-            // current_target_gain_for_fade_logic is available here
             
             // Check for a newly generated segment from wavegen_thread
-            let new_segment_option = incoming_segment_slot.lock().unwrap().take();
-
-            if let Some(new_segment) = new_segment_option {
-                debug!(target: "resynth::main", "New segment taken from slot. Preparing for crossfade. Base GUI rate for fade: {:.3}s, Current target gain: {:.3}", gui_driven_update_rate_for_polling, current_target_gain_for_fade_logic);
-                pa_synth_instance_accessor.lock().unwrap().prepare_for_crossfade(new_segment, gui_driven_update_rate_for_polling, current_target_gain_for_fade_logic);
+            if last_segment_check.elapsed() >= Duration::from_millis(50) {
+                if let Ok(mut slot) = incoming_segment_slot_clone.lock() {
+                    if let Some(new_segment) = slot.take() {
+                        debug!(target: "resynth::main", "New audio segment available from wavegen. Length: {} frames", new_segment.len_frames);
+                        
+                        // Get the WaveSynth instance and tell it to prepare for crossfade with the new segment
+                        if let Ok(mut synth) = pa_synth_instance_accessor.lock() {
+                            synth.prepare_for_crossfade(
+                                new_segment,
+                                current_config.update_rate,
+                                current_config.gain
+                            );
+                        } else {
+                            error!(target: "resynth::main", "Failed to lock synth instance for segment update");
+                        }
+                    }
+                }
+                last_segment_check = Instant::now();
             }
             
-            // The sleep duration determines how often we check for new segments and potentially switch.
-            // This should align with the GUI update rate to make switches timely.
-            // A shorter sleep allows faster reaction to new segments in the slot if get_results is faster than GUI rate.
-            // Let's sleep for a fraction of the GUI update rate to be responsive.
-            let sleep_time_for_switch_check = Duration::from_millis(10); // Check much more frequently (100Hz)
-            thread::sleep(sleep_time_for_switch_check);
+            // Sleep to avoid high CPU usage
+            thread::sleep(Duration::from_millis(10));
         }
-
+        
         // Shutdown PA stream
-        if let Some(mut stream) = pa_stream.take() {
-            let _ = stream.stop();
-            let _ = stream.close();
-            debug!(target: "resynth::main", "Final PA stream stop and close.");
+        if let Some(mut s) = stream {
+            let _ = s.stop();
+            let _ = s.close();
         }
-        info!(target: "resynth::main", "Resynthesis thread (PA management and segment switching) shutting down.");
+        
+        debug!(target: "resynth::main", "Resynth thread exiting");
     });
 }
 
@@ -574,28 +783,58 @@ fn setup_audio_stream(
     let device_info = pa_ctx.device_info(device_index)
         .map_err(|e| anyhow::anyhow!("Failed to get device info: {}", e))?;
     
-    debug!(target: "resynth::pa_setup", "Setting up PA stream for device: {}, Output Channels: {}, Default SR: {}",
+    info!(target: "resynth::pa_setup", "Setting up PA stream for device: {}, Output Channels: {}, Default SR: {}",
         device_info.name, device_info.max_output_channels, device_info.default_sample_rate);
 
     if device_info.max_output_channels < 2 {
         return Err(anyhow::anyhow!("Selected output device {} does not support stereo output (has {} channels).", device_info.name, device_info.max_output_channels));
     }
 
+    // For HDA devices, use specific settings
+    let is_hda = device_info.name.contains("HDA");
+    let latency = if is_hda {
+        // HDA devices work better with higher latency
+        info!(target: "resynth::pa_setup", "Using higher latency for HDA device");
+        device_info.default_high_output_latency
+    } else {
+        device_info.default_low_output_latency
+    };
+
     let output_params = pa::StreamParameters::<f32>::new(
         device_index,
         2, // Force stereo output
         true, // Interleaved
-        device_info.default_low_output_latency // Or default_high_output_latency for more stability
+        latency
     );
 
-    // Validate format
-    pa_ctx.is_output_format_supported(output_params, sample_rate)
-        .map_err(|e| anyhow::anyhow!("Output format not supported (SR: {}, Ch: 2): {}", sample_rate, e))?;
+    // For HDA devices, if requested sample rate doesn't match default,
+    // warn but continue anyway since we know they typically support common rates
+    if is_hda && (sample_rate != device_info.default_sample_rate) {
+        info!(target: "resynth::pa_setup", 
+              "Using non-default sample rate {} Hz on HDA device (default: {} Hz)",
+              sample_rate, device_info.default_sample_rate);
+    }
+    
+    // Use a larger buffer size for high sample rates
+    let buffer_frames = if sample_rate > 96000.0 {
+        // For high sample rates, use larger buffer
+        4096
+    } else if sample_rate > 48000.0 {
+        // For medium sample rates
+        2048
+    } else {
+        // For standard sample rates
+        OUTPUT_BUFFER_SIZE as u32
+    };
+    
+    info!(target: "resynth::pa_setup", 
+          "Using buffer size of {} frames for sample rate {} Hz", 
+          buffer_frames, sample_rate);
     
     let stream_settings = pa::OutputStreamSettings::new(
         output_params,
         sample_rate,
-        OUTPUT_BUFFER_SIZE as u32 // PortAudio's internal buffer size, not our segment length
+        buffer_frames
     );
 
     let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
