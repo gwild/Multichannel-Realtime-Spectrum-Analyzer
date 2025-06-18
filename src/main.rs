@@ -192,6 +192,186 @@ fn calculate_max_freq(sample_rate: f64) -> f64 {
     sample_rate / 2.0
 }
 
+#[cfg(target_os = "macos")]
+fn filter_realistic_sample_rates(rates: Vec<f64>) -> Vec<f64> {
+    use std::process::Command;
+    
+    // On macOS, query the system directly for current sample rate capabilities
+    info!("Querying macOS for actual audio device capabilities...");
+    
+    // Use system_profiler to get the actual hardware sample rate
+    let output = Command::new("system_profiler")
+        .arg("SPAudioDataType")
+        .output();
+        
+    let mut native_rates = vec![44100.0, 48000.0]; // Default fallback rates
+    
+    if let Ok(output) = output {
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        // Try to extract supported sample rates from system_profiler output
+        if let Some(pos) = output_str.find("Current SampleRate:") {
+            if let Some(end_pos) = output_str[pos..].find('\n') {
+                let rate_str = &output_str[pos + 19..pos + end_pos].trim();
+                if let Ok(rate) = rate_str.parse::<f64>() {
+                    info!("Detected current hardware sample rate: {}", rate);
+                    
+                    // Usually hardware supports multiples/fractions of the current rate
+                    native_rates = vec![
+                        rate,
+                        rate / 2.0,
+                        rate * 2.0
+                    ];
+                    
+                    // Most pro audio devices support 44.1k and 48k variants
+                    if rate % 44100.0 == 0.0 || rate % 48000.0 == 0.0 {
+                        native_rates.extend_from_slice(&[
+                            44100.0,
+                            48000.0,
+                            88200.0,
+                            96000.0
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter the reported rates based on what we know about the hardware
+    // Allow rates only if they're actually supported by PortAudio AND likely supported by hardware
+    let mut realistic_rates: Vec<f64> = rates.into_iter()
+        .filter(|&rate| {
+            // Consider it realistic if:
+            // 1. It's one of the natively detected rates, or
+            // 2. It's a common audio rate <= 96kHz (most Mac hardware max)
+            native_rates.contains(&rate) || 
+            (rate <= 96000.0 && (
+                rate == 8000.0 || 
+                rate == 11025.0 || 
+                rate == 16000.0 || 
+                rate == 22050.0 || 
+                rate == 32000.0 || 
+                rate == 44100.0 || 
+                rate == 48000.0 || 
+                rate == 88200.0 || 
+                rate == 96000.0
+            ))
+        })
+        .collect();
+    
+    realistic_rates.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    
+    if realistic_rates.is_empty() {
+        // If filtering removed everything (shouldn't happen), include standard rates
+        info!("No realistic rates detected, falling back to standard rates");
+        vec![48000.0, 44100.0]
+    } else {
+        info!("Filtered to realistic hardware-supported rates: {:?}", realistic_rates);
+        realistic_rates
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn filter_realistic_sample_rates(rates: Vec<f64>) -> Vec<f64> {
+    // On other platforms, return original rates
+    rates
+}
+
+fn get_supported_sample_rates(
+    device_index: pa::DeviceIndex,
+    num_channels: i32,
+    pa: &pa::PortAudio,
+) -> Vec<f64> {
+    if let Ok(device_info) = pa.device_info(device_index) {
+        info!("Detecting supported sample rates for device: {}", device_info.name);
+        info!("Device default sample rate: {}", device_info.default_sample_rate);
+        
+        // Standard rates to check
+        let sample_rates = [
+            192000.0, 176400.0, 96000.0, 88200.0, 48000.0, 44100.0,
+            32000.0, 22050.0, 16000.0, 11025.0, 8000.0
+        ];
+        
+        let mut supported_rates = Vec::new();
+        
+        for &rate in &sample_rates {
+            let params = pa::StreamParameters::<f32>::new(
+                device_index,
+                num_channels,
+                true,
+                0.1
+            );
+            if pa.is_input_format_supported(params, rate as f64).is_ok() {
+                info!("Device supports sample rate: {} Hz", rate);
+                supported_rates.push(rate);
+            }
+        }
+        
+        // Add the device's default rate if not already included
+        if !supported_rates.contains(&(device_info.default_sample_rate as f64)) {
+            supported_rates.push(device_info.default_sample_rate);
+        }
+        
+        // Sort in descending order
+        supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        
+        // Filter out unrealistic rates on macOS
+        let filtered_rates = filter_realistic_sample_rates(supported_rates);
+        
+        info!("Device '{}' supported sample rates: {:?}", device_info.name, filtered_rates);
+        filtered_rates
+    } else {
+        vec![44100.0]  // If we can't query the device, return a safe default
+    }
+}
+
+fn get_supported_output_sample_rates(
+    device_index: pa::DeviceIndex,
+    pa: &pa::PortAudio,
+) -> Vec<f64> {
+    if let Ok(device_info) = pa.device_info(device_index) {
+        info!("Detecting supported sample rates for output device: {}", device_info.name);
+        info!("Device default sample rate: {}", device_info.default_sample_rate);
+        
+        // Standard rates to check
+        let sample_rates = [
+            192000.0, 176400.0, 96000.0, 88200.0, 48000.0, 44100.0,
+            32000.0, 22050.0, 16000.0, 11025.0, 8000.0
+        ];
+        
+        let mut supported_rates = Vec::new();
+        
+        for &rate in &sample_rates {
+            let params = pa::StreamParameters::<f32>::new(
+                device_index,
+                device_info.max_output_channels,
+                true,
+                0.1
+            );
+            if pa.is_output_format_supported(params, rate).is_ok() {
+                info!("Output device supports sample rate: {} Hz", rate);
+                supported_rates.push(rate);
+            }
+        }
+        
+        // Add the device's default rate if not already included
+        if !supported_rates.contains(&(device_info.default_sample_rate as f64)) {
+            supported_rates.push(device_info.default_sample_rate);
+        }
+        
+        // Sort in descending order
+        supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        
+        // Filter out unrealistic rates on macOS
+        let filtered_rates = filter_realistic_sample_rates(supported_rates);
+        
+        info!("Output device '{}' supported sample rates: {:?}", device_info.name, filtered_rates);
+        filtered_rates
+    } else {
+        vec![44100.0]  // If we can't query the device, return a safe default
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Parse command line arguments
@@ -219,22 +399,60 @@ async fn main() -> Result<(), anyhow::Error> {
             cmd_str.push_str(&format!(" '{}'", arg));
         }
         
-        cmd_str.push_str(" 2>&1 | tee debug.txt; read -p 'Press enter to close'");
+        // Use platform-specific terminal commands
+        #[cfg(target_os = "linux")]
+        {
+            cmd_str.push_str(" 2>&1 | tee debug.txt; read -p 'Press enter to close'");
 
-        let cmd = vec![
-            "xterm".to_string(),
-            "-hold".to_string(),
-            "-e".to_string(),
-            "bash".to_string(),
-            "-c".to_string(),
-            cmd_str,
-        ];
+            let cmd = vec![
+                "xterm".to_string(),
+                "-hold".to_string(),
+                "-e".to_string(),
+                "bash".to_string(),
+                "-c".to_string(),
+                cmd_str,
+            ];
 
-        let mut child = std::process::Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .spawn()
-            .expect("Failed to launch new terminal");
-        child.wait().expect("Failed to wait for child process");
+            let mut child = std::process::Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .spawn()
+                .expect("Failed to launch new terminal");
+            child.wait().expect("Failed to wait for child process");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, use osascript to open Terminal.app with our command
+            cmd_str.push_str("; echo 'Press enter to close'; read");
+            
+            let osascript_cmd = format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                cmd_str.replace("\"", "\\\"")
+            );
+
+            let mut child = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(osascript_cmd)
+                .spawn()
+                .expect("Failed to launch new terminal");
+            child.wait().expect("Failed to wait for child process");
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            cmd_str.push_str(" & pause");
+            
+            let mut child = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("start")
+                .arg("cmd")
+                .arg("/K")
+                .arg(cmd_str)
+                .spawn()
+                .expect("Failed to launch new terminal");
+            child.wait().expect("Failed to wait for child process");
+        }
+        
         return Ok(());
     }
 
@@ -266,11 +484,36 @@ fn check_and_start_gstreamer() {
                 .and_then(|p| p.parent().and_then(|d| d.parent().map(|pd| pd.join("stream.sh"))))
                 .unwrap_or_else(|| std::path::PathBuf::from("../stream.sh"));
 
+            // Use platform-specific terminal commands
+            #[cfg(target_os = "linux")]
             let start_result = std::process::Command::new("xterm")
                 .arg("-e")
                 .arg("bash")
                 .arg("-c")
                 .arg(format!("'{}; read -p \"Press enter to close\"'", script_path.display()))
+                .spawn();
+
+            #[cfg(target_os = "macos")]
+            let start_result = {
+                let cmd = format!("{}; echo 'Press enter to close'; read", script_path.display());
+                let osascript_cmd = format!(
+                    "tell application \"Terminal\" to do script \"{}\"",
+                    cmd.replace("\"", "\\\"")
+                );
+                
+                std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(osascript_cmd)
+                    .spawn()
+            };
+
+            #[cfg(target_os = "windows")]
+            let start_result = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("start")
+                .arg("cmd")
+                .arg("/K")
+                .arg(format!("{} & pause", script_path.display()))
                 .spawn();
 
             match start_result {
@@ -613,8 +856,18 @@ async fn run(args: &Args) -> Result<()> {
         output_sample_rate: Arc::new(Mutex::new(selected_output_sample_rate)),
     }));
 
+    // Get appropriate shared memory directory based on platform
+    #[cfg(target_os = "linux")]
+    let shm_dir = "/dev/shm";
+    
+    #[cfg(target_os = "macos")]
+    let shm_dir = "/tmp";
+    
+    #[cfg(target_os = "windows")]
+    let shm_dir = std::env::temp_dir().to_str().unwrap_or("C:\\Temp");
+
     // Write control file for external processes
-    let control_path = "/dev/shm/audio_control";
+    let control_path = format!("{}/audio_control", shm_dir);
     let mut control_file = std::fs::File::create(&control_path)?;
     writeln!(control_file, "{}\n{}\n{}", std::process::id(), selected_channels.len(), num_partials)?;
 
@@ -631,7 +884,7 @@ async fn run(args: &Args) -> Result<()> {
     // Initialize shared memory without mutex BEFORE threads start
     let shared_partials = {
         let shmem_name = "audio_peaks";
-        let shared_memory_path = format!("/dev/shm/{}", shmem_name);
+        let shared_memory_path = format!("{}/{}", shm_dir, shmem_name);
         let file = std::fs::File::create(&shared_memory_path)?;
         file.set_len(4 * 1024 * 1024)?;
         info!("Shared memory initialized at {} for internal use", shared_memory_path);
@@ -832,178 +1085,6 @@ async fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn get_supported_sample_rates(
-    device_index: pa::DeviceIndex,
-    num_channels: i32,
-    pa: &pa::PortAudio,
-) -> Vec<f64> {
-    let device_info = match pa.device_info(device_index) {
-        Ok(info) => info,
-        Err(e) => {
-            error!("Failed to get device info: {}", e);
-            return vec![44100.0, 48000.0]; // Default fallback
-        }
-    };
-    
-    info!("Detecting supported sample rates for device: {}", device_info.name);
-    info!("Device default sample rate: {}", device_info.default_sample_rate);
-    
-    // Standard sample rates to test in order of preference
-    let standard_rates = [
-        44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0,
-        8000.0, 11025.0, 16000.0, 22050.0, 32000.0
-    ];
-
-    // Dynamic approach: test each rate with PortAudio
-    let mut supported_rates = Vec::new();
-    let input_params = pa::StreamParameters::<f32>::new(
-        device_index,
-        num_channels,
-        true,
-        device_info.default_low_input_latency,
-    );
-
-    for &rate in &standard_rates {
-        match pa.is_input_format_supported(input_params, rate) {
-            Ok(_) => {
-                info!("Device supports sample rate: {} Hz", rate);
-                supported_rates.push(rate);
-            }
-            Err(e) => {
-                debug!("Sample rate {} Hz not supported: {}", rate, e);
-            }
-        }
-    }
-
-    // If no rates detected, try to query the device directly
-    if supported_rates.is_empty() {
-        info!("No standard rates detected via PortAudio API, trying alternative methods");
-        
-        // Try to get the maximum supported rate via arecord trick (Linux-specific)
-        #[cfg(target_os = "linux")]
-        {
-            use std::process::Command;
-            
-            // Try a very high sample rate that will likely fail
-            let output = Command::new("arecord")
-                .args(&["-f", "dat", "-r", "200000", "-D", &format!("hw:{}", device_index.0), "-d", "1", "/dev/null"])
-                .output();
-                
-            if let Ok(output) = output {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                
-                // Parse the output to find the actual supported rate
-                if let Some(rate_pos) = stderr.find("got = ") {
-                    if let Some(rate_end) = stderr[rate_pos+6..].find("Hz") {
-                        if let Ok(rate) = stderr[rate_pos+6..rate_pos+6+rate_end].trim().parse::<f64>() {
-                            info!("Found maximum sample rate via arecord: {} Hz", rate);
-                            supported_rates.push(rate);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If still empty, use device default
-        if supported_rates.is_empty() {
-            supported_rates.push(device_info.default_sample_rate);
-            warn!("Using device default sample rate: {} Hz", device_info.default_sample_rate);
-        }
-    }
-
-    // Sort rates from highest to lowest quality
-    supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    
-    info!("Device '{}' supported sample rates: {:?}", device_info.name, supported_rates);
-    supported_rates
-}
-
-fn get_supported_output_sample_rates(
-    device_index: pa::DeviceIndex,
-    pa: &pa::PortAudio,
-) -> Vec<f64> {
-    let device_info = match pa.device_info(device_index) {
-        Ok(info) => info,
-        Err(e) => {
-            error!("Failed to get output device info: {}", e);
-            return vec![44100.0, 48000.0]; // Default fallback
-        }
-    };
-    
-    info!("Detecting supported sample rates for output device: {}", device_info.name);
-    info!("Device default sample rate: {}", device_info.default_sample_rate);
-    
-    // Standard sample rates to test in order of preference
-    let standard_rates = [
-        44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0,
-        8000.0, 11025.0, 16000.0, 22050.0, 32000.0
-    ];
-
-    // Dynamic approach: test each rate with PortAudio
-    let mut supported_rates = Vec::new();
-    let output_params = pa::StreamParameters::<f32>::new(
-        device_index,
-        2, // Stereo output
-        true,
-        device_info.default_low_output_latency,
-    );
-
-    for &rate in &standard_rates {
-        match pa.is_output_format_supported(output_params, rate) {
-            Ok(_) => {
-                info!("Output device supports sample rate: {} Hz", rate);
-                supported_rates.push(rate);
-            }
-            Err(e) => {
-                debug!("Output sample rate {} Hz not supported: {}", rate, e);
-            }
-        }
-    }
-
-    // If no rates detected, try to query the device directly
-    if supported_rates.is_empty() {
-        info!("No standard rates detected via PortAudio API, trying alternative methods");
-        
-        // Try to get the maximum supported rate via aplay trick (Linux-specific)
-        #[cfg(target_os = "linux")]
-        {
-            use std::process::Command;
-            
-            // Try a very high sample rate that will likely fail
-            let output = Command::new("aplay")
-                .args(&["-f", "dat", "-r", "200000", "-D", &format!("hw:{}", device_index.0), "-d", "1", "/dev/null"])
-                .output();
-                
-            if let Ok(output) = output {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                
-                // Parse the output to find the actual supported rate
-                if let Some(rate_pos) = stderr.find("got = ") {
-                    if let Some(rate_end) = stderr[rate_pos+6..].find("Hz") {
-                        if let Ok(rate) = stderr[rate_pos+6..rate_pos+6+rate_end].trim().parse::<f64>() {
-                            info!("Found maximum sample rate via aplay: {} Hz", rate);
-                            supported_rates.push(rate);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If still empty, use device default
-        if supported_rates.is_empty() {
-            supported_rates.push(device_info.default_sample_rate);
-            warn!("Using device default sample rate: {} Hz", device_info.default_sample_rate);
-        }
-    }
-
-    // Sort rates from highest to lowest quality
-    supported_rates.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    
-    info!("Output device '{}' supported sample rates: {:?}", device_info.name, supported_rates);
-    supported_rates
-}
-
-// New function to find compatible sample rates between input and output devices
 fn find_compatible_sample_rates(
     input_device_index: pa::DeviceIndex,
     input_channels: i32,
