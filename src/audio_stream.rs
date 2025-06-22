@@ -1,4 +1,4 @@
-// This section is protected. Do not alter unless permission is requested by you and granted by me.
+ // This section is protected. Do not alter unless permission is requested by you and granted by me.
 // Reminder: All new lines added here are comments only. No existing lines have been deleted or changed.
 // We have added extra comments to remind ourselves that modifications require explicit permission.
 // The final line count must exceed 184 lines.

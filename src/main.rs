@@ -456,78 +456,8 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    // Check if GStreamer is running, start it if not
-    check_and_start_gstreamer();
-
-    if let Err(e) = run(&args).await {
-        error!("Application error in main: {:?}", e);
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-fn check_and_start_gstreamer() {
-    let gstreamer_check = std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg("gst-launch-1.0")
-        .output();
-
-    match gstreamer_check {
-        Ok(output) if output.status.success() => {
-            info!("GStreamer is already running.");
-        },
-        _ => {
-            info!("GStreamer is not running, attempting to start it in a new terminal...");
-            // Build absolute path to stream.sh located beside the binary
-            let script_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().and_then(|d| d.parent().map(|pd| pd.join("stream.sh"))))
-                .unwrap_or_else(|| std::path::PathBuf::from("../stream.sh"));
-
-            // Use platform-specific terminal commands
-            #[cfg(target_os = "linux")]
-            let start_result = std::process::Command::new("xterm")
-                .arg("-e")
-                .arg("bash")
-                .arg("-c")
-                .arg(format!("'{}; read -p \"Press enter to close\"'", script_path.display()))
-                .spawn();
-
-            #[cfg(target_os = "macos")]
-            let start_result = {
-                let cmd = format!("{}; echo 'Press enter to close'; read", script_path.display());
-                let osascript_cmd = format!(
-                    "tell application \"Terminal\" to do script \"{}\"",
-                    cmd.replace("\"", "\\\"")
-                );
-                
-                std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(osascript_cmd)
-                    .spawn()
-            };
-
-            #[cfg(target_os = "windows")]
-            let start_result = std::process::Command::new("cmd")
-                .arg("/C")
-                .arg("start")
-                .arg("cmd")
-                .arg("/K")
-                .arg(format!("{} & pause", script_path.display()))
-                .spawn();
-
-            match start_result {
-                Ok(child) => {
-                    info!("GStreamer stream started with PID: {} in a new terminal", child.id());
-                    // Wait a bit to ensure it starts
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                },
-                Err(e) => {
-                    error!("Failed to start GStreamer stream in a new terminal: {}", e);
-                }
-            }
-        }
-    }
+    // Run the async part of the application
+    run(&args).await
 }
 
 async fn run(args: &Args) -> Result<()> {
