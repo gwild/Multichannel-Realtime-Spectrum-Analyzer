@@ -1170,23 +1170,23 @@ pub fn run_native(
 pub mod display_utils {
     // This helper function formats partials with any number of partials
     pub fn format_partials(values: &Vec<(f32, f32)>, num_partials: usize) -> String {
-        // Format exactly num_partials values
+        // Format exactly num_partials values, creating a single horizontal string
         let magnitudes = (0..num_partials)
             .map(|i| {
                 if i < values.len() {
                     let (freq, db_val) = values[i];
-                    // Format dB value directly
-                    if db_val.is_finite() && freq > 0.0 { // Check if dB is valid and freq > 0
+                    // Format dB value directly, as it is now pre-calculated
+                    if db_val.is_finite() && freq > 0.0 {
                         format!("({:.2}, {:.0})", freq, db_val)
                     } else {
-                        "(0.00, -)".to_string() // Display '-' for invalid/zero values
+                        "(0.0, -)".to_string() // Display placeholder for invalid/silent values
                     }
                 } else {
-                    "(0.00, -)".to_string()
+                    "(0.0, -)".to_string()
                 }
             })
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", "); // Join into a single comma-separated string
         
         magnitudes
     }

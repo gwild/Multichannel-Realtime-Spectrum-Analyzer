@@ -924,7 +924,13 @@ fn extract_partials_from_spectrum(
             if magnitude >= linear_magnitude_threshold &&
                frequency >= config.min_frequency as f32 &&
                frequency <= config.max_frequency as f32 {
-                Some((frequency, magnitude)) // Return linear magnitude
+                // MOVE THE GUI's CONVERSION HERE: Robustly convert to dB
+                let db = if magnitude > 1e-10 { // Use an epsilon for stability
+                    20.0 * magnitude.log10()
+                } else {
+                    -120.0 // Use a large negative number for silence, as is standard
+                };
+                Some((frequency, db)) // Return correct dB magnitude
             } else {
                 None
             }

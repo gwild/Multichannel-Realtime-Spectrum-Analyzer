@@ -122,8 +122,7 @@ async fn shared_memory_updater_loop(
 
     while !shutdown_flag.load(Ordering::Relaxed) {
         match partials_rx.recv().await {
-            Ok(linear_partials) => {
-                // Track update frequency
+            Ok(db_partials) => {
                 update_count += 1;
                 let now = Instant::now();
                 if now.duration_since(last_update_time).as_secs() >= 5 {
@@ -132,26 +131,19 @@ async fn shared_memory_updater_loop(
                     update_count = 0;
                 }
 
-                // Log details about the received data
-                let channel_count = linear_partials.len();
-                let partials_count = if !linear_partials.is_empty() {
-                    linear_partials[0].len()
-                } else {
-                    0
-                };
+                let channel_count = db_partials.len();
+                let partials_count = if !db_partials.is_empty() { db_partials[0].len() } else { 0 };
                 
                 debug!(target: "shared_memory", 
-                    "Received partials data: {} channels, {} partials per channel", 
+                    "Received dB-scaled partials: {} channels, {} partials per channel", 
                     channel_count, partials_count);
 
-                // Serialize LINEAR partials (unitless magnitudes) to bytes for Python
-                // The received linear_partials already contains (frequency, linear_magnitude)
-                // where linear_magnitude is 0.0 for padded/non-existent partials.
+                // Serialize dB-scaled partials to bytes for Python.
                 let mut bytes_to_write = Vec::<u8>::new();
-                for channel_data in linear_partials { // Iterate directly over the received linear_partials
-                    for (freq, linear_mag) in channel_data { // 'linear_mag' is the original linear magnitude
+                for channel_data in db_partials { // Iterate over dB-scaled partials
+                    for (freq, db_amp) in channel_data { // Variable renamed for clarity
                         bytes_to_write.extend_from_slice(&freq.to_ne_bytes());
-                        bytes_to_write.extend_from_slice(&linear_mag.to_ne_bytes()); // Write the linear magnitude directly
+                        bytes_to_write.extend_from_slice(&db_amp.to_ne_bytes()); // Write the dB amplitude
                     }
                 }
 
