@@ -124,6 +124,9 @@ pub struct MyApp {
     is_adding_preset: bool,
     new_preset_name: String,
     show_delete_confirmation: bool,
+    // New fields for overwrite confirmation
+    show_overwrite_confirmation: bool,
+    preset_to_overwrite: String,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -186,6 +189,9 @@ impl MyApp {
             is_adding_preset: false,
             new_preset_name: String::new(),
             show_delete_confirmation: false,
+            // Initialize new fields
+            show_overwrite_confirmation: false,
+            preset_to_overwrite: String::new(),
         };
 
         // Apply the default preset on startup
@@ -388,6 +394,14 @@ impl MyApp {
             self.gain_update_tx.send(resynth_config.gain).unwrap_or_else(|e| error!("Failed to send instant gain update on preset load: {}", e));
             self.gui_param_tx.send(GuiParameter::FreqScale(resynth_config.freq_scale)).unwrap_or_else(|e| error!("Failed to send FreqScale update on preset load: {}", e));
             self.gui_param_tx.send(GuiParameter::UpdateRate(resynth_config.update_rate)).unwrap_or_else(|e| error!("Failed to send UpdateRate update on preset load: {}", e));
+
+            // Clear spectrograph history to avoid displaying stale data
+            if let Ok(mut history) = self.spectrograph_history.lock() {
+                info!("Clearing spectrograph history due to preset change.");
+                history.clear();
+            } else {
+                error!("Failed to lock spectrograph history for clearing.");
+            }
 
         } else {
             warn!("Attempted to load non-existent preset: {}", name);
@@ -622,13 +636,21 @@ impl eframe::App for MyApp {
                             .hint_text("New preset name..."),
                     );
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if !self.new_preset_name.trim().is_empty() && !self.preset_manager.presets.contains_key(self.new_preset_name.trim()) {
-                            let new_preset = self.capture_current_preset();
-                            self.preset_manager.presets.insert(self.new_preset_name.trim().to_string(), new_preset);
-                            if let Err(e) = self.preset_manager.save() {
-                                error!("Failed to save preset: {}", e);
+                        let name_to_save = self.new_preset_name.trim();
+                        if !name_to_save.is_empty() {
+                            if self.preset_manager.presets.contains_key(name_to_save) {
+                                // Preset exists, show confirmation
+                                self.show_overwrite_confirmation = true;
+                                self.preset_to_overwrite = name_to_save.to_string();
+                            } else {
+                                // New preset, save directly
+                                let new_preset = self.capture_current_preset();
+                                self.preset_manager.presets.insert(name_to_save.to_string(), new_preset);
+                                if let Err(e) = self.preset_manager.save() {
+                                    error!("Failed to save preset: {}", e);
+                                }
+                                self.selected_preset_name = name_to_save.to_string();
                             }
-                            self.selected_preset_name = self.new_preset_name.trim().to_string();
                         }
                         self.is_adding_preset = false;
                     }
@@ -637,15 +659,20 @@ impl eframe::App for MyApp {
                     }
                 } else {
                     let mut selected_name = self.selected_preset_name.clone();
+                    let mut reselected = false;
                     egui::ComboBox::from_id_source("preset_selector")
                         .selected_text(selected_name.clone())
                         .show_ui(ui, |ui| {
                             for name in self.preset_manager.presets.keys() {
-                                ui.selectable_value(&mut selected_name, name.clone(), name.clone());
+                                // The selectable_value response's `clicked()` method detects any click.
+                                if ui.selectable_value(&mut selected_name, name.clone(), name.clone()).clicked() {
+                                    reselected = true; // Mark that a selection was made
+                                }
                             }
                         });
 
-                    if selected_name != self.selected_preset_name {
+                    // If a selection was clicked (even if it's the same one), reload it.
+                    if reselected {
                         self.load_preset(&selected_name);
                         self.selected_preset_name = selected_name;
                     }
@@ -678,6 +705,34 @@ impl eframe::App for MyApp {
                             }
                             if ui.button("No").clicked() {
                                 self.show_delete_confirmation = false;
+                            }
+                        });
+                    });
+            }
+
+            // Overwrite Confirmation Dialog
+            if self.show_overwrite_confirmation {
+                egui::Window::new("Confirm Overwrite")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!("A preset named '{}' already exists. Overwrite it?", self.preset_to_overwrite));
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes").clicked() {
+                                let updated_preset = self.capture_current_preset();
+                                self.preset_manager.presets.insert(self.preset_to_overwrite.clone(), updated_preset);
+                                if let Err(e) = self.preset_manager.save() {
+                                    error!("Failed to save overwritten preset: {}", e);
+                                }
+                                self.selected_preset_name = self.preset_to_overwrite.clone();
+                                self.show_overwrite_confirmation = false;
+                                self.preset_to_overwrite.clear();
+                            }
+                            if ui.button("No").clicked() {
+                                self.show_overwrite_confirmation = false;
+                                self.preset_to_overwrite.clear();
                             }
                         });
                     });
