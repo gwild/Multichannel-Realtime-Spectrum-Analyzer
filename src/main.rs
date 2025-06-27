@@ -4,6 +4,7 @@ mod plot;
 mod display;
 mod resynth;
 mod get_results;
+mod presets;
 
 use clap::Parser;
 use std::sync::LazyLock;

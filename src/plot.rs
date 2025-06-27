@@ -26,6 +26,7 @@ use tokio::sync::broadcast; // Added import
 use crate::display::SpectralDisplay; // Added import
 use std::sync::mpsc; // Add this for mpsc::Sender
 use crate::get_results::GuiParameter; // Add this for the enum
+use crate::presets::{PresetManager, Preset};
 
 // Define type alias
 type PartialsData = Vec<Vec<(f32, f32)>>; 
@@ -117,6 +118,12 @@ pub struct MyApp {
     desired_buffer_size: Option<usize>,
     buffer_debounce_timer: Option<Instant>,
     gain_update_tx: std::sync::mpsc::Sender<f32>,
+    // Preset management fields
+    preset_manager: PresetManager,
+    selected_preset_name: String,
+    is_adding_preset: bool,
+    new_preset_name: String,
+    show_delete_confirmation: bool,
 }
 
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
@@ -146,7 +153,10 @@ impl MyApp {
             egui::Color32::from_rgb(255, 255, 0),
         ];
 
-        let instance = MyApp {
+        let preset_manager = PresetManager::new("presets.yaml").expect("Failed to load or create presets");
+        let selected_preset_name = "default".to_string();
+
+        let mut instance = MyApp {
             spectrum,
             fft_config,
             buffer_size,
@@ -170,7 +180,16 @@ impl MyApp {
             desired_buffer_size: None,
             buffer_debounce_timer: None,
             gain_update_tx,
+            // Initialize preset fields
+            preset_manager,
+            selected_preset_name,
+            is_adding_preset: false,
+            new_preset_name: String::new(),
+            show_delete_confirmation: false,
         };
+
+        // Apply the default preset on startup
+        instance.load_preset("default");
 
         // FIX IMPLEMENTATION:
         // First, ensure the initial max_frequency from default() respects the
@@ -183,9 +202,17 @@ impl MyApp {
                 cfg.max_frequency = nyquist_limit;
                 debug!("Clamped initial max frequency range to {:.1} Hz", cfg.max_frequency);
             }
-            // Now, explicitly set the initial *value* of the slider
-            cfg.max_frequency = 1400.0;
-            debug!("Set initial max frequency value to 1400.0 Hz");
+            // Now, explicitly set the initial *value* of the slider from the preset,
+            // which we already loaded. This might seem redundant, but it ensures
+            // the initial state is correct even if default preset changes.
+            if let Some(preset) = instance.preset_manager.presets.get("default") {
+                cfg.max_frequency = preset.max_frequency;
+                debug!("Set initial max frequency value to {} Hz from preset", cfg.max_frequency);
+            } else {
+                // Fallback in case default preset is somehow missing
+                cfg.max_frequency = 1400.0;
+                warn!("Default preset not found during initialization, falling back to 1400.0 Hz for max_frequency");
+            }
         }
 
         // Return the newly created instance with the fix
@@ -289,37 +316,82 @@ impl MyApp {
         (sample_rate / 2.0) as f32
     }
 
-    pub fn update_ui(&mut self, ui: &mut egui::Ui) {
-        let mut config = self.fft_config.lock().unwrap();
+    // Capture the current GUI state into a Preset object
+    fn capture_current_preset(&self) -> Preset {
+        let fft_config = self.fft_config.lock().unwrap();
+        let resynth_config = self.resynth_config.lock().unwrap();
 
-        // Get nyquist limit once using the helper method
-        let nyquist_limit = self.get_nyquist_limit();
+        Preset {
+            // FFTConfig fields
+            min_frequency: fft_config.min_frequency,
+            max_frequency: fft_config.max_frequency,
+            magnitude_threshold: fft_config.magnitude_threshold,
+            min_freq_spacing: fft_config.min_freq_spacing,
+            window_type: fft_config.window_type.clone(),
+            crosstalk_enabled: fft_config.crosstalk_enabled,
+            crosstalk_threshold: fft_config.crosstalk_threshold,
+            crosstalk_reduction: fft_config.crosstalk_reduction,
+            harmonic_tolerance: fft_config.harmonic_tolerance,
+            root_freq_min: fft_config.root_freq_min,
+            root_freq_max: fft_config.root_freq_max,
+            freq_match_distance: fft_config.freq_match_distance,
+            // ResynthConfig fields
+            gain: resynth_config.gain,
+            freq_scale: resynth_config.freq_scale,
+            update_rate: resynth_config.update_rate,
+            // MyApp display fields
+            y_scale: self.y_scale,
+            alpha: self.alpha,
+            bar_width: self.bar_width,
+            show_line_plot: self.show_line_plot,
+            show_spectrograph: self.show_spectrograph,
+            show_results: self.show_results,
+        }
+    }
 
-        ui.label("Root frequency max:");
-        ui.add(
-            egui::Slider::new(&mut config.root_freq_max, 0.0..=nyquist_limit)
-                .logarithmic(true)
-        );
-
-        // 6) Advanced Crosstalk controls
-        ui.horizontal(|ui| {
+    // Load a preset's values into the current GUI state
+    fn load_preset(&mut self, name: &str) {
+        if let Some(preset) = self.preset_manager.presets.get(name).cloned() {
+            info!("Loading preset: {}", name);
             let mut fft_config = self.fft_config.lock().unwrap();
+            let mut resynth_config = self.resynth_config.lock().unwrap();
+
+            // Apply FFTConfig fields
+            fft_config.min_frequency = preset.min_frequency;
+            fft_config.max_frequency = preset.max_frequency;
+            fft_config.magnitude_threshold = preset.magnitude_threshold;
+            fft_config.min_freq_spacing = preset.min_freq_spacing;
+            fft_config.window_type = preset.window_type;
+            fft_config.crosstalk_enabled = preset.crosstalk_enabled;
+            fft_config.crosstalk_threshold = preset.crosstalk_threshold;
+            fft_config.crosstalk_reduction = preset.crosstalk_reduction;
+            fft_config.harmonic_tolerance = preset.harmonic_tolerance;
+            fft_config.root_freq_min = preset.root_freq_min;
+            fft_config.root_freq_max = preset.root_freq_max;
+            fft_config.freq_match_distance = preset.freq_match_distance;
+
+            // Apply ResynthConfig fields
+            resynth_config.gain = preset.gain;
+            resynth_config.freq_scale = preset.freq_scale;
+            resynth_config.update_rate = preset.update_rate;
+
+            // Apply MyApp display fields
+            self.y_scale = preset.y_scale;
+            self.alpha = preset.alpha;
+            self.bar_width = preset.bar_width;
+            self.show_line_plot = preset.show_line_plot;
+            self.show_spectrograph = preset.show_spectrograph;
+            self.show_results = preset.show_results;
             
-            if fft_config.crosstalk_enabled {
-                ui.label("Root Freq Min:");
-                ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 0.0..=nyquist_limit as f32));
+            // Send updates for parameters that require it (like gain)
+            self.gui_param_tx.send(GuiParameter::Gain(resynth_config.gain)).unwrap_or_else(|e| error!("Failed to send Gain update on preset load: {}", e));
+            self.gain_update_tx.send(resynth_config.gain).unwrap_or_else(|e| error!("Failed to send instant gain update on preset load: {}", e));
+            self.gui_param_tx.send(GuiParameter::FreqScale(resynth_config.freq_scale)).unwrap_or_else(|e| error!("Failed to send FreqScale update on preset load: {}", e));
+            self.gui_param_tx.send(GuiParameter::UpdateRate(resynth_config.update_rate)).unwrap_or_else(|e| error!("Failed to send UpdateRate update on preset load: {}", e));
 
-                ui.label("Root Freq Max (Advanced):");
-                ui.add(
-                    egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
-                        .logarithmic(true)
-                );
-            }
-        });
-
-        ui.checkbox(&mut self.show_line_plot, "Show FFT");
-        ui.checkbox(&mut self.show_spectrograph, "Show Spectrograph");
-        ui.checkbox(&mut self.show_results, "Show Results");
+        } else {
+            warn!("Attempted to load non-existent preset: {}", name);
+        }
     }
 }
 
@@ -534,7 +606,82 @@ impl eframe::App for MyApp {
         ctx.set_visuals(egui::Visuals::dark());
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("First Twelve Partials per Channel");
+            // --- Preset Management UI ---
+            ui.horizontal(|ui| {
+                // Add Preset Button
+                if ui.button("+").clicked() {
+                    self.is_adding_preset = true;
+                    self.new_preset_name.clear();
+                }
+
+                // Preset Dropdown / Add Text Field
+                if self.is_adding_preset {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.new_preset_name)
+                            .desired_width(120.0)
+                            .hint_text("New preset name..."),
+                    );
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if !self.new_preset_name.trim().is_empty() && !self.preset_manager.presets.contains_key(self.new_preset_name.trim()) {
+                            let new_preset = self.capture_current_preset();
+                            self.preset_manager.presets.insert(self.new_preset_name.trim().to_string(), new_preset);
+                            if let Err(e) = self.preset_manager.save() {
+                                error!("Failed to save preset: {}", e);
+                            }
+                            self.selected_preset_name = self.new_preset_name.trim().to_string();
+                        }
+                        self.is_adding_preset = false;
+                    }
+                    if response.lost_focus() {
+                        self.is_adding_preset = false;
+                    }
+                } else {
+                    let mut selected_name = self.selected_preset_name.clone();
+                    egui::ComboBox::from_id_source("preset_selector")
+                        .selected_text(selected_name.clone())
+                        .show_ui(ui, |ui| {
+                            for name in self.preset_manager.presets.keys() {
+                                ui.selectable_value(&mut selected_name, name.clone(), name.clone());
+                            }
+                        });
+
+                    if selected_name != self.selected_preset_name {
+                        self.load_preset(&selected_name);
+                        self.selected_preset_name = selected_name;
+                    }
+                }
+
+                // Delete Preset Button
+                if ui.add_enabled(self.selected_preset_name != "default", egui::Button::new("-")).clicked() {
+                    self.show_delete_confirmation = true;
+                }
+            });
+
+            // Delete Confirmation Dialog
+            if self.show_delete_confirmation {
+                egui::Window::new("Confirm Deletion")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!("Are you sure you want to delete the '{}' preset?", self.selected_preset_name));
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes").clicked() {
+                                self.preset_manager.presets.remove(&self.selected_preset_name);
+                                if let Err(e) = self.preset_manager.save() {
+                                    error!("Failed to save presets after deletion: {}", e);
+                                }
+                                self.selected_preset_name = "default".to_string();
+                                self.load_preset("default");
+                                self.show_delete_confirmation = false;
+                            }
+                            if ui.button("No").clicked() {
+                                self.show_delete_confirmation = false;
+                            }
+                        });
+                    });
+            }
 
             let mut size_changed = false;
 
@@ -787,76 +934,12 @@ impl eframe::App for MyApp {
             // 8) Reset button
             let mut needs_buffer_reset = false; // Variable to track if buffer reset is needed
             if ui.button("Reset to Defaults").clicked() {
-                { // Scope for fft_config lock
-                    let mut fft_config = self.fft_config.lock().unwrap();
-                    let current_num_channels = fft_config.num_channels; // Preserve
-                    let current_num_partials = fft_config.num_partials; // Preserve num_partials
-
-                    // Start with a fresh default from the struct
-                    *fft_config = FFTConfig::default();
-
-                    // Re-apply essential overrides that main.rs would do for a default startup:
-                    fft_config.num_channels = current_num_channels; // Restore preserved num_channels
-                    fft_config.num_partials = current_num_partials; // Restore preserved num_partials
-
-                    // Replicate frames_per_buffer logic from main.rs using self.sample_rate
-                    fft_config.frames_per_buffer = if cfg!(target_os = "linux") {
-                        2048u32
-                    } else {
-                        match self.sample_rate as u32 {
-                            48000 => 1024u32,
-                            44100 => 1024u32,
-                            96000 => 2048u32,
-                            192000 => 4096u32,
-                            _ => { // Fallback logic from main.rs
-                                let mut base_size = 1024u32;
-                                // Ensure sample_rate is positive to avoid issues with / 50.0 if it were 0
-                                if self.sample_rate > 0.0 {
-                                    while base_size * 2 <= (self.sample_rate / 50.0) as u32 {
-                                        base_size *= 2;
-                                    }
-                                }
-                                base_size
-                            }
-                        }
-                    };
-
-                    // Re-apply the max_frequency clamping that MyApp::new() would do.
-                    // Use the *current runtime* buffer size for clamping, not the default buffer size.
-                    let current_buffer_size = *self.buffer_size.lock().unwrap(); // Get current buffer size
-                    let nyquist_limit_for_current_state = (self.sample_rate / 2.0).min(current_buffer_size as f64 / 2.0);
-                    if fft_config.max_frequency > nyquist_limit_for_current_state {
-                        fft_config.max_frequency = nyquist_limit_for_current_state;
-                    }
-                    // Set the reset *value* explicitly to 1400.0 Hz
-                    fft_config.max_frequency = 1400.0;
-                    // Note: The slider's *range* will still be determined by the current Nyquist limit
-                    // calculated based on the potentially reset buffer size, handled by the slider logic itself.
-                    
-                    // All other FFTConfig fields (like root_freq_max, window_type, magnitude_threshold, etc.)
-                    // are now correctly set to their initial defaults by FFTConfig::default().
-                } // fft_config lock released here
-
-                // Reset resynth config
-                { // Scope for resynth_config lock
-                    let mut resynth_config = self.resynth_config.lock().unwrap();
-                    resynth_config.gain = 0.5; // Set reset gain to 0.5
-                    resynth_config.freq_scale = 1.0;
-                    resynth_config.update_rate = DEFAULT_UPDATE_RATE;
-                    // Send gain update for instant playback volume reset
-                    self.gain_update_tx.send(0.5).unwrap_or_else(|e| error!("Failed to send instant gain update on reset: {}", e));
-                } // resynth_config lock released here
-
-                // Reset display settings
-                self.y_scale = 80.0;
-                self.alpha = 255;
-                self.bar_width = 5.0;
-                self.show_line_plot = false;
-                self.show_spectrograph = false;
+                self.load_preset("default");
                 
-                // Check if buffer size needs reset *after* other locks are released
-                if current_buffer_size != DEFAULT_BUFFER_SIZE { // Compare with current size
-                    needs_buffer_reset = true; // Set flag instead of calling directly
+                // The preset system handles most of the reset. We still need to check
+                // if the buffer size needs to be reset, as that is not part of the preset.
+                if current_buffer_size != DEFAULT_BUFFER_SIZE {
+                    needs_buffer_reset = true;
                     // --- IMPORTANT --- 
                     // If buffer will be reset, recalculate the nyquist limit for *this frame's* slider range
                     // based on the target default buffer size.

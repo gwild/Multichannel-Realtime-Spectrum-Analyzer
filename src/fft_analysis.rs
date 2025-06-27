@@ -20,6 +20,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use rustfft::num_complex::Complex;
 use tokio::sync::broadcast; // Added import
+use serde::{Serialize, Deserialize};
 
 // Change the constant declaration to be public
 pub const MAX_SPECTROGRAPH_HISTORY: usize = 500;
@@ -617,7 +618,7 @@ pub fn compute_spectrum(
 }
 
 /// Window function types
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum WindowType {
     Rectangular,  // No window (flat)
     Hanning,
