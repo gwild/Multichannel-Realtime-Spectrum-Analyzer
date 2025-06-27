@@ -20,6 +20,7 @@ default:
   show_line_plot: false
   show_spectrograph: false
   show_results: true
+  buffer_size: 8192
 spec:
   min_frequency: 0.0
   max_frequency: 7000.0
@@ -42,6 +43,7 @@ spec:
   show_line_plot: false
   show_spectrograph: true
   show_results: true
+  buffer_size: 65536
 test:
   min_frequency: 700.0
   max_frequency: 1400.0
@@ -64,3 +66,4 @@ test:
   show_line_plot: false
   show_spectrograph: false
   show_results: true
+  buffer_size: 8192

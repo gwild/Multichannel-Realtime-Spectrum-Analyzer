@@ -37,6 +37,7 @@ pub struct Preset {
     pub show_line_plot: bool,
     pub show_spectrograph: bool,
     pub show_results: bool,
+    pub buffer_size: usize,
     // Note: buffer_size is handled separately and not part of a preset
 }
 
@@ -115,6 +116,7 @@ impl PresetManager {
             show_line_plot: false,
             show_spectrograph: false,
             show_results: true, // Assuming this is the default state
+            buffer_size: crate::DEFAULT_BUFFER_SIZE,
         }
     }
 } 

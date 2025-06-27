@@ -326,6 +326,7 @@ impl MyApp {
     fn capture_current_preset(&self) -> Preset {
         let fft_config = self.fft_config.lock().unwrap();
         let resynth_config = self.resynth_config.lock().unwrap();
+        let buffer_size = *self.buffer_size.lock().unwrap();
 
         Preset {
             // FFTConfig fields
@@ -352,6 +353,7 @@ impl MyApp {
             show_line_plot: self.show_line_plot,
             show_spectrograph: self.show_spectrograph,
             show_results: self.show_results,
+            buffer_size,
         }
     }
 
@@ -388,6 +390,14 @@ impl MyApp {
             self.show_line_plot = preset.show_line_plot;
             self.show_spectrograph = preset.show_spectrograph;
             self.show_results = preset.show_results;
+            
+            // Apply Buffer Size if it has changed
+            let current_buffer_size = *self.buffer_size.lock().unwrap();
+            if current_buffer_size != preset.buffer_size {
+                info!("Preset loading new buffer size: {} -> {}", current_buffer_size, preset.buffer_size);
+                self.desired_buffer_size = Some(preset.buffer_size);
+                self.buffer_debounce_timer = Some(Instant::now());
+            }
             
             // Send updates for parameters that require it (like gain)
             self.gui_param_tx.send(GuiParameter::Gain(resynth_config.gain)).unwrap_or_else(|e| error!("Failed to send Gain update on preset load: {}", e));
@@ -501,27 +511,27 @@ impl eframe::App for MyApp {
 
         // --- Buffer Size Debounce Check --- 
         let debounce_duration = Duration::from_millis(300);
-        let mut size_to_apply_after_debounce: Option<usize> = None; // Variable to hold the size if debounce passes
+        let mut size_to_apply: Option<usize> = None;
 
         if let Some(timer) = self.buffer_debounce_timer {
             if timer.elapsed() >= debounce_duration {
-                if let Some(desired_val) = self.desired_buffer_size { // Check if there's a desired size
+                // Timer has elapsed, clear it.
+                self.buffer_debounce_timer = None; 
+                
+                if let Some(desired_val) = self.desired_buffer_size.take() { // Take ownership of the value
                     let current_size = *self.buffer_size.lock().unwrap();
                     if desired_val != current_size {
-                        size_to_apply_after_debounce = Some(desired_val); // Capture the value
+                        size_to_apply = Some(desired_val);
                         debug!("Buffer size debounce complete - applying new size: {}", desired_val);
                     }
                 }
-                // Clear timer and desired size regardless of whether we applied
-                self.buffer_debounce_timer = None;
-                self.desired_buffer_size = None; 
             }
         }
 
-        // Apply the change using the captured value
-        if let Some(new_size) = size_to_apply_after_debounce {
+        // Apply the change if the debounce timer has elapsed
+        if let Some(new_size) = size_to_apply {
             debug!("Calling update_buffer_size with size: {}", new_size);
-            self.update_buffer_size(new_size); // Call the actual update function
+            self.update_buffer_size(new_size);
         }
         // --- End Debounce Check ---
 
