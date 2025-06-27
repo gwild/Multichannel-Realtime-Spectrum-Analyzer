@@ -622,6 +622,7 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // --- Preset Management UI ---
             ui.horizontal(|ui| {
+                ui.label("Presets:");
                 // Add Preset Button
                 if ui.button("+").clicked() {
                     self.is_adding_preset = true;
@@ -909,47 +910,51 @@ impl eframe::App for MyApp {
                 ui.checkbox(&mut fft_config.crosstalk_enabled, "Crosstalk Filtering");
             });
 
-            // 5) Crosstalk basic parameters row + Harmonic Tolerance
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                
-                // Only show crosstalk parameters if enabled
-                if fft_config.crosstalk_enabled {
-                    ui.label("Threshold:");
-                    ui.add(egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0));
-                    ui.label("Reduction:");
-                    ui.add(egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0));
+            // The 'if' condition below is to prevent empty rows from being created when crosstalk is disabled.
+            // This does not reorder any elements, it just hides the controls when they are not applicable.
+            if self.fft_config.lock().unwrap().crosstalk_enabled {
+                // 5) Crosstalk basic parameters row + Harmonic Tolerance
+                ui.horizontal(|ui| {
+                    let mut fft_config = self.fft_config.lock().unwrap();
                     
-                    // Move Harmonic Tolerance to this row
-                    ui.separator();
-                    ui.label("Harmonic Tolerance:");
-                    ui.add(egui::Slider::new(&mut fft_config.harmonic_tolerance, 0.01..=0.10)
-                        .logarithmic(true));
-                }
-            });
+                    // Only show crosstalk parameters if enabled
+                    if fft_config.crosstalk_enabled {
+                        ui.label("Threshold:");
+                        ui.add(egui::Slider::new(&mut fft_config.crosstalk_threshold, 0.0..=1.0));
+                        ui.label("Reduction:");
+                        ui.add(egui::Slider::new(&mut fft_config.crosstalk_reduction, 0.0..=1.0));
+                        
+                        // Move Harmonic Tolerance to this row
+                        ui.separator();
+                        ui.label("Harmonic Tolerance:");
+                        ui.add(egui::Slider::new(&mut fft_config.harmonic_tolerance, 0.01..=0.10)
+                            .logarithmic(true));
+                    }
+                });
 
-            // 6) Advanced Crosstalk controls - only show if crosstalk is enabled
-            ui.horizontal(|ui| {
-                let mut fft_config = self.fft_config.lock().unwrap();
-                
-                // Use the helper method
-                let nyquist_limit = self.get_nyquist_limit();
-                
-                // Only show advanced parameters if enabled
-                if fft_config.crosstalk_enabled {
-                    ui.label("Root Freq Min:");
-                    ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 0.0..=nyquist_limit as f32));
+                // 6) Advanced Crosstalk controls - only show if crosstalk is enabled
+                ui.horizontal(|ui| {
+                    let mut fft_config = self.fft_config.lock().unwrap();
                     
-                    ui.label("Root Freq Max (Advanced):");
-                    ui.add(
-                        egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
-                            .logarithmic(true)
-                    );
+                    // Use the helper method
+                    let nyquist_limit = self.get_nyquist_limit();
                     
-                    ui.label("Frequency Match:");
-                    ui.add(egui::Slider::new(&mut fft_config.freq_match_distance, 1.0..=20.0));
-                }
-            });
+                    // Only show advanced parameters if enabled
+                    if fft_config.crosstalk_enabled {
+                        ui.label("Root Freq Min:");
+                        ui.add(egui::Slider::new(&mut fft_config.root_freq_min, 0.0..=nyquist_limit as f32));
+                        
+                        ui.label("Root Freq Max (Advanced):");
+                        ui.add(
+                            egui::Slider::new(&mut fft_config.root_freq_max, 0.0..=nyquist_limit as f32)
+                                .logarithmic(true)
+                        );
+                        
+                        ui.label("Frequency Match:");
+                        ui.add(egui::Slider::new(&mut fft_config.freq_match_distance, 1.0..=20.0));
+                    }
+                });
+            }
 
             // 7) Resynth update timer control
             ui.horizontal(|ui| {
@@ -981,35 +986,6 @@ impl eframe::App for MyApp {
                         debug!("Adjusted root_freq_max to nyquist limit: {} Hz", nyquist_limit);
                     }
                 }
-            }
-
-            // Calculate nyquist limit based on current buffer size for general use
-            let current_buffer_size = *self.buffer_size.lock().unwrap(); // THIS STAYS
-
-            // 8) Reset button
-            let mut needs_buffer_reset = false; // Variable to track if buffer reset is needed
-            if ui.button("Reset to Defaults").clicked() {
-                self.load_preset("default");
-                
-                // The preset system handles most of the reset. We still need to check
-                // if the buffer size needs to be reset, as that is not part of the preset.
-                if current_buffer_size != DEFAULT_BUFFER_SIZE {
-                    needs_buffer_reset = true;
-                    // --- IMPORTANT --- 
-                    // If buffer will be reset, recalculate the nyquist limit for *this frame's* slider range
-                    // based on the target default buffer size.
-                    let nyquist_limit_for_debug_log = (self.sample_rate / 2.0).min(DEFAULT_BUFFER_SIZE as f64 / 2.0);
-                    debug!("Reset triggered buffer change, overriding slider range limit for this frame to {}", nyquist_limit_for_debug_log);
-                }
-            }
-
-            // Perform buffer reset outside the main button logic if needed
-            if needs_buffer_reset {
-                // self.update_buffer_size(DEFAULT_BUFFER_SIZE); // REMOVED direct call
-                // Instead, set desired size and timer for debouncing
-                self.desired_buffer_size = Some(DEFAULT_BUFFER_SIZE);
-                self.buffer_debounce_timer = Some(Instant::now());
-                 // Note: UI update based on nyquist_limit change still applies immediately from button logic
             }
 
             // 8) Plot logic

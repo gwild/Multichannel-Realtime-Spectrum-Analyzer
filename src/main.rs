@@ -41,6 +41,10 @@ struct Args {
     #[arg(short = 'p', long)]
     num_partials: Option<usize>,
     
+    /// Enable info logging
+    #[arg(long)]
+    info: bool,
+
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
@@ -371,7 +375,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
     
     // Initialize logging - setup both console and file logging
-    setup_logging(args.debug)?;
+    setup_logging(args.debug, args.info)?;
     info!("Starting audio streaming application");
 
     if !args.launched_by_python {
@@ -1095,12 +1099,14 @@ fn test_audio_input(pa: &pa::PortAudio, device_index: pa::DeviceIndex, channels:
 }
 
 // Add this new function to set up logging to both console and file
-fn setup_logging(debug_mode: bool) -> Result<(), anyhow::Error> {
+fn setup_logging(debug_mode: bool, info_mode: bool) -> Result<(), anyhow::Error> {
     // Set the log level based on debug flag
     let log_level = if debug_mode {
         LevelFilter::Debug
-    } else {
+    } else if info_mode {
         LevelFilter::Info
+    } else {
+        LevelFilter::Warn
     };
 
     // Get the current executable's directory to place logs alongside the binary

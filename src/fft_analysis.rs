@@ -75,8 +75,8 @@ impl Default for FFTConfig {
 #[macro_export]
 macro_rules! crosstalk_info {
     ($($arg:tt)*) => {
-        log::info!(target: "crosstalk", $($arg)*);
-    }
+        log::debug!(target: "crosstalk", $($arg)*);
+    };
 }
 
 // Add a new struct to hold both types of FFT data
