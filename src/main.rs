@@ -9,6 +9,10 @@ mod presets;
 use clap::Parser;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
+use eframe::egui;
+use egui::ViewportBuilder;
+use signal_hook::{iterator::Signals, consts::*};
+use std::os::unix::process::CommandExt;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -369,14 +373,43 @@ fn get_supported_output_sample_rates(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
     // Parse command line arguments
     let args = Args::parse();
     
     // Initialize logging - setup both console and file logging
     setup_logging(args.debug, args.info)?;
     info!("Starting audio streaming application");
+
+    // Set up signal handlers
+    let term = Arc::new(AtomicBool::new(false));
+    let term_signal = Arc::clone(&term);
+    
+    #[cfg(target_os = "linux")]
+    {
+        use signal_hook::{iterator::Signals, consts::signal::*};
+        let mut signals = Signals::new(&[SIGTERM, SIGINT, SIGQUIT])?;
+        let term = Arc::clone(&term);
+        
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                info!("Received signal {}", sig);
+                term.store(true, Ordering::Relaxed);
+                
+                // Try to read and kill the process group
+                if let Ok(pgid_str) = std::fs::read_to_string("/tmp/sendaq_pgid") {
+                    if let Ok(pgid) = pgid_str.trim().parse::<i32>() {
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGTERM);
+                        }
+                        let _ = std::fs::remove_file("/tmp/sendaq_pgid");
+                    }
+                }
+                
+                std::process::exit(0);
+            }
+        });
+    }
 
     if !args.launched_by_python {
         // Relaunch in a new terminal
@@ -399,21 +432,30 @@ async fn main() -> Result<(), anyhow::Error> {
         // Use platform-specific terminal commands
         #[cfg(target_os = "linux")]
         {
-            cmd_str.push_str(" 2>&1 | tee debug.txt; read -p 'Press enter to close'");
+            cmd_str.push_str(" 2>&1 | tee debug.txt");
 
-            let cmd = vec![
-                "xterm".to_string(),
-                "-hold".to_string(),
-                "-e".to_string(),
-                "bash".to_string(),
-                "-c".to_string(),
-                cmd_str,
-            ];
-
-            let mut child = std::process::Command::new(&cmd[0])
-                .args(&cmd[1..])
+            // Create a new session and process group for the terminal
+            let mut child = std::process::Command::new("xterm")
+                .arg("-hold")  // This is sufficient to keep the terminal open
+                .arg("-e")
+                .arg("bash")
+                .arg("-c")
+                .arg(cmd_str)
+                .process_group(0) // Create new process group
                 .spawn()
                 .expect("Failed to launch new terminal");
+
+            // Store the process group ID for later cleanup
+            match unsafe { libc::getpgid(child.id() as libc::pid_t) } {
+                pgid if pgid >= 0 => {
+                    std::fs::write("/tmp/sendaq_pgid", pgid.to_string())
+                        .expect("Failed to write process group ID");
+                }
+                _ => {
+                    error!("Failed to get process group ID");
+                }
+            }
+
             child.wait().expect("Failed to wait for child process");
         }
 
@@ -454,10 +496,10 @@ async fn main() -> Result<(), anyhow::Error> {
     }
 
     // Run the async part of the application
-    run(&args).await
+    run(&args)
 }
 
-async fn run(args: &Args) -> Result<()> {
+fn run(args: &Args) -> Result<()> {
     info!("run() function entered."); // New log
     let pa = Arc::new(pa::PortAudio::new()?);
     info!("PortAudio initialized successfully in run()."); // New log
@@ -765,7 +807,11 @@ async fn run(args: &Args) -> Result<()> {
     let fft_config = Arc::new(Mutex::new(config));
 
     // --- GUI setup ---
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_inner_size([1024.0, 440.0]),
+        ..Default::default()
+    };
 
     // Create the MPSC channel for GUI parameter updates
     let (gui_param_tx, gui_param_rx) = mpsc::channel::<GuiParameter>();
@@ -964,16 +1010,18 @@ async fn run(args: &Args) -> Result<()> {
     if let Some(shared_mem_info) = shared_partials {
         let shared_memory_partials_rx = partials_tx.subscribe();
         let sm_shutdown_flag = Arc::clone(&shutdown_flag);
-        tokio::spawn(async move {
-            shared_memory_updater_loop(shared_memory_partials_rx, shared_mem_info.path, sm_shutdown_flag).await;
+        let shared_memory_path = shared_mem_info.path.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(shared_memory_updater_loop(shared_memory_partials_rx, shared_memory_path, sm_shutdown_flag));
         });
     } else {
         warn!("SharedMemory struct not initialized, skipping shared memory update thread.");
     }
     
     let native_options = NativeOptions {
-        initial_window_size: Some(egui::vec2(1024.0, 440.0)),
-        vsync: true,
+        viewport: ViewportBuilder::default()
+            .with_inner_size([1024.0, 440.0]),
         ..Default::default()
     };
 

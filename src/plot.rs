@@ -1,7 +1,7 @@
 // This section is protected. Do not alter unless permission is requested by you and granted by me.
 use std::sync::{Arc, Mutex};
 use eframe::egui;
-use egui::plot::{Plot, BarChart, Legend};
+use egui_plot::{Plot, BarChart, Legend, Bar, Line, Points, PlotBounds};
 pub use eframe::NativeOptions;
 use crate::fft_analysis::FFTConfig;
 use crate::audio_stream::CircularBuffer;
@@ -15,7 +15,7 @@ use crate::fft_analysis::WindowType;  // Add at top with other imports
 use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
-use egui::widgets::plot::uniform_grid_spacer;
+use egui_plot::uniform_grid_spacer;
 use std::collections::VecDeque;
 use chrono;
 use egui::TextStyle;
@@ -423,13 +423,47 @@ impl MyApp {
 // Implementing eframe::App for MyApp
 
 impl eframe::App for MyApp {
-    fn on_close_event(&mut self) -> bool {
-        info!("GUI close event detected, setting shutdown flag");
-        self.shutdown_flag.store(true, Ordering::SeqCst);
-        true
-    }
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            info!("GUI close event detected, initiating shutdown sequence");
+            // Set shutdown flag for all threads
+            self.shutdown_flag.store(true, Ordering::SeqCst);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            
+            // Give threads time to clean up
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            
+            // Read stored process group ID if available
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(pgid_str) = std::fs::read_to_string("/tmp/sendaq_pgid") {
+                    if let Ok(pgid) = pgid_str.trim().parse::<i32>() {
+                        // First send SIGTERM to allow graceful shutdown
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGTERM);
+                        }
+                        // Give processes a moment to handle SIGTERM
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        // Then send SIGKILL to force termination
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGKILL);
+                        }
+                        // Clean up the temp file
+                        let _ = std::fs::remove_file("/tmp/sendaq_pgid");
+                    }
+                }
+            }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // If we couldn't find a stored PGID, fall back to sending SIGTERM to our own group
+            unsafe {
+                libc::kill(0, libc::SIGTERM);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                libc::kill(0, libc::SIGKILL);
+            }
+            
+            std::process::exit(0);
+        }
+        
         // Track GUI update cycles for debugging
         static mut LAST_UPDATE_LOG: Option<Instant> = None;
         static mut UPDATE_COUNT: usize = 0;
@@ -1008,33 +1042,33 @@ impl eframe::App for MyApp {
             let all_bar_charts: Vec<BarChart> = (0..absolute_values.len())
                 .map(|channel| {
                     let channel_partials = &absolute_values[channel];
-                    let mut bars: Vec<egui::plot::Bar> = channel_partials
+                    let mut bars: Vec<egui_plot::Bar> = channel_partials
                         .iter()
                         // Filter out non-positive frequencies and values (assuming dB)
                         .filter(|&&(freq, db_val)| freq > 0.0 && db_val > -f32::INFINITY) // Use -inf for dB check
                         .map(|&(freq, db_val)| {
                             // Use dB value directly for plotting
-                            egui::plot::Bar::new(freq as f64, db_val as f64)
+                            egui_plot::Bar::new(freq as f64, db_val as f64)
                                 .width(self.bar_width as f64)
                         })
                         .collect();
 
                     // If no visible bars, add a single invisible bar
                     if bars.is_empty() {
-                        bars.push(egui::plot::Bar::new(0.0, 0.0).width(0.0));
+                        bars.push(egui_plot::Bar::new(0.0, 0.0).width(0.0));
                     }
 
                     let color = self.colors[channel % self.colors.len()]
                         .linear_multiply(self.alpha as f32 / 255.0);
 
-                    BarChart::new(bars)
+                    egui_plot::BarChart::new(bars)
                         .name(format!("Channel {}", channel + 1))
                         .color(color)
                 })
                 .collect();
 
             // Line plots without legend names - more memory efficient
-            let all_line_plots: Vec<egui::plot::Line> = if self.show_line_plot {
+            let all_line_plots: Vec<egui_plot::Line> = if self.show_line_plot {
                 let spectrum = self.spectrum.lock().unwrap();
                 let fft_data = spectrum.get_fft_line_data();
                 
@@ -1042,7 +1076,7 @@ impl eframe::App for MyApp {
                     let color = self.colors[channel % self.colors.len()]
                         .linear_multiply(self.alpha as f32 / 255.0);
 
-                    egui::plot::Line::new(
+                    egui_plot::Line::new(
                         points.iter()
                             .map(|&(freq, mag)| [freq as f64, mag as f64])
                             .collect::<Vec<[f64; 2]>>()
@@ -1068,15 +1102,15 @@ impl eframe::App for MyApp {
                 FontId::new(14.0, FontFamily::Proportional)
             );
 
-            Plot::new("spectrum_plot")
-                .legend(Legend::default())
+            egui_plot::Plot::new("spectrum_plot")
+                .legend(egui_plot::Legend::default())
                 .view_aspect(6.0)
                 .include_x(0.0)
                 .include_x(max_freq as f64)
                 .include_y(0.0)
                 .include_y(self.y_scale as f64)
-                .x_axis_formatter(|value, _range| format!("{} Hz", value as i32))
-                .y_axis_formatter(|value, _range| format!("{} dB", value as i32))
+                .x_axis_formatter(|value, _range, _precision| format!("{} Hz", value.value))
+                .y_axis_formatter(|value, _range, _precision| format!("{} dB", value.value))
                 .y_grid_spacer(uniform_grid_spacer(|_input| [5.0, 10.0, 20.0]))  // More frequent grid lines
                 .show_axes([true, true])
                 .show_x(true)
@@ -1119,7 +1153,7 @@ impl eframe::App for MyApp {
                     let fft_config = self.fft_config.lock().unwrap();
                     let min_freq = fft_config.min_frequency;
                     let max_freq = fft_config.max_frequency;
-                    let bounds = egui::plot::PlotBounds::from_min_max(
+                    let bounds = egui_plot::PlotBounds::from_min_max(
                         [min_freq, 0.0], // Min X, Min Y
                         [max_freq, self.y_scale as f64] // Max X, Max Y
                     );
@@ -1181,16 +1215,16 @@ impl eframe::App for MyApp {
                     (fft.min_frequency as f32, max)
                 };
 
-                Plot::new("spectrograph_plot")
-                    .legend(Legend::default())
+                egui_plot::Plot::new("spectrograph_plot")
+                    .legend(egui_plot::Legend::default())
                     .view_aspect(6.0)
                     .include_y(min_freq as f64)
                     .include_y(max_freq as f64)
-                    .x_axis_formatter(move |value, _range| {
-                        let timestamp = start_timestamp + chrono::Duration::milliseconds((value * 1000.0) as i64);
+                    .x_axis_formatter(move |value, _range, _precision| {
+                        let timestamp = start_timestamp + chrono::Duration::milliseconds((value.value * 1000.0) as i64);
                         format!("{}", timestamp.format("%H:%M:%S"))
                     })
-                    .y_axis_formatter(|value, _range| format!("{} Hz", value as i32))
+                    .y_axis_formatter(|value, _range, _precision| format!("{} Hz", value.value))
                     .show_axes([true, true])
                     .show_x(true)
                     .show_y(true)
@@ -1209,7 +1243,7 @@ impl eframe::App for MyApp {
                     .show(ui, |plot_ui| {
                         let history = self.spectrograph_history.lock().unwrap();
                         if !history.is_empty() {
-                            plot_ui.set_plot_bounds(egui::plot::PlotBounds::from_min_max(
+                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
                                 [earliest_time * 1000.0, min_freq as f64],
                                 [latest_time * 1000.0, max_freq as f64]
                             ));
@@ -1241,7 +1275,7 @@ impl eframe::App for MyApp {
                                         );
 
                                         plot_ui.points(
-                                            egui::plot::Points::new(vec![[slice.time * 1000.0, freq]])
+                                            egui_plot::Points::new(vec![[slice.time * 1000.0, freq]])
                                                 .color(color)
                                                 .radius(2.0)
                                         );
@@ -1303,10 +1337,10 @@ pub mod display_utils {
                     if db_val.is_finite() && freq > 0.0 {
                         format!("({:.2}, {:.0})", freq, db_val)
                     } else {
-                        "(0.0, -)".to_string() // Display placeholder for invalid/silent values
+                        "(0,0)".to_string() // Simple format for zero/invalid values
                     }
                 } else {
-                    "(0.0, -)".to_string()
+                    "(0,0)".to_string()
                 }
             })
             .collect::<Vec<_>>()
