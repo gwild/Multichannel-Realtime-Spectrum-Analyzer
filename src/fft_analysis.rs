@@ -47,6 +47,7 @@ pub struct FFTConfig {
     pub root_freq_max: f32,  // Add this (default: DEFAULT_BUFFER_SIZE / 4)
     pub freq_match_distance: f32,  // Maximum Hz difference to consider frequencies as matching
     pub num_partials: usize,  // Add configurable number of partials
+    pub gain: f32,  // Add gain parameter for signal amplification
 }
 
 impl Default for FFTConfig {
@@ -67,6 +68,7 @@ impl Default for FFTConfig {
             freq_match_distance: 5.0,
             window_type: WindowType::Hanning,
             num_partials: DEFAULT_NUM_PARTIALS, // Use default value from main.rs
+            gain: 1.0,  // Default gain is 1.0 (no amplification)
         }
     }
 }
@@ -919,7 +921,10 @@ fn extract_partials_from_spectrum(
         .enumerate()
         .filter_map(|(i, &complex_val)| {
             let frequency = i as f32 * freq_step;
-            let magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+            let mut magnitude = (complex_val.re * complex_val.re + complex_val.im * complex_val.im).sqrt();
+            
+            // Apply gain before threshold check
+            magnitude *= config.gain;
 
             // Filter based on linear magnitude threshold and frequency range
             if magnitude >= linear_magnitude_threshold &&

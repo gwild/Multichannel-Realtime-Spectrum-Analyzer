@@ -11,6 +11,7 @@ default:
   root_freq_min: 20.0
   root_freq_max: 2048.0
   freq_match_distance: 5.0
+  fft_gain: 1.0
   gain: 0.5
   freq_scale: 1.0
   update_rate: 1.0
@@ -21,6 +22,30 @@ default:
   show_spectrograph: false
   show_results: true
   buffer_size: 8192
+gain:
+  min_frequency: 8192.0
+  max_frequency: 16384.0
+  magnitude_threshold: 6.0
+  min_freq_spacing: 20.0
+  window_type: Hanning
+  crosstalk_enabled: false
+  crosstalk_threshold: 0.3
+  crosstalk_reduction: 0.5
+  harmonic_tolerance: 0.03
+  root_freq_min: 20.0
+  root_freq_max: 2048.0
+  freq_match_distance: 5.0
+  fft_gain: 100.0
+  gain: 0.5
+  freq_scale: 1.0
+  update_rate: 1.0
+  y_scale: 80.0
+  alpha: 255
+  bar_width: 5.0
+  show_line_plot: true
+  show_spectrograph: true
+  show_results: true
+  buffer_size: 32768
 spec:
   min_frequency: 0.0
   max_frequency: 7000.0
@@ -34,6 +59,7 @@ spec:
   root_freq_min: 20.0
   root_freq_max: 2048.0
   freq_match_distance: 5.0
+  fft_gain: 1.0
   gain: 0.5
   freq_scale: 1.0
   update_rate: 1.0
@@ -57,6 +83,7 @@ test:
   root_freq_min: 20.0
   root_freq_max: 2048.0
   freq_match_distance: 5.0
+  fft_gain: 1.0
   gain: 0.5
   freq_scale: 1.0
   update_rate: 1.0

@@ -342,6 +342,7 @@ impl MyApp {
             root_freq_min: fft_config.root_freq_min,
             root_freq_max: fft_config.root_freq_max,
             freq_match_distance: fft_config.freq_match_distance,
+            fft_gain: fft_config.gain,  // Add FFT gain
             // ResynthConfig fields
             gain: resynth_config.gain,
             freq_scale: resynth_config.freq_scale,
@@ -377,6 +378,7 @@ impl MyApp {
             fft_config.root_freq_min = preset.root_freq_min;
             fft_config.root_freq_max = preset.root_freq_max;
             fft_config.freq_match_distance = preset.freq_match_distance;
+            fft_config.gain = preset.fft_gain;  // Load FFT gain
 
             // Apply ResynthConfig fields
             resynth_config.gain = preset.gain;
@@ -827,13 +829,22 @@ impl eframe::App for MyApp {
                         .changed()
                     {
                         let new_size = 1 << buffer_log_slider;
-                        // self.update_buffer_size(new_size); // REMOVED direct call
-                        // Instead, set desired size and timer for debouncing
                         self.desired_buffer_size = Some(new_size);
                         self.buffer_debounce_timer = Some(Instant::now());
-                        size_changed = true; // Keep UI responsive even if change is debounced
+                        size_changed = true;
                     }
                     ui.label("samples");
+                }
+
+                // Add gain slider
+                {
+                    let mut fft_config = self.fft_config.lock().unwrap();
+                    ui.label("Gain:");
+                    ui.add(
+                        egui::Slider::new(&mut fft_config.gain, 1.0..=100.0)
+                            .logarithmic(true)
+                            .text("x")
+                    );
                 }
 
                 // Min freq spacing slider

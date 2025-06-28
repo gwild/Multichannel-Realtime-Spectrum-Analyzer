@@ -24,6 +24,7 @@ pub struct Preset {
     pub root_freq_min: f32,
     pub root_freq_max: f32,
     pub freq_match_distance: f32,
+    pub fft_gain: f32,
 
     // ResynthConfig fields
     pub gain: f32,
@@ -103,6 +104,7 @@ impl PresetManager {
             root_freq_min: fft_config.root_freq_min,
             root_freq_max: fft_config.root_freq_max,
             freq_match_distance: fft_config.freq_match_distance,
+            fft_gain: fft_config.gain,
 
             // ResynthConfig fields
             gain: 0.5,
@@ -115,7 +117,7 @@ impl PresetManager {
             bar_width: 5.0,
             show_line_plot: false,
             show_spectrograph: false,
-            show_results: true, // Assuming this is the default state
+            show_results: true,
             buffer_size: crate::DEFAULT_BUFFER_SIZE,
         }
     }
