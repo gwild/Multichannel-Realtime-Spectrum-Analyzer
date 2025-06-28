@@ -16,7 +16,7 @@ use crate::resynth::ResynthConfig;  // Add this import
 use crate::resynth::DEFAULT_UPDATE_RATE;
 use crate::DEFAULT_NUM_PARTIALS;  // Import the new constant
 use egui_plot::uniform_grid_spacer;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use chrono;
 use egui::TextStyle;
 use egui::FontId;
@@ -1207,16 +1207,18 @@ impl eframe::App for MyApp {
                 let elapsed = current_time.duration_since(self.start_time.as_ref().clone());
                 let start_timestamp = current_timestamp - chrono::Duration::from_std(elapsed).unwrap_or_default();
                 
-                // Get the oldest timestamp from the history
+                // Get the newest timestamp from the history to create a sliding window
                 let (earliest_time, latest_time) = {
                     let history = self.spectrograph_history.lock().unwrap();
-                    if let Some(oldest) = history.front() {
-                        let oldest_time = oldest.time;
-                        (oldest_time, oldest_time + 5.0) // Show 5 seconds from oldest timestamp
+                    let latest_time_sec = if let Some(newest) = history.back() {
+                        newest.time
                     } else {
-                        let current = elapsed.as_secs_f64();
-                        (current, current + 5.0)
-                    }
+                        elapsed.as_secs_f64()
+                    };
+                    // Create a 5-second sliding window ending at the latest data point.
+                    // Ensure the start time is never negative.
+                    let earliest_time_sec = (latest_time_sec - 5.0).max(0.0);
+                    (earliest_time_sec, latest_time_sec)
                 };
                 
                 let (min_freq, max_freq) = {
@@ -1229,8 +1231,6 @@ impl eframe::App for MyApp {
                 egui_plot::Plot::new("spectrograph_plot")
                     .legend(egui_plot::Legend::default())
                     .view_aspect(6.0)
-                    .include_y(min_freq as f64)
-                    .include_y(max_freq as f64)
                     .x_axis_formatter(move |value, _range, _precision| {
                         let timestamp = start_timestamp + chrono::Duration::milliseconds((value.value * 1000.0) as i64);
                         format!("{}", timestamp.format("%H:%M:%S"))
@@ -1259,39 +1259,43 @@ impl eframe::App for MyApp {
                                 [latest_time * 1000.0, max_freq as f64]
                             ));
 
+                            // Efficient rendering: Batch points by color
+                            let mut points_by_color: HashMap<egui::Color32, Vec<[f64; 2]>> = HashMap::new();
+
                             for slice in history.iter() {
                                 if slice.time >= earliest_time && slice.time <= latest_time {
-                                    // slice.data contains (freq: f64, unnormalized_linear_magnitude: f32)
                                     for &(freq, unnormalized_magnitude_f32) in &slice.data { 
                                         let unnormalized_magnitude = unnormalized_magnitude_f32 as f64;
 
-                                        // 1. Calculate the value to scale: 20 * log10(unnormalized magnitude)
-                                        let value_to_scale = if unnormalized_magnitude > 1e-10 { // Avoid log(0)
+                                        let value_to_scale = if unnormalized_magnitude > 1e-10 {
                                             20.0 * unnormalized_magnitude.log10()
                                         } else {
-                                            // Map silence/low values to ensure intensity is 0
                                             0.0 
                                         };
 
-                                        // 2. Calculate intensity by normalizing value_to_scale against y_scale
-                                        // Intensity = 0.0 if value_to_scale <= 0
-                                        // Intensity = 1.0 if value_to_scale >= y_scale
                                         let intensity = (value_to_scale / self.y_scale as f64).clamp(0.0, 1.0);
                                         
-                                        // 3. Apply color based on intensity (Blue -> Green -> Red)
                                         let color = egui::Color32::from_rgb(
-                                            (255.0 * intensity) as u8, // Red increases with intensity
-                                            (255.0 * (1.0 - (intensity - 0.5).abs() * 2.0).max(0.0)) as u8, // Green peaks at mid-intensity
-                                            (255.0 * (1.0 - intensity)) as u8, // Blue decreases with intensity
+                                            (255.0 * intensity) as u8,
+                                            (255.0 * (1.0 - (intensity - 0.5).abs() * 2.0).max(0.0)) as u8,
+                                            (255.0 * (1.0 - intensity)) as u8,
                                         );
 
-                                        plot_ui.points(
-                                            egui_plot::Points::new(vec![[slice.time * 1000.0, freq]])
-                                                .color(color)
-                                                .radius(2.0)
-                                        );
+                                        points_by_color
+                                            .entry(color)
+                                            .or_default()
+                                            .push([slice.time * 1000.0, freq]);
                                     }
                                 }
+                            }
+
+                            // Draw the batched points
+                            for (color, points) in points_by_color {
+                                plot_ui.points(
+                                    egui_plot::Points::new(points)
+                                        .color(color)
+                                        .radius(2.0)
+                                );
                             }
                         }
                     });
