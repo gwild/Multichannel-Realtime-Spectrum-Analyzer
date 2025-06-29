@@ -19,7 +19,7 @@ default:
   alpha: 255
   bar_width: 5.0
   show_line_plot: false
-  show_spectrograph: false
+  show_spectrograph: true
   show_results: true
   buffer_size: 8192
 gain:

@@ -807,7 +807,7 @@ fn run(args: &Args) -> Result<()> {
     // --- GUI setup ---
     let native_options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([1024.0, 440.0]),
+            .with_inner_size([1024.0, 680.0]),
         ..Default::default()
     };
 
@@ -1019,7 +1019,7 @@ fn run(args: &Args) -> Result<()> {
     
     let native_options = NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([1024.0, 440.0]),
+            .with_inner_size([1024.0, 680.0]),
         ..Default::default()
     };
 
