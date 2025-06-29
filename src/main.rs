@@ -462,10 +462,8 @@ fn main() -> Result<(), anyhow::Error> {
         #[cfg(target_os = "macos")]
         {
             // On macOS, use osascript to open Terminal.app with our command
-            cmd_str.push_str("; echo 'Press enter to close'; read");
-            
             let osascript_cmd = format!(
-                "tell application \"Terminal\" to do script \"{}\"",
+                "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
                 cmd_str.replace("\"", "\\\"")
             );
 
