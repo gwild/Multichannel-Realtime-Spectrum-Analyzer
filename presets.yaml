@@ -46,6 +46,30 @@ gain:
   show_spectrograph: true
   show_results: true
   buffer_size: 32768
+listen:
+  min_frequency: 500.0
+  max_frequency: 32768.0
+  magnitude_threshold: 32.0
+  min_freq_spacing: 250.0
+  window_type: Hanning
+  crosstalk_enabled: false
+  crosstalk_threshold: 0.3
+  crosstalk_reduction: 0.5
+  harmonic_tolerance: 0.03
+  root_freq_min: 20.0
+  root_freq_max: 2048.0
+  freq_match_distance: 5.0
+  fft_gain: 1.0
+  gain: 0.0
+  freq_scale: 1.0
+  update_rate: 1.0
+  y_scale: 100.0
+  alpha: 120
+  bar_width: 5.0
+  show_line_plot: false
+  show_spectrograph: true
+  show_results: true
+  buffer_size: 65536
 spec:
   min_frequency: 0.0
   max_frequency: 7000.0
