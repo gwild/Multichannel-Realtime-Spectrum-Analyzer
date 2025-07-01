@@ -41,10 +41,22 @@ A high-performance, real-time audio spectrum analyzer written in Rust with a mod
 - **Storage**: 100MB free space
 
 ### Software Dependencies
+
+#### Required Dependencies
 - **Rust**: 1.65.0 or later
 - **PortAudio**: Audio I/O library
-- **ALSA/PulseAudio**: Linux audio backend
+- **xterm**: Terminal emulator for self-launching in new window (Linux)
+
+#### Audio Backends
+- **ALSA**: Primary Linux audio backend
+- **JACK**: Professional audio server (optional)
+- **PulseAudio**: Modern Linux audio system (optional)
 - **Core Audio**: macOS audio backend
+
+#### System Libraries
+- **libasound2**: ALSA library
+- **libjack0**: JACK audio server library
+- **libdb5.3**: Berkeley DB library (for shared memory)
 
 ## Installation
 
@@ -56,16 +68,16 @@ A high-performance, real-time audio spectrum analyzer written in Rust with a mod
    source ~/.cargo/env
    ```
 
-2. **Install PortAudio development libraries**:
+2. **Install system dependencies**:
    ```bash
    # Ubuntu/Debian
-   sudo apt-get install portaudio19-dev
+   sudo apt-get install portaudio19-dev xterm libasound2-dev libjack-jackd2-dev
    
    # Fedora/RHEL
-   sudo dnf install portaudio-devel
+   sudo dnf install portaudio-devel xterm alsa-lib-devel jack-audio-connection-kit-devel
    
    # Arch Linux
-   sudo pacman -S portaudio
+   sudo pacman -S portaudio xterm alsa-lib jack2
    ```
 
 ### Building from Source
@@ -85,16 +97,18 @@ A high-performance, real-time audio spectrum analyzer written in Rust with a mod
    ```bash
    ./target/release/audio_streaming
    ```
+   
+   **Note**: The application will automatically launch itself in a new terminal window:
+   - **Linux**: Uses xterm to spawn a new terminal window
+   - **macOS**: Uses the native Terminal.app
+   - **Windows**: Not supported
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-# Run with default settings
-./target/release/audio_streaming
-
-# Run with default settings (single channel)
+# Run with default settings (launches in new terminal window)
 ./target/release/audio_streaming
 
 # Specify input device
@@ -106,6 +120,8 @@ A high-performance, real-time audio spectrum analyzer written in Rust with a mod
 # Enable debug logging
 ./target/release/audio_streaming --debug
 ```
+
+**Self-Launching Behavior**: The application automatically spawns itself in a new terminal window for better isolation and debugging. This ensures the GUI runs in its own process space.
 
 ### Command Line Options
 
@@ -211,7 +227,13 @@ with open('/tmp/spectrum_data', 'r+b') as f:
 1. **No Audio Input**:
    - Check device permissions
    - Verify PortAudio installation
+   - Ensure ALSA/JACK audio backend is working
    - Test with `--debug` flag for detailed logs
+
+2. **Missing xterm**:
+   - Install xterm: `sudo apt-get install xterm` (Ubuntu/Debian)
+   - Required for self-launching in new terminal window on Linux
+   - The application automatically spawns itself in a new xterm window
 
 2. **High CPU Usage**:
    - Increase buffer size
